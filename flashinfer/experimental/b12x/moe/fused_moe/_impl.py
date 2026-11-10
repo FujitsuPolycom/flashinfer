@@ -1222,6 +1222,7 @@ class TPMoEFP4Binding:
     output_cast_target: torch.Tensor | None = None
     input_scales_static: bool = False
     compact_launches: object | None = None
+    weight_views_cache: dict | None = None
     fast_math: bool | None = None
     quant_mode: str | None = None
     decode_config: MoeDecodeConfig | None = None
@@ -5261,6 +5262,7 @@ def _logical_weight_to_w4a8_rp_inplace(
     size_n: int,
     row_rotation: int | None = None,
     gated_half_rows: int | None = None,
+    allocate=None,
 ) -> torch.Tensor:
     size_k = int(size_k)
     size_n = int(size_n)
@@ -5302,7 +5304,9 @@ def _logical_weight_to_w4a8_rp_inplace(
         # Ceil-tiled tails don't fit the source storage; write a fresh
         # destination and read the (never-aliased) source directly.
         out_i32 = (
-            torch.empty((weight_E, rp_words), dtype=torch.int32, device=weight.device)
+            (torch.empty if allocate is None else allocate)(
+                (weight_E, rp_words), dtype=torch.int32, device=weight.device
+            )
             if has_tail
             else None
         )
@@ -5615,6 +5619,7 @@ def _e8m0_scale_to_w4a8_sfb_inplace(
     k_dim: int,
     row_rotation: int | None = None,
     gated_half_rows: int | None = None,
+    allocate=None,
 ) -> torch.Tensor:
     weight_E = int(weight_E)
     rows = int(rows)
@@ -5657,7 +5662,9 @@ def _e8m0_scale_to_w4a8_sfb_inplace(
         source_stride = rows * scale_cols if is_logical else scale_cols * rows_pad
         # Ceil-tiled tails don't fit the source storage in place.
         out_u8 = (
-            torch.empty((weight_E, sfb_bytes), dtype=torch.uint8, device=scale.device)
+            (torch.empty if allocate is None else allocate)(
+                (weight_E, sfb_bytes), dtype=torch.uint8, device=scale.device
+            )
             if has_tail
             else None
         )
@@ -5937,6 +5944,7 @@ def _get_w6a8_weight_views(
     k: int,
     *,
     activation_spec: _ActivationKernelSpec,
+    cache=None,
 ) -> _WeightViews:
     """Weight views for the prepared w6a8_mx (MX-FP6) expert layout.
 
@@ -5973,12 +5981,14 @@ def _get_w6a8_weight_views(
         activation_spec.activation,
         "w6a8_mx",
     )
-    last_wkey, last_wval = _LAST_WEIGHTS
+    last_wkey, last_wval = _LAST_WEIGHTS if cache is None else (None, None)
     if last_wkey == key:
         return last_wval
-    cached = _WEIGHT_CACHE.get(key)
+    weight_cache = _WEIGHT_CACHE if cache is None else cache
+    cached = weight_cache.get(key)
     if cached is not None:
-        _LAST_WEIGHTS = (key, cached)
+        if cache is None:
+            _LAST_WEIGHTS = (key, cached)
         return cached
 
     # Permute [E, rows, 3K//4] -> [rows, 3K//4, E] (view, no copy!) to match
@@ -6015,8 +6025,9 @@ def _get_w6a8_weight_views(
         cute.AddressSpace.gmem,
         assumed_align=16,
     )
-    _WEIGHT_CACHE[key] = views
-    _LAST_WEIGHTS = (key, views)
+    weight_cache[key] = views
+    if cache is None:
+        _LAST_WEIGHTS = (key, views)
     return views
 
 
@@ -6125,6 +6136,8 @@ def _get_weight_views(
     activation_spec: _ActivationKernelSpec,
     quant_mode: str = "nvfp4",
     w13_layout: str = "w13",
+    scale_views=None,
+    cache=None,
 ) -> _WeightViews:
     """Create weight views from the expert-weight layout.
 
@@ -6154,6 +6167,7 @@ def _get_weight_views(
             n,
             k,
             activation_spec=activation_spec,
+            cache=cache,
         )
     if quant_mode == "w4a8_mx" and w1_fp4.dim() != 3:
         # In-place N256/K128-repacked storage (tiny_decode band): view flat as the
@@ -6182,20 +6196,22 @@ def _get_weight_views(
         )
     key = (
         w1_fp4.data_ptr(),
-        w1_blockscale.data_ptr(),
+        w1_blockscale.data_ptr() if scale_views is None else scale_views[0].data_ptr(),
         w2_fp4.data_ptr(),
-        w2_blockscale.data_ptr(),
+        w2_blockscale.data_ptr() if scale_views is None else scale_views[1].data_ptr(),
         w1_alphas.data_ptr(),
         w2_alphas.data_ptr(),
         activation_spec.activation,
         quant_mode if _is_w4a8_quant_mode(quant_mode) else "nvfp4",
     )
-    last_wkey, last_wval = _LAST_WEIGHTS
+    last_wkey, last_wval = _LAST_WEIGHTS if cache is None else (None, None)
     if last_wkey == key:
         return last_wval
-    cached = _WEIGHT_CACHE.get(key)
+    weight_cache = _WEIGHT_CACHE if cache is None else cache
+    cached = weight_cache.get(key)
     if cached is not None:
-        _LAST_WEIGHTS = (key, cached)
+        if cache is None:
+            _LAST_WEIGHTS = (key, cached)
         return cached
 
     # Permute [E, w1_n, k//2] → [w1_n, k//2, E] (view, no copy!)
@@ -6207,7 +6223,10 @@ def _get_weight_views(
     bs_u8 = w1_blockscale.view(torch.uint8)
     w1_scale_storage = w1_blockscale
     w2_scale_storage = w2_blockscale
-    if quant_mode == "w4a8_mx":
+    if scale_views is not None:
+        w13_sf, down_sf = scale_views
+        w1_scale_storage, w2_scale_storage = scale_views
+    elif quant_mode == "w4a8_mx":
         # MXFP4 sources carry checkpoint-native per-K/32 E8M0 grids
         # ([E, rows, K//32] bytes); there is no vec16 scale stack to view.
         # The w4a8 kernels never read the vec16 SF descriptors, so the
@@ -6287,8 +6306,9 @@ def _get_weight_views(
             # substitutes dummy pointers.
             views.sfb_w13_mx = w13_sf
             views.sfb_down_mx = down_sf
-    _WEIGHT_CACHE[key] = views
-    _LAST_WEIGHTS = (key, views)
+    weight_cache[key] = views
+    if cache is None:
+        _LAST_WEIGHTS = (key, views)
     return views
 
 
@@ -6452,6 +6472,8 @@ def _prepare_w4a8_from_e8m0_source(
     source_format: str,
     w13_layout: str,
     n64_repack: bool = False,
+    allocate=None,
+    scale_allocate=None,
 ) -> _PreparedW4A8Weights:
     source_format = _normalize_fp4_source_format(source_format)
     if source_format != "fp4_e8m0_k32":
@@ -6542,11 +6564,13 @@ def _prepare_w4a8_from_e8m0_source(
             size_n=w1_rows,
             row_rotation=row_rotation,
             gated_half_rows=n if is_gated else None,
+            allocate=allocate,
         )
         w2_rp = _logical_weight_to_w4a8_rp_inplace(
             w2_fp4,
             size_k=n,
             size_n=k,
+            allocate=allocate,
         )
         w13_sfb = _e8m0_scale_to_w4a8_sfb_inplace(
             w1_blockscale,
@@ -6555,12 +6579,14 @@ def _prepare_w4a8_from_e8m0_source(
             k_dim=k,
             row_rotation=row_rotation,
             gated_half_rows=n if is_gated else None,
+            allocate=scale_allocate,
         )
         w2_sfb = _e8m0_scale_to_w4a8_sfb_inplace(
             w2_blockscale,
             weight_E=weight_E,
             rows=k,
             k_dim=n,
+            allocate=scale_allocate,
         )
     return _PreparedW4A8Weights(
         w13_rp=w13_rp,
@@ -6722,6 +6748,7 @@ def _prepare_modelopt_nvfp4_runtime_alphas(
     a2_gscale: torch.Tensor,
     *,
     weight_E: int | None = None,
+    allocate=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Prepare W4A4 runtime alphas from raw ModelOpt NVFP4 scales.
 
@@ -6749,8 +6776,12 @@ def _prepare_modelopt_nvfp4_runtime_alphas(
     )
     a1_recip = _prepare_expert_scale_vector(a1_gscale, weight_E, name="a1_gscale")
     a2_recip = _prepare_expert_scale_vector(a2_gscale, weight_E, name="a2_gscale")
-    w1_runtime = torch.empty_like(w1_scale)
-    w2_runtime = torch.empty_like(w2_scale)
+    w1_runtime = (torch.empty if allocate is None else allocate)(
+        w1_scale.shape, dtype=w1_scale.dtype, device=w1_scale.device
+    )
+    w2_runtime = (torch.empty if allocate is None else allocate)(
+        w2_scale.shape, dtype=w2_scale.dtype, device=w2_scale.device
+    )
     torch.div(
         w1_scale, a1_recip[:, None] if w1_scale.ndim == 2 else a1_recip, out=w1_runtime
     )
@@ -6833,6 +6864,8 @@ def prepare_b12x_fp4_moe_weights(
     exl3_device: torch.device | str | None = None,
     dummy_scale: torch.Tensor | None = None,
     immutable_input_scales: bool = False,
+    allocate=None,
+    scale_allocate=None,
 ) -> B12XFP4ExpertWeights:
     """Transfer source tensors into the planner-selected runtime owner.
 
@@ -6979,6 +7012,7 @@ def prepare_b12x_fp4_moe_weights(
             w2_global_scale,
             a2_gscale,
             weight_E=plan.num_experts,
+            allocate=allocate,
         )
 
     representation: _PreparedWeightRepresentation | None = None
@@ -7002,6 +7036,8 @@ def prepare_b12x_fp4_moe_weights(
                 params_dtype=params_dtype,
                 source_format=plan.source_format,
                 w13_layout=plan.w13_layout,
+                allocate=allocate,
+                scale_allocate=scale_allocate,
             )
         elif plan.source_format == "fp4_e8m0_k32":
             value = prepare_w4a16_e8m0_native_weights(
@@ -7014,6 +7050,8 @@ def prepare_b12x_fp4_moe_weights(
                 activation=plan.activation,
                 params_dtype=params_dtype,
                 w13_layout=plan.w13_layout,
+                allocate=allocate,
+                scale_allocate=scale_allocate,
             )
         else:
             raise AssertionError(
@@ -7044,6 +7082,8 @@ def prepare_b12x_fp4_moe_weights(
             source_format=plan.source_format,
             w13_layout=plan.w13_layout,
             reuse_input_storage=True,
+            allocate=allocate,
+            scale_allocate=scale_allocate,
         )
         representation = _PreparedWeightRepresentation(
             quant_mode="w4a16",
@@ -7066,6 +7106,8 @@ def prepare_b12x_fp4_moe_weights(
             source_format=plan.source_format,
             w13_layout=plan.w13_layout,
             n64_repack=plan.intermediate_size % 128 == 64,
+            allocate=allocate,
+            scale_allocate=scale_allocate,
         )
         representation = _PreparedWeightRepresentation(
             quant_mode="w4a8_mx",
@@ -7138,7 +7180,17 @@ def prepare_b12x_fp4_moe_weights(
         ):
             raise ValueError("paired FC1 gains require gated NVFP4 A4 preparation")
         if plan.w13_layout == "w31":
-            canonical_a1 = canonical_a1.flip(1).contiguous()
+            flipped = canonical_a1.flip(1).contiguous()
+            if allocate is not None and plan.prepares_runtime_alphas:
+                canonical_a1.copy_(flipped)
+            else:
+                canonical_a1 = flipped
+                if allocate is not None:
+                    canonical_a1 = allocate(
+                        canonical_a1.shape,
+                        dtype=canonical_a1.dtype,
+                        device=canonical_a1.device,
+                    ).copy_(canonical_a1)
     canonical_w2 = w2_fp4
     canonical_s2 = w2_blockscale
     canonical_a2 = w2_runtime_alphas
@@ -7174,7 +7226,9 @@ def prepare_b12x_fp4_moe_weights(
     )
 
 
-def prepare_b12x_iq2_xs_weights(*, plan, weights) -> B12XFP4ExpertWeights:
+def prepare_b12x_iq2_xs_weights(
+    *, plan, weights, allocate=None
+) -> B12XFP4ExpertWeights:
     """Own compact IQ2_XS planes through the canonical expert package."""
     from b12x.moe._shared.kernels.w4a16.iq2_xs import prepare_iq2_xs_moe_weights
 
@@ -7187,8 +7241,11 @@ def prepare_b12x_iq2_xs_weights(*, plan, weights) -> B12XFP4ExpertWeights:
         activation=plan.activation,
         w13_layout=plan.w13_layout,
         codec=weights.codec,
+        allocate=allocate,
     )
-    unit = torch.ones((), dtype=torch.float32, device=value.w13.device)
+    unit = (torch.empty if allocate is None else allocate)(
+        (), dtype=torch.float32, device=value.w13.device
+    ).fill_(1)
     return B12XFP4ExpertWeights(
         plan=plan,
         a1_gscale=unit,
@@ -13708,6 +13765,21 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         dtype=a.dtype,
         hidden_size=k,
     )
+    if (
+        inline_scales is not None
+        and getattr(experts, "_csf_scale_templates", None) is not None
+    ):
+        prepared_payload = (
+            replace(
+                prepared_payload,
+                **{
+                    name: inline_scales[index].storage
+                    for name, index, _, _ in experts._csf_scale_templates.aliases
+                },
+            )
+            if prepared_payload is not None
+            else None
+        )
     device = a.device
     prepared_hidden = experts.hidden_size
     if prepared_hidden != k:
@@ -13943,6 +14015,10 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 activation_spec=activation_spec,
                 quant_mode=quant_mode,
                 w13_layout=w13_layout,
+                scale_views=None
+                if inline_scales is None
+                else tuple(p.storage for p in inline_scales),
+                cache=binding.weight_views_cache,
             )
         input_gs = _prepare_expert_scale(a1_gscale, weight_E)
         down_input_scale = _prepare_expert_scale(a2_gscale, weight_E)
@@ -13969,6 +14045,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 n,
                 k,
                 activation_spec=activation_spec,
+                cache=binding.weight_views_cache,
             )
         elif quant_mode == "w8a8_mx":
             # Weight preparation validated the MXFP8 geometry and resolved the
@@ -13994,8 +14071,12 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 activation_spec=activation_spec,
                 quant_mode=quant_mode,
                 w13_layout=w13_layout,
+                scale_views=None
+                if inline_scales is None
+                else tuple(p.storage for p in inline_scales),
+                cache=binding.weight_views_cache,
             )
-            if quant_mode == "nvfp4":
+            if quant_mode == "nvfp4" and inline_scales is None:
                 _ensure_dynamic_nvfp4_tail_views(
                     wv,
                     n,

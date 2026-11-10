@@ -46,6 +46,7 @@ class PagedDecodeQuery:
     has_sinks: bool
     descale_layout: str
     sm_count: int
+    caller_owned_placeholders: bool = False
     autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     @property

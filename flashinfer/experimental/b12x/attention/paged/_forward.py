@@ -755,7 +755,9 @@ def _capture_decode_graph_replay_metadata_if_needed(
             "prepare_decode_graph_replay_state before capture"
         )
     owner_scratch_plan = getattr(scratch, "_owner_scratch_plan", None)
-    if owner_scratch_plan is not None:
+    if owner_scratch_plan is not None and not getattr(
+        scratch, "_caller_owned_replay_metadata", False
+    ):
         # ``Plan.bind()`` may have run before capture.  In that case the graph
         # first sees the Plan-owned schedule addresses here, in ``run()``, and
         # the owner must be pinned before a later prepare can replace them.

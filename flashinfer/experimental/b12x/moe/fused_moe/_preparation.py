@@ -1310,6 +1310,8 @@ class _FusedMoeState:
 
     def bind(self, **kwargs):
         experts = kwargs.pop("experts", self.experts)
+        scale_buffers = kwargs.pop("_scale_buffers", ())
+        weight_views_cache = kwargs.pop("_weight_views_cache", None)
         if experts is not self.experts:
             raise ValueError("prepared experts differ from the plan declaration")
         kwargs["a4_prefill"] = self._precision_choice(kwargs.get("a4_prefill"))
@@ -1327,6 +1329,13 @@ class _FusedMoeState:
             raise ValueError("fast_math differs from the prepared numerical contract")
         kwargs["fast_math"] = fast_math
         kwargs["experts"] = self.execution_experts or self.experts._impl
+        if scale_buffers:
+            from ._binding_ops import _scale_view
+
+            impl = kwargs["experts"]
+            kwargs["experts"] = _scale_view(
+                impl, scale_buffers, replace(impl.nvfp4_csf, active=scale_buffers[2])
+            )
         kwargs["unit_scale_contract"] = (
             _quant_mode(self.experts, self.config) == "w4a16"
         )
@@ -1336,6 +1345,7 @@ class _FusedMoeState:
             self.scratch.bind(**kwargs),
             compact_launches=self.compact_launches,
             output_layout=self.scratch.caps.output_layout,
+            weight_views_cache=weight_views_cache,
         )
         if (
             self.experts.plan.activation.a4_prefill is not None

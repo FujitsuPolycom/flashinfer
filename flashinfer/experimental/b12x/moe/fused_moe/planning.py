@@ -450,6 +450,7 @@ def prepare_weights(
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
     scale_scratch: tuple[torch.Tensor, torch.Tensor] | None = None,
+    allocate=None,
 ) -> PreparedExperts:
     """Materialize the in-memory representation selected by ``plan_weights``.
 
@@ -458,6 +459,27 @@ def prepare_weights(
     may share; the prepared experts retain only compressed scales.
     """
 
+    return _prepare_weights(
+        plan=plan,
+        weights=weights,
+        device=device,
+        staging=staging,
+        scale_scratch=scale_scratch,
+        allocate=allocate,
+        scale_allocate=allocate,
+    )
+
+
+def _prepare_weights(
+    *,
+    plan,
+    weights,
+    device=None,
+    staging=None,
+    scale_scratch=None,
+    allocate=None,
+    scale_allocate=None,
+):
     if not isinstance(plan, WeightPlan):
         raise TypeError("plan must be a WeightPlan")
     if (device is not None or staging is not None) and not isinstance(
@@ -469,7 +491,9 @@ def prepare_weights(
     if plan.scale_compression is not None:
         from ._csf_preparation import prepare_online_csf_weights
 
-        return prepare_online_csf_weights(plan, weights, scale_scratch)
+        return prepare_online_csf_weights(
+            plan, weights, scale_scratch, allocate=allocate
+        )
     if scale_scratch is not None:
         raise ValueError("scale_scratch requires a scale_compression plan")
     if isinstance(weights, (Nvfp4CsfWeights, Mxfp4CsfWeights)):
@@ -482,7 +506,7 @@ def prepare_weights(
             raise TypeError("Compressed expert weights require CSF checkpoint sources")
         from ._csf_preparation import prepare_csf_block_weights
 
-        return prepare_csf_block_weights(plan, weights)
+        return prepare_csf_block_weights(plan, weights, allocate=allocate)
     if (
         isinstance(plan.source, PackedSource)
         and plan.source.format.value in BLOCK_CODECS
@@ -494,7 +518,9 @@ def prepare_weights(
             raise TypeError(
                 f"{plan.source.format.value} preparation requires matching BlockQuantWeights"
             )
-        prepared = prepare_b12x_iq2_xs_weights(plan=plan._impl, weights=weights)
+        prepared = prepare_b12x_iq2_xs_weights(
+            plan=plan._impl, weights=weights, allocate=allocate
+        )
     elif isinstance(plan.source, TrellisSource):
         if not isinstance(weights, TrellisWeights):
             raise TypeError("Trellis preparation requires TrellisWeights")
@@ -574,23 +600,29 @@ def prepare_weights(
             input_scale = (
                 input_scale.detach().reshape(-1).amin().reshape(1).contiguous()
             )
+            if allocate is not None:
+                input_scale = allocate(
+                    input_scale.shape,
+                    dtype=input_scale.dtype,
+                    device=input_scale.device,
+                ).copy_(input_scale)
         if plan.activation.outer_scale == "token":
             if input_scale is not None or intermediate_scale is not None:
                 raise ValueError(
                     "token outer scaling does not consume static activation scales"
                 )
-            input_scale = torch.ones(
-                plan.geometry.num_experts,
+            input_scale = (torch.empty if allocate is None else allocate)(
+                (plan.geometry.num_experts,),
                 dtype=torch.float32,
                 device=weights.w13.device,
-            )
+            ).fill_(1)
             intermediate_scale = input_scale
         elif plan.activation.mode is ActivationMode.A16 and not keep_activation_scales:
-            input_scale = torch.ones(
-                plan.geometry.num_experts,
+            input_scale = (torch.empty if allocate is None else allocate)(
+                (plan.geometry.num_experts,),
                 dtype=torch.float32,
                 device=weights.w13.device,
-            )
+            ).fill_(1)
             intermediate_scale = input_scale
         elif (input_scale is None) != (intermediate_scale is None):
             raise ValueError(
@@ -601,11 +633,11 @@ def prepare_weights(
                 raise ValueError(
                     "ModelOpt NVFP4 A4/A8 preparation requires activation scales"
                 )
-            input_scale = torch.ones(
-                plan.geometry.num_experts,
+            input_scale = (torch.empty if allocate is None else allocate)(
+                (plan.geometry.num_experts,),
                 dtype=torch.float32,
                 device=weights.w13.device,
-            )
+            ).fill_(1)
             intermediate_scale = input_scale
         prepared = prepare_b12x_fp4_moe_weights(
             plan=plan._impl,
@@ -619,6 +651,8 @@ def prepare_weights(
             immutable_input_scales=weights.immutable_input_scales,
             a1_gscale=input_scale,
             a2_gscale=intermediate_scale,
+            allocate=allocate,
+            scale_allocate=scale_allocate,
         )
         if keep_activation_scales:
             prepared = replace(prepared, a4_prefill_scales=True)

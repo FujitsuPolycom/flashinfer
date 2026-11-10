@@ -16,6 +16,7 @@ from ._preparation import (
 from ._forward import _compile_paged_attention, paged_attention_forward
 from ._scratch import B12XPagedAttentionScratchPlan, plan_paged_attention_scratch
 from ._scratch import (
+    ReplayMetadata,
     B12XPagedAttentionBinding as Binding,
     B12XPagedAttentionScratchCaps as Caps,
     B12XPagedDecodeGraphScratchEnvelope as DecodeGraphScratchEnvelope,
@@ -52,6 +53,30 @@ def bind(plan, **kwargs):
     return _bind(plan, **kwargs)
 
 
+def replay_metadata(plan):
+    """Return selected-plan schedule seeds and their live-alias requirement."""
+    from b12x.preparation import require_prepared
+
+    owner = (
+        plan
+        if isinstance(plan, B12XPagedAttentionScratchPlan)
+        else require_prepared(plan, "attention.gqa").scratch_plan
+    )
+    return owner.replay_metadata()
+
+
+def release_replay_metadata(plan):
+    """Retire declaration metadata after callers have installed explicit operands."""
+    from b12x.preparation import require_prepared
+
+    owner = (
+        plan
+        if isinstance(plan, B12XPagedAttentionScratchPlan)
+        else require_prepared(plan, "attention.gqa").scratch_plan
+    )
+    owner.release_replay_metadata()
+
+
 def compile(*, binding):
     """Prime a heuristic binding before serving or CUDA graph capture."""
     if binding.plan is not None:
@@ -76,6 +101,9 @@ __all__ = [
     "Caps",
     "Plan",
     "Binding",
+    "ReplayMetadata",
+    "replay_metadata",
+    "release_replay_metadata",
     "Workspace",
     "Budget",
     "DecodeGraphCapacity",

@@ -127,6 +127,7 @@ def _canonical_prepare_weights(
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
     scale_scratch: tuple[torch.Tensor, torch.Tensor] | None = None,
+    allocate=None,
 ) -> PreparedExperts:
     """Prepare the canonical weight representation owned by this layer."""
     return _prepare_weights(
@@ -135,6 +136,7 @@ def _canonical_prepare_weights(
         device=device,
         staging=staging,
         scale_scratch=scale_scratch,
+        allocate=allocate,
     )
 
 

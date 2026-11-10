@@ -43,6 +43,7 @@ class Caps:
     causal: bool = True
     has_sinks: bool = False
     descale_layout: str = "tensor"
+    caller_owned_placeholders: bool = False
 
 
 def plan(
@@ -120,6 +121,7 @@ def write_kv(
     slot_mapping: torch.Tensor,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    dummy_scale: torch.Tensor | None = None,
 ) -> None:
     """Append new K/V rows to the layer family's paged caches.
 
@@ -137,6 +139,7 @@ def write_kv(
         slot_mapping=slot_mapping,
         k_scale=k_scale,
         v_scale=v_scale,
+        dummy_scale=dummy_scale,
     )
 
 
