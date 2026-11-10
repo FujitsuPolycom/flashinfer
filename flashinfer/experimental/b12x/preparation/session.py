@@ -2171,7 +2171,7 @@ class PreparationJob:
             pool = self.session._pool
             if pool is None:
                 raise LookupError("required compiler artifacts are unavailable")
-            if pool.ready(tuple(programs)):
+            if pool.ready(tuple(programs)) and not self._programs_available(programs):
                 raise RuntimeError(
                     "compiler completed without publishing required artifacts"
                 )
@@ -2309,6 +2309,13 @@ class PreparationJob:
         while not self._programs_available(programs):
             if self.session._stop.is_set():
                 return None
+            pool = self.session._pool
+            if pool is None:
+                raise LookupError("required compiler artifacts are unavailable")
+            if pool.ready(tuple(programs)) and not self._programs_available(programs):
+                raise RuntimeError(
+                    "compiler completed without publishing required artifacts"
+                )
             yield from self._pump_pipeline(obligation)
             yield "compile"
         selection = self._selection(obligation, config, "tuned", assignment)
