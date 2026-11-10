@@ -424,6 +424,8 @@ class DenseGemmKernel:
         small_m_warps = (
             mma_warps
             if mma_warps is not None
+            else 4
+            if self.a16_q8 and mma_tiler_mn == (16, 32)
             else 8
             if self.a16_block
             else 4
@@ -4913,7 +4915,7 @@ class DenseGemmKernel:
                 and (
                     mma_tiler_mn
                     in ((16, 64), (16, 128), (32, 64), (32, 128), (64, 64), (64, 128))
-                    or weight_only == "mxfp8"
+                    or weight_only in ("mxfp8", "q8_0")
                     and mma_tiler_mn == (16, 32)
                     or weight_only in BLOCK_CODECS
                     and mma_tiler_mn in ((8, 64), (8, 128))
