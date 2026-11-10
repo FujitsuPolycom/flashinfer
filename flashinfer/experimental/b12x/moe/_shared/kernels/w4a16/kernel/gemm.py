@@ -32,7 +32,7 @@ from b12x._lib.intrinsics.packed import fp8x4_e4m3_to_half2x2
 from b12x._lib.intrinsics.memory import get_ptr_as_int64
 from b12x._lib.intrinsics.packed import half2_mul
 from b12x._lib.intrinsics.packed import half2_to_float2_scaled
-from b12x._lib.intrinsics.trellis import iq2_xxs_descriptor_pair
+from b12x._lib.intrinsics.trellis import packed_decode_iq2_xxs_to_bfloat2x4
 from b12x._lib.intrinsics.sync import ld_global_acquire_i32
 from b12x._lib.intrinsics.memory import ld_global_nc_u32
 from b12x._lib.intrinsics.memory import ld_global_v4_f32
@@ -2443,8 +2443,8 @@ class W4A16GemmKernel:
 
         for jj in cutlass.range_constexpr(4):
             if cutlass.const_expr(self.weight_layout_block):
-                q0, q1, base_pair, subscale_pair = self._load_iq2_xs_fragment(
-                    smem_base, tid, pipe, Int32(kk), jj
+                q0, q1, base_pair, subscale_pair, signs_row1, half = (
+                    self._load_iq2_xs_fragment(smem_base, tid, pipe, Int32(kk), jj)
                 )
                 self._scaled_dequant_b_fragment_iq2_xs(
                     b_frag,
@@ -2452,6 +2452,8 @@ class W4A16GemmKernel:
                     q1,
                     base_pair,
                     subscale_pair,
+                    signs_row1,
+                    half,
                     trellis_lut_addr,
                     tid,
                 )
@@ -3123,6 +3125,7 @@ class W4A16GemmKernel:
             + tc_col
         ) * Int32(4)
         base_pair = ld_shared_u32(base_addr)
+        signs_row1, half = Uint32(0), Int32(0)
         if cutlass.const_expr(self.q8):
             tile_base = (kt_local * Int32(self.cta_n_blocks) + local_n16) * Int32(16)
             addr = (
@@ -3146,9 +3149,9 @@ class W4A16GemmKernel:
             signs0, signs1 = ld_shared_v2_u32(
                 record_addr + Int32(self.cta_n_blocks * self.block_tile_bytes)
             )
-            q0 = iq2_xxs_descriptor_pair(grid0, signs0, kt_local % Int32(2))
-            q1 = iq2_xxs_descriptor_pair(grid1, signs1, kt_local % Int32(2))
-            subscale_pair = (signs0 >> 28) | ((signs1 >> 28) << 8)
+            q0, q1 = grid0, grid1
+            subscale_pair, signs_row1 = signs0, signs1
+            half = kt_local % Int32(2)
         else:
             scale_addr = scale_region + (
                 (kt_local // Int32(2) * Int32(self.cta_n_blocks) + local_n16)
@@ -3162,7 +3165,7 @@ class W4A16GemmKernel:
                 b_region + (tile_base + tc_col * Int32(2)) * Int32(4)
             )
             subscale_pair = scale_pair >> shift
-        return q0, q1, base_pair, subscale_pair
+        return q0, q1, base_pair, subscale_pair, signs_row1, half
 
     @cute.jit
     def _load_b_weight_registers(
@@ -3450,6 +3453,8 @@ class W4A16GemmKernel:
         q_row1: Uint32,
         base_pair: Uint32,
         subscale_pair: Uint32,
+        signs_row1: Uint32,
+        half: Int32,
         execution_lut_addr: Int64,
         tid: Int32,
     ):
@@ -3458,6 +3463,20 @@ class W4A16GemmKernel:
             b0_1 = q8_0_pair_to_bf16x2(q_row0 >> 16, base_pair)
             b1_0 = q8_0_pair_to_bf16x2(q_row1, base_pair >> 16)
             b1_1 = q8_0_pair_to_bf16x2(q_row1 >> 16, base_pair >> 16)
+        elif cutlass.const_expr(self.iq2_xxs):
+            pair_byte_offset = (tid & Int32(3)) * Int32(2)
+            b0_0, b0_1, b1_0, b1_1 = packed_decode_iq2_xxs_to_bfloat2x4(
+                q_row0,
+                q_row1,
+                base_pair,
+                subscale_pair,
+                signs_row1,
+                half,
+                execution_lut_addr,
+                pair_byte_offset,
+                shared_lut=self.iq2_xs_smem_lut,
+                selector_lut=True,
+            )
         else:
             pair_byte_offset = (tid & Int32(3)) * Int32(2)
             b0_0, b0_1, b1_0, b1_1 = packed_decode_iq2_xs_to_bfloat2x4(

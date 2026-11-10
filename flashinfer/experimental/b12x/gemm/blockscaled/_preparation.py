@@ -742,11 +742,14 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         if query.recipe in IQ2_CODECS:
             from b12x._lib.quant.iq2_xs import _DEVICE_TABLES
 
-            resident = _DEVICE_TABLES.get(("cuda", device.ordinal, False, query.recipe))
+            selectors = config.tile_n != 4
+            resident = _DEVICE_TABLES.get(
+                ("cuda", device.ordinal, selectors, query.recipe)
+            )
             persistent.append(
                 PersistentMemory(
-                    ("iq2.execution_lut", device.ordinal, query.recipe),
-                    block_codec(query.recipe).lut_bytes(),
+                    ("iq2.execution_lut", device.ordinal, query.recipe, selectors),
+                    block_codec(query.recipe).lut_bytes(selectors=selectors),
                     0
                     if resident is None
                     else resident.numel() * resident.element_size(),
@@ -840,7 +843,10 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
             from b12x._lib.quant.iq2_xs import iq2_xs_execution_lut
 
             lut = iq2_xs_execution_lut(
-                resolved_device, prepare=True, codec=query.recipe
+                resolved_device,
+                prepare=True,
+                selectors=config.tile_n != 4,
+                codec=query.recipe,
             )
         return _PackedExecutionState(
             query,

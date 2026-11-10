@@ -194,7 +194,7 @@ class DenseGemmKernel:
         self.a16_iq2_xxs = weight_only == "iq2_xxs"
         self.a16_q8 = weight_only == "q8_0"
         self.a16_lut_bytes = (
-            block_codec(weight_only).lut_bytes() if self.a16_block else 0
+            block_codec(weight_only).lut_bytes(selectors=True) if self.a16_block else 0
         )
         self.a16_block_transposed = self.a16_block and swap_ab
         self.a16_pack_factor = (
