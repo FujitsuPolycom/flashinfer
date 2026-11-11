@@ -109,8 +109,10 @@ finite reserve includes every modeled origin and serial because acknowledgment
 completions can remain unpolled after an origin admits another serial. It does
 not establish the production queue bound for indefinitely repeated traffic.
 
-Four-rank opposite destinations follow the clockwise tie used by `ring_next`.
-`ring_mixed_directions` uses a five-rank ring with two opposing two-hop routes;
+Each instance states its hops in its own `DIRECTIONS` map; the models do not
+derive them from `ring_next`. `ring_4r_two_origins` sends both four-rank origins
+clockwise so their hops share queue pairs. `ring_mixed_directions` uses a
+five-rank ring with two opposing two-hop routes;
 data and reverse acknowledgments then contend in both directions. The six-rank
 `ring_ack_chain` configuration includes two relay mailboxes per route. These
 five- and six-rank configurations execute on a single model-checker process;

@@ -237,7 +237,7 @@ _Static_assert(CTRL_CREDIT >= CTRL_READY_VL + ROCE_VARLEN_MAX_CHUNKS &&
 #define RING_WINDOW 32
 #define RING_SLOT_COUNT(world) (RING_WINDOW * ((world) - 1))
 #define RING_MAX_SLOTS RING_SLOT_COUNT(ROCE_MAX_PEERS)
-#define RING_PROTOCOL 0x45504f35u  // EPO5: dense destination lanes with fanout broadcast
+#define RING_PROTOCOL 0x45504f36u  // EPO6: EPO5 lanes and fanout, tie broken by rank parity
 #define RING_ACK_READY 3
 #define RING_COMPLETION (UINT64_C(1) << 63)
 typedef struct {
@@ -390,12 +390,16 @@ static ring_descriptor_t* ring_outgoing(const roce_ctx_t* c, int origin, int rai
                                             c->world, ring_slot(c->world, origin, rail, slot)));
 }
 // Next hop from `rank` toward target: on a line always toward it; on a cycle the
-// shorter way, clockwise on a tie.
+// shorter way, and on a tie the way its rank parity names, so an even rank sends
+// a two-hop peer clockwise and an odd rank counter-clockwise. A tie only exists
+// where the two arcs are equal, so no rank has two first hops toward one target
+// and every (origin, target) lane keeps one fixed route.
 static int ring_next_at(const roce_ctx_t* c, int rank, int target) {
   if (c->ring_open) return target > rank ? rank + 1 : rank - 1;
   int clockwise = (target - rank + c->world) % c->world;
   int counter = (rank - target + c->world) % c->world;
-  return clockwise <= counter ? (rank + 1) % c->world : (rank + c->world - 1) % c->world;
+  int clockwise_first = clockwise < counter || (clockwise == counter && rank % 2 == 0);
+  return clockwise_first ? (rank + 1) % c->world : (rank + c->world - 1) % c->world;
 }
 static int ring_next(const roce_ctx_t* c, int target) { return ring_next_at(c, c->rank, target); }
 // Relay mailboxes are never addressed at a path endpoint or at the final target.

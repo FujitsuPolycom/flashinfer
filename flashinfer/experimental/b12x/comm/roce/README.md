@@ -43,7 +43,8 @@ can perform that exchange without requiring an NCCL data transport.
 
 One-shot reductions, two-shot reductions, fixed gathers, and variable-length
 gathers share the same native write path. Non-neighbor transfers use the
-shorter direction around the ring; equal distances choose increasing ranks.
+shorter direction around the ring; equal distances send an even rank clockwise and an odd rank
+counter-clockwise, so both cables of a four-rank ring carry two shards per collective.
 Relays split each rail into at most 256 KiB packets. Each original sender owns
 32 mailbox slots per destination and rail at every rank, so up to 32 packets
 per sender, destination and rail are in flight, and a slot is reused only after
