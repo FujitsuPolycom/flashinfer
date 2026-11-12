@@ -67,7 +67,9 @@ Native consumers must use the matching C source and call `roce_enable_ring` (or
 exchanged fresh at startup rather than restored from a CUDA graph. Every rank of a group must run
 the same proxy source: the connection blob grew from 1,168 to 1,184 bytes to carry the mailbox
 window, the packet size and the protocol tag, and `roce_connect` fails with `ranks disagree on CPU
-relay protocol or geometry` before any operation is posted. Kernels exported at ABI 11 through 14
+relay protocol or geometry` before any operation is posted. The tag also rotates whenever a ring
+rule changes the route of a lane, most recently for the tie broken by rank parity, so a ring group
+never mixes two proxies that route the same lane differently. Kernels exported at ABI 11 through 14
 keep their captured addresses, because the region layout and the doorbell words are ABI 14's.
 
 The two halves of the pipelined two-shot path are also separate operations.
@@ -157,6 +159,19 @@ shard-gather operations, not to the variable-length all-gather;
 `native_description()["relay_plan"]` is the plan a native runtime passes to
 `roce_set_relay`. Proxy ABI 13 adds `roce_set_relay`.
 
+A closed ring of four ranks uses the same relay for the all-gather. Rank `r` posts its reduced
+shard to `r - 1` and `r + 1` only, and both neighbors forward it to `r + 2`, the clockwise one the
+even chunks and the counter-clockwise one the odd chunks, so each far chunk keeps one carrier. One
+round of chunks then takes 12 shard-sized link transfers instead of 16, no far chunk enters a
+mailbox, and both cables carry half. The plan is `_routes.ring_relay_plan`, which returns none for
+any other world size. A relay forwards by direct write to a cable neighbor, so `roce_set_relay`
+accepts a plan on the direct transport and on a closed ring of four ranks only, and refuses one on
+an open line or a ring of another size, where the second hop of every forward would leave by ring
+mailbox and the fanout would be silently off. `B12X_ROCE_RELAY` defaults on, so an existing closed
+four-rank ring plans this relay with no flag; set it to 0 to keep the mailbox route. Four GB10 hosts
+cabled as a closed ring ran this plan through the mixed-collectives benchmark below, every output of
+every iteration checked, but no GPU pytest has run on a closed ring.
+
 On an open chain, the two-shot all-gather phase and the shard gather are broadcast once per direction
 instead of relayed once per destination (proxy ABI 15). Each packet names the far endpoint as its
 target; its payload is written into the next host's receive row, and every host it passes publishes
@@ -179,7 +194,7 @@ CPU-only proxy checks (a C compiler and libibverbs headers required, no GPU or R
 
 ```sh
 PYTHONPATH=flashinfer/experimental python3 -m pytest -q --confcutdir=tests/experimental/b12x \
-  tests/experimental/b12x/comm/test_roce_{proxy,routes,ring_arrival,relay_guard}.py
+  tests/experimental/b12x/comm/test_roce_{proxy,routes,ring_arrival,relay_guard,ring_balance,ring_relay}.py
 ```
 
 The transport validator uses real libibverbs registrations and RDMA writes,
@@ -305,10 +320,11 @@ Proxy ABI 15 ran on four DGX Sparks, one GB10 each, cabled as an open line in ra
 RoCE rails per link: `validate_roce_ring_native.py --ring-open --iterations 120`, alone and with
 `--scatter-gather`, exited 0 on every rank, and the seven `test_roce_*_gpu.py` files gave 236 passed
 and 6 skipped over two neighboring hosts. No GPU pytest ran over an open chain of more than two
-ranks. A closed four-rank ring ran the same proxy outside pytest:
-`validate_roce_ring_native.py --world-size 4 --iterations 120 --skew-rank 2`, with and without
-`--scatter-gather`, and the mixed-collectives benchmark with `--transport ring` exited 0 on every
-rank. No closed-ring GPU pytest, one-rail operation or cable-partner relay ran with this proxy.
+ranks. A closed four-rank ring ran proxy ABI 15 outside pytest: the mixed-collectives benchmark with
+`--transport ring`, which exited 0 on every rank with every output checked and plans the partner
+relay above, and `validate_roce_ring_native.py --world-size 4 --iterations 120 --skew-rank 2` with
+and without `--scatter-gather`, on the arm before the relay. No closed-ring GPU pytest, one-rail
+operation or cable-partner relay ran with this proxy.
 
 Full-model ring serving and ring performance under a model remain unqualified.
 These finite tests do not establish progress under every possible failure or

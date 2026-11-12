@@ -5,7 +5,13 @@ import ipaddress
 
 import pytest
 
-from b12x.comm.roce._routes import Endpoint, partners, plan_routes, relay_plan
+from b12x.comm.roce._routes import (
+    Endpoint,
+    partners,
+    plan_routes,
+    relay_plan,
+    ring_relay_plan,
+)
 
 
 def ep(name, iface=None, link=None):
@@ -453,6 +459,23 @@ def test_relay_plan_needs_every_rank_in_a_cable_pair():
     pair = [_switch_with_partner_cables()[r] for r in (0, 3)]
     assert partners(pair, 2) == [None, None]
     assert relay_plan(pair, 0, 2) is None
+
+
+def test_ring_relay_plan_forwards_each_far_shard_through_both_neighbors():
+    """On a closed four-rank ring a rank posts its chunks to its two neighbors only, and both of
+    them forward it to the rank across the ring, one carrying the even chunks, the other the odd."""
+    plans = [ring_relay_plan(4, rank) for rank in range(4)]
+    for rank, plan in enumerate(plans):
+        clockwise, counter = (rank + 1) % 4, (rank - 1) % 4
+        assert plan[(rank + 2) % 4] == clockwise
+        assert plan[clockwise] == -1 and plan[counter] == -1
+        assert plan[4 + clockwise] == counter and plan[4 + counter] == clockwise
+        assert plan[4 + (rank + 2) % 4] == -1
+    for source in range(4):
+        carriers = [rank for rank in range(4) if plans[rank][4 + source] != -1]
+        assert sorted(carriers) == sorted([(source + 1) % 4, (source - 1) % 4])
+        assert all(plans[rank][4 + source] == (source + 2) % 4 for rank in carriers)
+    assert all(ring_relay_plan(world, 0) is None for world in (2, 3, 5, 6, 8, 16))
 
 
 def test_a_switched_fabric_with_both_functions_of_a_link_listed_first_avoids_the_shared_link():

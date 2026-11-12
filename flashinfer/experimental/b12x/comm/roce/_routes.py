@@ -472,6 +472,28 @@ def relay_plan(
     return via + forward
 
 
+def ring_relay_plan(world: int, rank: int) -> Optional[list[int]]:
+    """The all-gather relay plan of ``rank`` for ``Proxy.set_relay`` on a closed four-rank ring.
+
+    Rank ``r`` reaches rank ``r + 2`` through ``r + 1`` and forwards ``r - 1``'s chunks to ``r + 1``;
+    ``r - 1`` likewise forwards ``r``'s chunks to ``r + 2``, so each far chunk has a carrier on
+    either cable and the proxy splits them by chunk parity. Entry ``p`` therefore names the
+    neighbor that carries ``rank``'s chunks to ``p`` (-1: sent directly) and entry ``world + s``
+    the neighbor that ``rank`` forwards rank ``s``'s chunks to (-1: none). ``None`` for any other
+    world size, where a peer's two neighbors are not both one hop from the rank across the ring.
+    """
+    if world != 4:
+        return None
+    clockwise = (rank + 1) % world
+    counter = (rank - 1) % world
+    via = [-1] * world
+    forward = [-1] * world
+    via[(rank + 2) % world] = clockwise
+    forward[counter] = clockwise
+    forward[clockwise] = counter
+    return via + forward
+
+
 __all__ = [
     "Endpoint",
     "MAX_RAILS",
@@ -479,4 +501,5 @@ __all__ = [
     "partners",
     "plan_routes",
     "relay_plan",
+    "ring_relay_plan",
 ]

@@ -43,7 +43,13 @@ from torch.distributed import ProcessGroup
 from . import _allgather_cute, _scatter_gather_cute, _twoshot_cute, _varlen_cute
 from ._oneshot_cute import PACK_BYTES, get_launcher
 from ._proxy import MAX_LANES, Layout, Proxy, load as _load_proxy_library, ring_bytes
-from ._routes import MAX_RAILS, local_endpoints, plan_routes, relay_plan
+from ._routes import (
+    MAX_RAILS,
+    local_endpoints,
+    plan_routes,
+    relay_plan,
+    ring_relay_plan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -254,8 +260,10 @@ class RoceOneshotAllReduce:
 
         ``relay`` (default ``B12X_ROCE_RELAY``, else on) relays two-shot all-gather chunks through
         cable partners when the ranks form pairs joined by direct cables (``_routes.relay_plan``);
-        on any other fabric it has no effect. Results are the same bit for bit either way. Every
-        rank must select the same value.
+        on a closed ring of four ranks each neighbor forwards half of the other's far chunks
+        (``_routes.ring_relay_plan``), so no far chunk takes a mailbox. On any other fabric it has
+        no effect. Results are the same bit for bit either way. Every rank must select the same
+        value.
 
         ``ring=True`` connects only neighbors in rank order (2..16 ranks),
         forwarding other writes through bounded native RDMA mailboxes along
@@ -542,7 +550,9 @@ class RoceOneshotAllReduce:
                 ring_open=self.ring_open,
             )
             self._proxy.connect([s[1] for s in statuses], self.routes)
-            if self.relay and not (self.ring or self.ring_open):
+            if self.relay and self.ring:
+                self.relay_plan = ring_relay_plan(self.world_size, self.rank)
+            elif self.relay and not self.ring_open:
                 self.relay_plan = relay_plan(all_endpoints, self.rank, self.rail_count)
             if self.relay_plan is not None:
                 self._proxy.set_relay(self.relay_plan)
