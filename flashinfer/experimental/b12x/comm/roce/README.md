@@ -246,6 +246,22 @@ stopped proxies through a test-only C wrapper: a two-shot graph completes at
 generation 2,147,483,647, then the next replay must report sequence exhaustion
 without advancing the epoch or posting another transfer.
 
+The mixed-collectives benchmark is a torchrun target of its own. One iteration
+replays a CUDA graph of six `gather_shards` calls (80, 12, 16, 16 and 8 MiB and
+128 KiB of gathered BF16) and three 1 MiB two-shot all-reduces, compares every
+output exactly after every replay, and reports each rank's median replay time:
+
+```sh
+B12X_ROCE_HCA=roceP2p1s0f0,roceP2p1s0f1,rocep1s0f0,rocep1s0f1 B12X_ROCE_GID_INDEX=3 \
+torchrun --nnodes=N --nproc-per-node=1 --node-rank=R \
+  --master-addr=RANK_ZERO_HOST --master-port=29650 \
+  benchmarks/experimental/b12x/benchmark_roce_mixed_collectives.py --iters 2000
+```
+
+It builds the line transport unless `--transport ring` or `--transport mesh` is
+given, and `--mix gathers` or `--mix twoshots` runs one kind of collective
+alone. A wrong output or a transport failure ends the run with exit status 3.
+
 ## Validation limits
 
 Validation used four physical DGX Sparks through a switch, with two RoCE rails
@@ -299,8 +315,8 @@ RoCE rails per link: `validate_roce_ring_native.py --ring-open --iterations 120`
 and 6 skipped over two neighboring hosts. No GPU pytest ran over an open chain of more than two
 ranks. A closed four-rank ring ran the same proxy outside pytest:
 `validate_roce_ring_native.py --world-size 4 --iterations 120 --skew-rank 2`, with and without
-`--scatter-gather`, exited 0 on every rank. No closed-ring GPU pytest, one-rail operation or
-cable-partner relay ran with this proxy.
+`--scatter-gather`, and the mixed-collectives benchmark with `--transport ring` exited 0 on every
+rank. No closed-ring GPU pytest, one-rail operation or cable-partner relay ran with this proxy.
 
 Full-model ring serving and ring performance under a model remain unqualified.
 These finite tests do not establish progress under every possible failure or
