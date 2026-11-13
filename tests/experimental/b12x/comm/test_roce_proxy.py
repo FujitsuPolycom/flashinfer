@@ -156,8 +156,8 @@ def test_ring_mailbox_is_sized_by_topology():
     assert ring_bytes(4) == 4 * 2 * 8 * small == 4_211_200
     # The same group on an open line broadcasts 256 KiB in 32 slots per destination.
     assert ring_bytes(4, ring_open=True) == 4 * 2 * 32 * 3 * large == 201_529_344
-    # A line of two or three ranks has no non-neighbor to broadcast to, so it keeps the
-    # small block; a wider ring keeps it too, growing with the world size alone.
+    # Broadcast is disabled for two- and three-rank lines, so they keep the small block.
+    # Closed rings also keep that geometry, with storage growing with the world size.
     assert ring_bytes(2, ring_open=True) == ring_bytes(2) == 2 * 2 * 8 * small
     assert ring_bytes(3, ring_open=True) == ring_bytes(3)
     assert ring_bytes(8) == 8 * 2 * 8 * small == 8_422_400

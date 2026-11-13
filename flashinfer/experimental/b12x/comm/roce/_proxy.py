@@ -23,12 +23,12 @@ _LIB: ctypes.CDLL | None = None
 
 BLOB_STRUCT_ERR = "roce proxy blob size mismatch"
 # Region layout, doorbell protocol and connection blob of ``_roce_proxy.c``; native runtimes vendor
-# the same file. ABI 15 adds the open-chain broadcast of all-gather chunks and the ring mailbox
-# geometry it uses. The region layout and every doorbell word are those of ABI 14, and the CuTe
-# kernel sources have not changed since ABI 11, so kernels exported at ABI 11 through 14 keep
-# their captured addresses. Every rank of a group must run the same proxy source: the setup
-# configuration the ranks compare includes this number, and ``roce_connect`` rejects ranks whose
-# ring window, packet size or protocol tag differ.
+# the same file. ABI 15 supports open-chain all-gather broadcast and its ring mailbox geometry.
+# The region layout and every doorbell word match ABI 14, and the CuTe kernel sources match
+# those used by ABI 11 through 14, so kernels exported at those ABIs retain their captured
+# addresses. Every rank of a group must run the same proxy source: the setup configuration
+# the ranks compare includes this number, and ``roce_connect`` rejects ranks whose ring window,
+# packet size or protocol tag differ.
 ABI_VERSION = 15
 # Reliable queue pairs per rail (``ROCE_MAX_LANES``): consecutive chunks of one peer and rail use
 # separate lanes.

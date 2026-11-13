@@ -1,6 +1,6 @@
 // What a relayed packet needs and where it may go, driven against the production
 // proxy with a fake verbs provider: the queue pair must declare the two send SGEs
-// one packet uses, the startup mailbox has to be sized, a context that failed or
+// a per-destination packet uses, the startup mailbox has to be sized, a context that failed or
 // was stopped inside an operation must never restart, and a fanout packet may only
 // replace a per-destination relay where some destination is not a neighbor. The
 // provider enforces the declared cap and copies every accepted write where a NIC
@@ -276,9 +276,9 @@ int main(void) {
           "the stop records why the context is terminal");
   require(roce_start(&terminal) == -1, "a terminal context refuses to start again");
 
-  // A fanout packet only pays when some destination is not a neighbor. On a two- or
-  // three-rank line every destination is one, so a broadcast there would replace a
-  // direct write with a relayed packet the CPU relay has to service.
+  // Two- and three-rank open chains retain per-destination delivery. A three-rank
+  // chain has a non-neighbor endpoint pair, but broadcast is enabled only from
+  // four ranks; this check verifies that threshold rather than a speedup claim.
   reset(2, ORIGIN, 4, 1);
   require(ring_fanout(&relay) == 0, "a two-rank line does not fan out");
   post_chunk();
@@ -309,8 +309,7 @@ int main(void) {
   require(row_flags[1] == 0, "a fanout payload publishes no local flag");
   require(row_payload[2] == 0 && row_payload[3] == 0, "a fanout writes no other peer's row");
 
-  // Four ranks on a closed ring: the far peer is relayed per destination, as before
-  // the fanout existed.
+  // Four ranks on a closed ring: the far peer uses per-destination relay delivery.
   reset(4, ORIGIN, 4, 0);
   require(ring_fanout(&relay) == 0, "a closed ring does not fan out");
   post_chunk();

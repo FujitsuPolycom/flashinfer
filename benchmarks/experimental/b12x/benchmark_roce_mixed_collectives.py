@@ -28,10 +28,13 @@ One iteration replays a CUDA graph of pipelined collectives over BF16 operands
 
 The graph holds no barrier between ranks, so consecutive collectives follow one
 another as closely as each rank's kernels allow.  Before every replay each rank
-fills every source with a small integer that differs by rank, operation and
-iteration, and fills every output with NaN.  After the replay it compares every
-output with its expected value exactly: a gather must hold each rank's value in
-that rank's rows, and an all-reduce the sum over ranks.  A wait timeout or a
+fills every source with a small integer derived from rank, operation and
+iteration modulo 16, and fills every output with NaN.  The patterns can repeat
+across operations and iterations and cannot distinguish stale data with the
+same value or permutations within a peer's uniformly filled rows.  After the
+replay it compares every output with its expected value exactly: a gather must
+hold each rank's value in that rank's rows, and an all-reduce the sum over
+ranks.  A wait timeout or a
 proxy failure is reported as a stall, a wrong output as corruption; either ends
 the run with exit status 3.
 
@@ -114,8 +117,9 @@ def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] rank{rank} {msg}", flush=True)
 
 
-# Operand values.  Every (iteration, operation) pair has its own value, so a
-# receive row left from any earlier operation or iteration fails the check.
+# Operand patterns vary by operation, rank and iteration modulo 16. Exact comparisons
+# detect mismatched pattern values, but cannot distinguish stale data with the same value
+# or permutations within a peer's uniformly filled rows.
 def gather_value(index: int, iteration: int) -> int:
     return (iteration % 16) * 4 + index
 

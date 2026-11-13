@@ -234,10 +234,10 @@ _Static_assert(CTRL_CREDIT >= CTRL_READY_VL + ROCE_VARLEN_MAX_CHUNKS &&
 //   7. Rails are independent: serials and acknowledgments are per rail, the GPU
 //      waits on every rail's flag, and a credit proves the previous kernel's
 //      completion on all rails.
-// A mailbox that only relays per destination carries main's geometry: 64 KiB
-// packets behind an eight-slot window. The bigger mailbox is for the broadcast,
-// which needs a 256 KiB packet in one strip and a 32-slot window per destination,
-// and starts on an open chain of four ranks where the first non-neighbor appears.
+// Per-destination relay mailboxes use 64 KiB packets and an eight-slot window.
+// Open chains of four or more ranks use 256 KiB packets and one 32-slot window
+// per destination for broadcast. Two- and three-rank chains keep the smaller
+// mailbox and per-destination delivery.
 #define RING_CHUNK_BYTES 65536
 #define RING_WINDOW 8
 #define RING_OPEN_CHUNK_BYTES 262144
@@ -492,11 +492,10 @@ static int ring_relayed(const roce_ctx_t* c, int peer) {
   if (c->ring_open) return peer != c->rank + 1 && peer != c->rank - 1;
   return peer != (c->rank + 1) % c->world && peer != (c->rank + c->world - 1) % c->world;
 }
-// The all-gather fanout replaces one relayed packet per destination with one
-// packet per direction. On a two- or three-rank line every destination is a
-// neighbor, so the fanout would replace a direct write with a relayed packet
-// that the CPU relay has to service, and it starts at four ranks. A cabled-pair
-// relay plan forwards chunks itself and keeps the per-destination path.
+// All-gather fanout sends one packet per direction instead of one per destination.
+// It is enabled only on open chains of four or more ranks. Two- and three-rank
+// chains, including the non-neighbor endpoint pair of a three-rank chain, keep
+// per-destination delivery. Cable-partner relay plans use per-destination delivery.
 static int ring_fanout(const roce_ctx_t* c) {
   return c->ring != NULL && c->ring_open && c->world > 3 && !c->relay;
 }

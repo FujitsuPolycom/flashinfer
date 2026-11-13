@@ -108,11 +108,13 @@ recreate every rank's runtime to reset the sequence. The bound preserves the
 meaning of zero-initialized chunk-ready words and the healthy error sentinel.
 It applies to the direct and ring transports and does not change the proxy ABI.
 
-Every queue pair is created with two send scatter-gather entries, because a relay packet carries its
-descriptor and its payload in one RDMA write; `roce_create` fails for a device whose `max_sge` is below
-two, on every transport. A context that failed, or that was stopped while posting an operation, is
-terminal: `roce_start` refuses it and the runtime must be recreated, because a partly posted
-operation leaves a serial that downstream ranks wait for.
+Every queue pair declares support for two send scatter-gather entries. A per-destination relay
+combines descriptor and payload in a two-SGE RDMA write, followed by its commit write. A broadcast
+writes descriptor, final receive-row payload and commit separately in queue-pair order.
+`roce_create` fails for a device whose `max_sge` is below two, on every transport. A context that
+failed, or that was stopped while posting an operation, is terminal: `roce_start` refuses it and
+the runtime must be recreated, because a partly posted operation leaves a serial that downstream
+ranks wait for.
 
 ## Rails, lanes and the all-gather relay
 
@@ -166,7 +168,7 @@ instead of relayed once per destination (proxy ABI 15). Each packet names the fa
 target; its payload is written into the next host's receive row, and every host it passes publishes
 the flag for its own row and forwards the bytes from that row, so each rank's shard crosses each link
 once: 12 shard-sized link transfers for a round on a four-rank line against 20, and 8 on a middle
-rank against 14. The broadcast starts at four ranks, where the first non-neighbor appears. The
+rank against 14. Broadcast is enabled only for open chains of four or more ranks; two- and three-rank chains retain per-destination delivery. The
 reduce-scatter phase, one-shot and variable-length transfers, and every transfer on a cycle or
 between cable partners keep per-destination delivery. Broadcast packets are forwarded in serial
 order, not arrival order: a hop forwards the next serial of its origin, target and rail
@@ -177,9 +179,9 @@ its arrivals in the order the origin posted them.
 A runtime must budget the mailbox block before it constructs the transport: `roce_ring_bytes(world,
 open)` returns its size in bytes per rank for that topology (201,529,344 at four ranks on a line,
 4,211,200 on a ring, zero outside 2..16), `roce_enable_ring` or `roce_enable_ring_open` allocates and
-registers it, and `native_description()["ring_bytes"]` reports it. Only the broadcast needs 256 KiB
-packets behind a 32-slot window per destination; every other topology keeps the 64 KiB packet and
-eight-slot window that the per-destination relay has always used.
+registers it, and `native_description()["ring_bytes"]` reports it. Broadcast topologies use 256 KiB
+packets behind a 32-slot window per destination; every other topology uses 64 KiB packets and an
+eight-slot window shared by destinations for each origin and rail.
 
 ## Runnable checks
 
