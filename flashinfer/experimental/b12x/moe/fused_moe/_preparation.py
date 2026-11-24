@@ -264,6 +264,7 @@ def _query(
         csf_inline_scales=plan.csf_inline_scales,
         a4_prefill=invocation.get("a4_prefill"),
         autotune_effort=capture_autotune_effort().value,
+        prequantized_input=capacity.input_format == "mxfp8",
     )
 
 
@@ -391,6 +392,7 @@ def _lower_caps(
             query.controls.get("w4a16_skip_empty_m_blocks", True)
         ),
         swiglu_beta=_decode_scalar(query.swiglu_beta),
+        prequantized_input=query.prequantized_input,
     )
 
 
@@ -912,6 +914,7 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
         "direct_routing": direct_routing,
         "external_route_plan": external_route_plan,
         "share_input_across_experts": share_input,
+        "prequantized_input": bool(caps.prequantized_input),
         "planned_tile_m": tile_m,
         "mma_warps": plan.decode_config.dynamic_mma_warps,
         "materialized_fc1_cta_budget": plan.decode_config.materialized_fc1_cta_budget,
@@ -1119,6 +1122,7 @@ def _program_carriers(
                 direct_routing=dynamic["direct_routing"],
                 external_route_plan=dynamic["external_route_plan"],
                 share_input_across_experts=dynamic["share_input_across_experts"],
+                prequantized_input=dynamic["prequantized_input"],
                 deterministic_output=plan.deterministic_output,
                 raw_routes=dynamic["raw_routes"],
                 split_fc1_scales=caps.split_fc1_scales,
