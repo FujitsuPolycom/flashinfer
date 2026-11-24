@@ -140,6 +140,7 @@ class MoEDynamicKernelBackend:
         mma_warps: int | None = None,
         dynamic_down_scale: bool = False,
         share_input_across_experts: bool = False,
+        prequantized_input: bool = False,
         deterministic_output: bool = False,
         raw_routes: bool = False,
         split_fc1_scales: bool = False,
@@ -606,6 +607,18 @@ class MoEDynamicKernelBackend:
             )
         self.dynamic_down_scale = dynamic_down_scale
         self.share_input_across_experts = share_input_across_experts
+        self.prequantized_input = bool(prequantized_input)
+        if self.prequantized_input and not (
+            self.is_w4a8
+            and self.w4a8_repacked
+            and self.share_input_across_experts
+            and self.materialize_intermediate
+            and not self.w4a8_trellis
+            and not self.direct_routing
+        ):
+            raise ValueError(
+                "prequantized_input requires repacked W4A8 MX with shared materialized inputs"
+            )
         self.raw_routes = bool(raw_routes)
         self.split_fc1_scales = bool(split_fc1_scales)
         self.deterministic_output = bool(deterministic_output)
@@ -3197,7 +3210,9 @@ class MoEDynamicKernelBackend:
                         )
 
                         if token_has_active_route > Int32(0):
-                            if cutlass.const_expr(self.is_w4a8):
+                            if cutlass.const_expr(self.prequantized_input):
+                                pass
+                            elif cutlass.const_expr(self.is_w4a8):
                                 # A token's BF16 row is identical for every routed
                                 # expert. The materialized specialization stores one
                                 # quantized row per token and gathers it in FC1; the

@@ -58,9 +58,10 @@ class MoeDecodeQuery:
     swiglu_clamp_after_silu: bool = False
     a4_prefill: bool | None = None
     autotune_effort: str = "default"
+    prequantized_input: bool = False
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        d = {
             "output_layout": self.output_layout,
             "split_fc1_scales": self.split_fc1_scales,
             "a4_prefill": self.a4_prefill,
@@ -96,6 +97,9 @@ class MoeDecodeQuery:
             "fast_math": self.fast_math,
             "weight_layouts": self.weight_layouts,
         }
+        if self.prequantized_input:
+            d["prequantized_input"] = True
+        return d
 
 
 @dataclass(frozen=True)
@@ -648,6 +652,15 @@ def validate_moe_decode_config(
         )
     if config.backend not in {"micro", "dynamic", "w4a16"}:
         raise ValueError(f"unsupported MoE backend {config.backend!r}")
+    if query.prequantized_input and (
+        config.backend != "dynamic"
+        or query.quant_mode != "w4a8_mx"
+        or config.dynamic_route_mode == "direct"
+        or config.dynamic_tile_m not in {32, 64, 128}
+    ):
+        raise ValueError(
+            "prequantized MXFP8 MoE inputs require grouped dynamic W4A8 MX execution"
+        )
     if config.w4a16_packed_schedule not in {"fused", "split"}:
         raise ValueError("W4A16 packed schedule must be 'fused' or 'split'")
     if config.w4a16_packed_schedule == "split" and not (

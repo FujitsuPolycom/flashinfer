@@ -853,6 +853,7 @@ class TPMoEScratchCaps:
     w4a16_a4_prefill_enabled: bool = False
     w4a16_a4_prefill_terms: int = 1
     w4a16_a4_prefill_warps: int = 8
+    prequantized_input: bool = False
     frozen: bool = True
 
     def __post_init__(self) -> None:
@@ -1014,6 +1015,7 @@ class TPMoEScratchPlan:
         layer_idx: int | None = None,
         route_expert_map: torch.Tensor | None = None,
         output_expert_map: torch.Tensor | None = None,
+        a_scales: torch.Tensor | None = None,
         scales_expanded: bool = False,
         a4_prefill: bool | None = None,
         _w4a16_launches: object | None = None,
@@ -1050,6 +1052,35 @@ class TPMoEScratchPlan:
                 f"top-k {int(topk_ids.shape[1])} does not match TP MoE scratch "
                 f"top-k={int(self.caps.num_topk)}"
             )
+        if a_scales is not None:
+            if not self.caps.prequantized_input:
+                raise ValueError(
+                    "a_scales requires a prequantized_input TP MoE scratch plan"
+                )
+            if (
+                a.dtype != torch.float8_e4m3fn
+                or not a.is_contiguous()
+                or a.data_ptr() % 16
+            ):
+                raise ValueError(
+                    "prequantized MoE input a must be contiguous 16B-aligned float8_e4m3fn"
+                )
+            if (
+                a_scales.dtype not in (torch.uint8, torch.float8_e8m0fnu)
+                or a_scales.device != a.device
+                or not a_scales.is_contiguous()
+                or a_scales.data_ptr() % 16
+                or tuple(a_scales.shape)
+                not in (
+                    (int(a.shape[0]), int(a.shape[1]) // 32),
+                    (1, int(a.shape[0]), int(a.shape[1]) // 32),
+                )
+            ):
+                raise ValueError(
+                    "prequantized MoE a_scales must be contiguous 16B-aligned [M, K//32] UE8M0"
+                )
+        elif self.caps.prequantized_input:
+            raise ValueError("prequantized_input TP MoE scratch plan requires a_scales")
         scratch_storage = scratch_tensor(scratch, self._scratch_specs, owner="TP MoE")
         # Eager vLLM bind: MAP caller-owned scratch into per-spec kernel-arg views
         # and build the binding directly. NEVER construct a workspace/arena object
@@ -1172,6 +1203,7 @@ class TPMoEScratchPlan:
             execution_plan=self.launch_plan,
             tensors=tensors,
             a=a,
+            a_scales=a_scales,
             experts=experts,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
@@ -1301,6 +1333,7 @@ class TPMoEFP4Binding:
     a4_prefill_launches: object | None = None
     # The caller expanded every expert's NVFP4-CSF scales with expand_scales().
     scales_expanded: bool = False
+    a_scales: torch.Tensor | None = None
     csf_route_pack: bool = False
     mixed_trellis_binding: object | None = None
     mixed_trellis_buffers: object | None = None
@@ -2888,7 +2921,11 @@ def _heuristic_moe_decode_config(
         # kernel; there is no micro specialization for them.
         backend = "dynamic"
     elif query.quant_mode == "w4a8_mx":
-        backend = "micro" if _w4a8_mx_micro_preferred(query, device) else "dynamic"
+        backend = (
+            "dynamic"
+            if query.prequantized_input
+            else ("micro" if _w4a8_mx_micro_preferred(query, device) else "dynamic")
+        )
     else:
         backend = select_tp_moe_backend(
             num_tokens=query.num_tokens,
@@ -2914,7 +2951,9 @@ def _heuristic_moe_decode_config(
         if compact_n64_pipeline:
             # Larger compact launches use the split-materialized M16 kernels.
             # The direct compact micro path owns one through sixteen live tokens.
-            dynamic_tile_m = 16
+            # Pre-quantized MXFP8 inputs require the dense shared-input repacked
+            # path, which selects M64 for N % 128 == 64 shapes.
+            dynamic_tile_m = 64 if query.prequantized_input else 16
             dynamic_route_mode = "grouped"
         else:
             dynamic_n = _dynamic_kernel_intermediate_size(
@@ -2931,10 +2970,16 @@ def _heuristic_moe_decode_config(
                     None if device is None else device.compute_capability
                 ),
             )[0]
-            dynamic_route_mode = _heuristic_dynamic_route_mode(
-                query,
-                device,
-                planned_tile_m=dynamic_tile_m,
+            if query.prequantized_input and dynamic_tile_m == 16:
+                dynamic_tile_m = 32
+            dynamic_route_mode = (
+                "grouped"
+                if query.prequantized_input
+                else _heuristic_dynamic_route_mode(
+                    query,
+                    device,
+                    planned_tile_m=dynamic_tile_m,
+                )
             )
     return MoeDecodeConfig(
         backend=backend,
@@ -3043,6 +3088,7 @@ def _build_tp_moe_fp4_binding_from_views(
     execution_plan: TPMoEPlan,
     tensors: Dict[str, torch.Tensor],
     a: torch.Tensor,
+    a_scales: torch.Tensor | None = None,
     experts: B12XFP4ExpertWeights,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -3137,7 +3183,7 @@ def _build_tp_moe_fp4_binding_from_views(
         source_format=source_format,
         activation=activation,
         w13_layout=w13_layout,
-        dtype=a.dtype,
+        dtype=plan.dtype if a_scales is not None else a.dtype,
         hidden_size=k,
     )
     num_topk = int(topk_ids.shape[1])
@@ -3213,6 +3259,7 @@ def _build_tp_moe_fp4_binding_from_views(
 
     common_kwargs = dict(
         a=a,
+        a_scales=a_scales,
         experts=experts,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
@@ -11380,6 +11427,7 @@ def _get_dynamic_kernel(
     direct_routing: bool = False,
     external_route_plan: bool = False,
     share_input_across_experts: bool = False,
+    prequantized_input: bool = False,
     deterministic_output: bool = False,
     raw_routes: bool = False,
     split_fc1_scales: bool = False,
@@ -11526,6 +11574,7 @@ def _get_dynamic_kernel(
         int(trellis_bits),
         bool(trellis_intermediate_hadamard),
         *(("csf_inline_scales",) if csf_inline_scales else ()),
+        *(("prequantized_input",) if prequantized_input else ()),
     )
     reuse_compiled = _first_env(
         "B12X_DYNAMIC_REUSE_COMPILED",
@@ -11566,6 +11615,8 @@ def _get_dynamic_kernel(
     if materialized_fc1_cta_budget != 2:
         kernel_kwargs["materialized_fc1_cta_budget"] = materialized_fc1_cta_budget
     kernel_kwargs["share_input_across_experts"] = share_input_across_experts
+    if prequantized_input:
+        kernel_kwargs["prequantized_input"] = True
     if raw_routes or split_fc1_scales:
         kernel_kwargs["raw_routes"] = raw_routes
         kernel_kwargs["split_fc1_scales"] = split_fc1_scales
@@ -11634,7 +11685,12 @@ def _get_dynamic_kernel(
 
     # a_input, topk_ids, topk_weights, scatter_output are pointers — shapes
     # are constructed at runtime from num_tokens Int32.
-    a_input_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    a_input_fake = make_ptr(
+        cutlass.Float8E4M3FN if prequantized_input else a_dtype,
+        16,
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
     topk_ids_fake = make_ptr(
         topk_ids_cutlass_dtype,
         topk_ids_align,
@@ -11944,6 +12000,7 @@ def _launch_dynamic_flat(
     mma_warps: int | None = None,
     materialized_fc1_cta_budget: int = 2,
     share_input_across_experts: bool,
+    prequantized_input: bool = False,
     deterministic_output: bool,
     raw_routes: bool = False,
     swiglu_limit: float | None,
@@ -12174,6 +12231,7 @@ def _launch_dynamic_flat(
         direct_routing=direct_routing,
         external_route_plan=external_route_plan,
         share_input_across_experts=share_input_across_experts,
+        prequantized_input=prequantized_input,
         deterministic_output=deterministic_output,
         raw_routes=raw_routes,
         split_fc1_scales=w1_alpha.numel() == 2 * E,
@@ -12229,7 +12287,7 @@ def _launch_dynamic_flat(
         cutlass.Float8E8M0FNU if is_byte_container else cutlass.Float8E4M3FN
     )
     compiled(
-        _gptr(cutlass.BFloat16, a),
+        _gptr(cutlass.Float8E4M3FN if prequantized_input else cutlass.BFloat16, a),
         _gptr(ids_cutlass_dtype, flat_ids, ids_align),
         _gptr(cutlass.Float32, flat_weights, 4),
         _gptr(packed_a_cutlass_dtype, packed_a_view),
@@ -12315,6 +12373,7 @@ _DYNAMIC_TILE_M_POLICY_CODES = {16: 0, 32: 1, 64: 2, 128: 3}
 _DYNAMIC_POLICY_TILE_MS = tuple(_DYNAMIC_TILE_M_POLICY_CODES)
 # Bits 10..61 encode the cluster limit; bit 62 selects FC1 budget three.
 # The signed high bit selects unweighted route output storage.
+_DYNAMIC_PREQUANTIZED_INPUT_BIT = 1 << 61
 _DYNAMIC_FC1_BUDGET3_BIT = 1 << 62
 _DYNAMIC_RAW_ROUTES_BIT = 1 << 63
 
@@ -12332,6 +12391,7 @@ def _encode_dynamic_launch_policy(
     mma_warps: int | None = None,
     materialized_fc1_cta_budget: int = 2,
     swiglu_clamp_after_silu: bool = False,
+    prequantized_input: bool = False,
 ) -> int:
     try:
         tile_code = _DYNAMIC_TILE_M_POLICY_CODES[int(planned_tile_m)]
@@ -12341,7 +12401,7 @@ def _encode_dynamic_launch_policy(
         ) from exc
     if policy_max_active_clusters < -1:
         raise ValueError("policy_max_active_clusters must be -1 or nonnegative")
-    if policy_max_active_clusters > (1 << 52) - 2:
+    if policy_max_active_clusters > (1 << 51) - 2:
         raise ValueError("policy_max_active_clusters exceeds the launch policy field")
     if type(
         materialized_fc1_cta_budget
@@ -12360,6 +12420,7 @@ def _encode_dynamic_launch_policy(
         | (int(bool(swiglu_clamp_after_silu)) << 8)
         | (int(bool(csf_inline_scales)) << 9)
         | ((int(policy_max_active_clusters) + 1) << 10)
+        | (_DYNAMIC_PREQUANTIZED_INPUT_BIT if prequantized_input else 0)
         | (_DYNAMIC_FC1_BUDGET3_BIT if materialized_fc1_cta_budget == 3 else 0)
     )
 
@@ -12376,7 +12437,7 @@ def _decode_dynamic_launch_policy(
         bool(value & 32),
         bool(value & 64),
         4 if value & 128 else None,
-        ((value & (_DYNAMIC_FC1_BUDGET3_BIT - 1)) >> 10) - 1,
+        ((value & (_DYNAMIC_PREQUANTIZED_INPUT_BIT - 1)) >> 10) - 1,
     )
 
 
@@ -12489,6 +12550,7 @@ def _tp_moe_dynamic_launch_op(
         policy_max_active_clusters,
     ) = _decode_dynamic_launch_policy(launch_policy)
     swiglu_clamp_after_silu = bool(launch_policy & 256)
+    prequantized_input = bool(launch_policy & _DYNAMIC_PREQUANTIZED_INPUT_BIT)
     _launch_dynamic_flat(
         packed_a_view=packed_a_view,
         packed_a_flat=packed_a_flat,
@@ -12556,6 +12618,7 @@ def _tp_moe_dynamic_launch_op(
         else 2,
         mma_warps=mma_warps,
         share_input_across_experts=share_input_across_experts,
+        prequantized_input=prequantized_input,
         deterministic_output=deterministic_output,
         swiglu_limit=swiglu_limit,
         swiglu_clamp_after_silu=swiglu_clamp_after_silu,
@@ -12668,6 +12731,8 @@ def _launch_dynamic(
     mma_warps: int | None = None,
     materialized_fc1_cta_budget: int = 2,
     share_input_across_experts: bool = False,
+    prequantized_input: bool = False,
+    prequantized_scales: torch.Tensor | None = None,
     deterministic_output: bool = False,
     raw_routes: bool = False,
     swiglu_limit: float | None = None,
@@ -12695,6 +12760,7 @@ def _launch_dynamic(
         mma_warps=mma_warps,
         materialized_fc1_cta_budget=materialized_fc1_cta_budget,
         swiglu_clamp_after_silu=swiglu_clamp_after_silu,
+        prequantized_input=prequantized_input,
     )
     if raw_routes:
         launch_policy -= _DYNAMIC_RAW_ROUTES_BIT
@@ -12733,10 +12799,18 @@ def _launch_dynamic(
         if w4a8_repacked:
             w13_sfb_rp, down_sfb_rp = dynamic_w13_sf, dynamic_down_sf
     sfb_down_mx = weights.sfb_down_mx
+    launch_packed_a_flat = (
+        a.view(torch.uint8).view(-1) if prequantized_input else workspace.packed_a_flat
+    )
+    launch_scale_flat = (
+        prequantized_scales.view(torch.uint8).view(-1)
+        if prequantized_input
+        else workspace.scale_flat
+    )
     torch.ops.b12x.tp_moe_dynamic_launch(
         workspace.packed_a_view,
-        workspace.packed_a_flat,
-        workspace.scale_flat,
+        launch_packed_a_flat,
+        launch_scale_flat,
         workspace.materialized_intermediate,
         workspace.barrier_count,
         workspace.barrier_epoch,
@@ -13814,13 +13888,14 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         )
     num_topk = topk_ids.shape[1]
     m, k = a.shape
+    prequantized_input = binding.a_scales is not None
     prepared_payload = _prepared_payload_for_runtime(
         experts,
         quant_mode=quant_mode,
         source_format=source_format,
         activation=activation,
         w13_layout=w13_layout,
-        dtype=a.dtype,
+        dtype=binding.dtype if prequantized_input else a.dtype,
         hidden_size=k,
     )
     if (
@@ -13845,7 +13920,13 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             f"prepared hidden_size mismatch: expected {k}, got {prepared_hidden}"
         )
     prepared_dtype = experts.plan.io_dtype
-    if prepared_dtype != str(a.dtype).removeprefix("torch."):
+    if prequantized_input:
+        if prepared_dtype != str(binding.dtype).removeprefix("torch."):
+            raise TypeError(
+                f"prepared weights were built for {prepared_dtype}, but binding dtype is "
+                f"{binding.dtype}"
+            )
+    elif prepared_dtype != str(a.dtype).removeprefix("torch."):
         raise TypeError(
             f"prepared weights were built for {prepared_dtype}, but a has "
             f"dtype {a.dtype}"
@@ -14149,19 +14230,22 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
 
     raw_routes = binding.output_layout == "routes"
     output_shape = (m, num_topk, k) if raw_routes else (m, k)
+    expected_output_dtype = binding.dtype if prequantized_input else a.dtype
     if output is None:
         if torch.cuda.is_current_stream_capturing():
             raise ValueError("CUDA graph capture requires a caller-owned output buffer")
-        scatter_output = torch.zeros(output_shape, dtype=a.dtype, device=device)
+        scatter_output = torch.zeros(
+            output_shape, dtype=expected_output_dtype, device=device
+        )
     else:
         scatter_output = output
     if scatter_output.shape != output_shape:
         raise ValueError(
             f"output must have shape {output_shape}, got {tuple(scatter_output.shape)}"
         )
-    if scatter_output.dtype != a.dtype:
+    if scatter_output.dtype != expected_output_dtype:
         raise ValueError(
-            f"output must have dtype {a.dtype}, got {scatter_output.dtype}"
+            f"output must have dtype {expected_output_dtype}, got {scatter_output.dtype}"
         )
     if scatter_output.device != device:
         raise ValueError(
@@ -14303,6 +14387,8 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             planned_tile_m=planned_tile_m,
             planned_num_tokens=plan.routed_rows // plan.num_topk,
             dynamic_route_mode=decode_config.dynamic_route_mode or "",
+            prequantized_input=prequantized_input,
+            prequantized_scales=binding.a_scales,
             share_input_across_experts=(
                 (quant_mode == "nvfp4" and decode_config.nvfp4_share_input)
                 or (
