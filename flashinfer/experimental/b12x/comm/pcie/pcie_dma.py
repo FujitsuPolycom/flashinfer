@@ -320,6 +320,19 @@ class PCIeDmaAllReduce:
         size_bytes = numel * inp.element_size()
         return inp.is_contiguous() and size_bytes <= self.shard_capacity
 
+    def should_reduce_scatter(self, inp: torch.Tensor) -> bool:
+        if self._closed or inp.device != self.device:
+            return False
+        if inp.dtype not in SUPPORTED_DTYPES:
+            return False
+        if inp.ndim < 1 or inp.shape[0] % self.world_size != 0:
+            return False
+        numel = inp.numel()
+        if numel <= 0 or numel % (self.world_size * 8) != 0:
+            return False
+        size_bytes = numel * inp.element_size()
+        return inp.is_contiguous() and size_bytes <= self.max_bytes
+
     def prepare_eager_replay(
         self, dtype: torch.dtype, *, max_elements: int | None = None
     ) -> None:
@@ -433,6 +446,58 @@ class PCIeDmaAllReduce:
                 (self.world_size, *inp.shape), dtype=inp.dtype, device=inp.device
             )
         return state.run_all_gather(inp, out=out)
+
+    def reduce_scatter(
+        self,
+        inp: torch.Tensor,
+        *,
+        plan: Plan,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Experimental Copy-Engine ring reduce-scatter `[world_size * rows, *tail] -> [rows, *tail]`.
+
+        Runs ``world_size - 1`` Copy-Engine peer-copy and ``dma_add`` reduction
+        hops across the channel's preallocated IPC scratch slots and writes
+        this rank's summed shard directly into ``out`` without a trailing
+        all-gather phase.
+
+        Experimental API: opt in by preparing a DMA plan for this channel via
+        ``b12x.comm.pcie.plan(query, runtime=channel)`` and passing the
+        materialized ``plan`` here.
+
+        Limitations:
+            - Supported dtypes: ``torch.bfloat16``, ``torch.float16``, ``torch.float32``.
+            - ``inp`` (and ``out`` when provided) must be contiguous on this
+              channel's CUDA device, with ``inp.ndim >= 1``,
+              ``inp.shape[0] % world_size == 0``, ``inp.numel()`` nonzero, and
+              ``inp.numel() % (world_size * 8) == 0``.
+            - ``inp.nbytes`` must not exceed ``self.max_bytes``.
+            - ``out`` must have shape ``(inp.shape[0] // world_size, *inp.shape[1:])``
+              and storage strictly disjoint from ``inp`` (in-place or aliased
+              outputs are rejected).
+            - Executes lossless ``dma_add`` ring reductions regardless of any
+              compressed ``all_reduce`` wire mode configured on the channel.
+            - Channel submissions must be serialized across invocations and graphs.
+        """
+
+        state = require_prepared(plan, "comm.pcie", self.device)
+        if not hasattr(state, "require_runtime") or not hasattr(
+            state, "run_reduce_scatter"
+        ):
+            raise TypeError("plan does not contain a prepared DMA channel")
+        state.require_runtime(self)
+        if not self.should_reduce_scatter(inp):
+            raise ValueError(
+                "input does not satisfy ring reduce_scatter requirements "
+                f"(shape={tuple(inp.shape)}, dtype={inp.dtype}, device={inp.device})"
+            )
+        if out is None:
+            out = torch.empty(
+                (inp.shape[0] // self.world_size, *inp.shape[1:]),
+                dtype=inp.dtype,
+                device=self.device,
+            )
+        return state.run_reduce_scatter(inp, out=out)
 
     @contextmanager
     def capture(self, stream: torch.cuda.Stream | None = None):
@@ -846,6 +911,128 @@ class PCIeDmaAllReduce:
                     piece_ptr(recv_chunk, p),
                     scratch_piece(rank, k, p),
                     piece_bytes,
+                )
+                add_done[p].record(main)
+
+        main.wait_stream(copy_stream)
+        main.wait_stream(flag_stream)
+        done = FLAG_SLOTS - 2
+        kernels.dma_set_flag(
+            self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
+        )
+        kernels.dma_wait_flag(
+            self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
+        )
+        return out
+
+    def _run_prepared_reduce_scatter(
+        self, inp: torch.Tensor, *, out: Optional[torch.Tensor], state
+    ) -> torch.Tensor:
+        state.require_runtime(self)
+        torch.cuda.set_device(self.device)
+        if not self.should_reduce_scatter(inp):
+            raise ValueError(
+                "input does not satisfy ring reduce_scatter requirements "
+                f"(shape={tuple(inp.shape)}, dtype={inp.dtype}, device={inp.device})"
+            )
+        expected_shape = (inp.shape[0] // self.world_size, *inp.shape[1:])
+        if (
+            out is None
+            or tuple(out.shape) != expected_shape
+            or out.dtype != inp.dtype
+            or out.device != self.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                f"DMA reduce_scatter output must be contiguous {expected_shape} {inp.dtype} on {self.device}"
+            )
+        in_ptr = inp.data_ptr()
+        out_ptr = out.data_ptr()
+        in_bytes = inp.numel() * inp.element_size()
+        out_bytes = out.numel() * out.element_size()
+        if in_ptr < out_ptr + out_bytes and out_ptr < in_ptr + in_bytes:
+            raise ValueError(
+                "DMA reduce_scatter requires disjoint input and output storage"
+            )
+        kernels = self._kernels
+        world = self.world_size
+        rank = self.rank
+        nxt = (rank + 1) % world
+        prv = (rank - 1) % world
+        dtype_code = SUPPORTED_DTYPES[inp.dtype]
+        elem = inp.element_size()
+        shard_elems = inp.numel() // world
+        shard_bytes = shard_elems * elem
+        pieces = self._pick_pieces(shard_elems, shard_bytes)
+        piece_elems = shard_elems // pieces
+        piece_bytes = piece_elems * elem
+        steps = world - 1
+
+        in_base = in_ptr
+        out_base = out_ptr
+        main = torch.cuda.current_stream(self.device)
+        copy_stream = self._copy_stream
+        flag_stream = self._flag_stream
+        add_done = self._piece_events
+        copied = self._copied_events
+
+        def in_piece_ptr(chunk: int, piece: int) -> int:
+            return in_base + chunk * shard_bytes + piece * piece_bytes
+
+        def out_piece_ptr(piece: int) -> int:
+            return out_base + piece * piece_bytes
+
+        def recv_scratch_piece(owner: int, step: int, piece: int) -> int:
+            return self._scratch_ptr(owner, step) + piece * piece_bytes
+
+        def accum_scratch_piece(owner: int, step: int, piece: int) -> int:
+            # Slots [0 .. world - 2] receive peer payloads; slots
+            # [world - 1 .. 2 * world - 4] hold intermediate partial sums when world > 2.
+            return self._scratch_ptr(owner, (world - 1) + step) + piece * piece_bytes
+
+        def slot(step: int, piece: int) -> int:
+            return step * pieces + piece
+
+        self._input_ready.record(main)
+        copy_stream.wait_event(self._input_ready)
+        flag_stream.wait_event(self._input_ready)
+
+        for k in range(steps):
+            # Offset starting chunk by -1 so the final hop (k = world - 2) reduces chunk rank.
+            send_chunk = (rank - 1 - k) % world
+            recv_chunk = (rank - 2 - k) % world
+            final_step = k == steps - 1
+            for p in range(pieces):
+                send_src = (
+                    in_piece_ptr(send_chunk, p)
+                    if k == 0
+                    else accum_scratch_piece(rank, k - 1, p)
+                )
+                send_dst = recv_scratch_piece(nxt, k, p)
+                with torch.cuda.stream(copy_stream):
+                    if k > 0:
+                        copy_stream.wait_event(add_done[p])
+                    kernels.dma_copy(send_dst, send_src, piece_bytes)
+                    copied[slot(k, p)].record(copy_stream)
+                with torch.cuda.stream(flag_stream):
+                    flag_stream.wait_event(copied[slot(k, p)])
+                    kernels.dma_set_flag(
+                        self._flag_ptr(nxt, slot(k, p)),
+                        self._counter_ptr(self._send_counters, slot(k, p)),
+                    )
+                kernels.dma_wait_flag(
+                    self._flag_ptr(rank, slot(k, p)),
+                    self._counter_ptr(self._wait_counters, slot(k, p)),
+                )
+                dst_ptr = (
+                    out_piece_ptr(p) if final_step else accum_scratch_piece(rank, k, p)
+                )
+                kernels.dma_add(
+                    dst_ptr,
+                    in_piece_ptr(recv_chunk, p),
+                    recv_scratch_piece(rank, k, p),
+                    piece_elems,
+                    dtype_code,
                 )
                 add_done[p].record(main)
 
