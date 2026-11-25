@@ -33,7 +33,7 @@ from b12x._lib.utils.device import (
     current_cuda_stream,
 )
 from b12x._lib.utils.pointers import make_ptr
-from ._joint_startup_cute import _globaltimer
+from ._cute_intrinsics import _globaltimer
 
 
 GROUP_TIMING_FIELDS = (
@@ -382,7 +382,10 @@ def _triton_rsqrt_3584(ss: Float32, eps: Float32, *, loc=None, ip=None) -> Float
     return Float32(
         llvm.inline_asm(
             T.f32(),
-            [Float32(ss).ir_value(loc=loc, ip=ip), Float32(eps).ir_value(loc=loc, ip=ip)],
+            [
+                Float32(ss).ir_value(loc=loc, ip=ip),
+                Float32(eps).ir_value(loc=loc, ip=ip),
+            ],
             "{ .reg .f32 %t0, %t1, %t2; mov.b32 %t0, 0f45600000; div.full.f32 %t1, $1, %t0; add.f32 %t2, $2, %t1; rsqrt.approx.ftz.f32 $0, %t2; }",
             "=f,f,f",
             has_side_effects=False,
@@ -399,7 +402,10 @@ def _triton_rsqrt_7168(ss: Float32, eps: Float32, *, loc=None, ip=None) -> Float
     return Float32(
         llvm.inline_asm(
             T.f32(),
-            [Float32(ss).ir_value(loc=loc, ip=ip), Float32(eps).ir_value(loc=loc, ip=ip)],
+            [
+                Float32(ss).ir_value(loc=loc, ip=ip),
+                Float32(eps).ir_value(loc=loc, ip=ip),
+            ],
             "{ .reg .f32 %t0, %t1, %t2; mov.b32 %t0, 0f45E00000; div.full.f32 %t1, $1, %t0; add.f32 %t2, $2, %t1; rsqrt.approx.ftz.f32 $0, %t2; }",
             "=f,f,f",
             has_side_effects=False,
@@ -1393,7 +1399,9 @@ class _IslandRSLaunch:
         for d in cutlass.range_constexpr(1, _ISLAND_SIZE):
             dlane = self._lane ^ d
             peer = self._island * _ISLAND_SIZE + dlane
-            dst_base = Int64(slabs[peer].toint()) + stage_offset + Int64(self._lane) * qbytes
+            dst_base = (
+                Int64(slabs[peer].toint()) + stage_offset + Int64(self._lane) * qbytes
+            )
             src_base = in_addr + Int64(dlane) * qbytes
             idx = start
             while idx < q_v4:
@@ -1453,7 +1461,9 @@ class _IslandRSLaunch:
                 )
             for d in cutlass.range_constexpr(1, _MAX_ISLANDS):
                 _wait_nosleep(
-                    _flag_address(self_base, _XS_ARRIVED, bidx, Int32(self._island ^ d)),
+                    _flag_address(
+                        self_base, _XS_ARRIVED, bidx, Int32(self._island ^ d)
+                    ),
                     generation * Uint32(2),
                 )
         cute.arch.barrier()
@@ -2238,17 +2248,33 @@ class _IslandV4Norm3584Launch:
                     tag,
                 )
             for d in cutlass.range_constexpr(1, 4):
-                w = (self._island ^ d) if cutlass.const_expr(cross) else (self._lane ^ d)
+                w = (
+                    (self._island ^ d)
+                    if cutlass.const_expr(cross)
+                    else (self._lane ^ d)
+                )
                 _wait_nosleep(_flag_address(self_base, region, bidx, Int32(w)), tag)
         cute.arch.barrier()
 
     @cute.jit
     def __call__(
         self,
-        s0: cute.Pointer, s1: cute.Pointer, s2: cute.Pointer, s3: cute.Pointer,
-        s4: cute.Pointer, s5: cute.Pointer, s6: cute.Pointer, s7: cute.Pointer,
-        s8: cute.Pointer, s9: cute.Pointer, s10: cute.Pointer, s11: cute.Pointer,
-        s12: cute.Pointer, s13: cute.Pointer, s14: cute.Pointer, s15: cute.Pointer,
+        s0: cute.Pointer,
+        s1: cute.Pointer,
+        s2: cute.Pointer,
+        s3: cute.Pointer,
+        s4: cute.Pointer,
+        s5: cute.Pointer,
+        s6: cute.Pointer,
+        s7: cute.Pointer,
+        s8: cute.Pointer,
+        s9: cute.Pointer,
+        s10: cute.Pointer,
+        s11: cute.Pointer,
+        s12: cute.Pointer,
+        s13: cute.Pointer,
+        s14: cute.Pointer,
+        s15: cute.Pointer,
         inp: cute.Pointer,
         weight: cute.Pointer,
         out: cute.Pointer,
@@ -2262,17 +2288,52 @@ class _IslandV4Norm3584Launch:
         stream: cuda.CUstream,
     ) -> None:
         self.kernel(
-            s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15,
-            inp, weight, out, begin_ptr, stage_off, part_off, final_off, qcap, eps,
+            s0,
+            s1,
+            s2,
+            s3,
+            s4,
+            s5,
+            s6,
+            s7,
+            s8,
+            s9,
+            s10,
+            s11,
+            s12,
+            s13,
+            s14,
+            s15,
+            inp,
+            weight,
+            out,
+            begin_ptr,
+            stage_off,
+            part_off,
+            final_off,
+            qcap,
+            eps,
         ).launch(grid=(blocks, 1, 1), block=(512, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(
         self,
-        s0: cute.Pointer, s1: cute.Pointer, s2: cute.Pointer, s3: cute.Pointer,
-        s4: cute.Pointer, s5: cute.Pointer, s6: cute.Pointer, s7: cute.Pointer,
-        s8: cute.Pointer, s9: cute.Pointer, s10: cute.Pointer, s11: cute.Pointer,
-        s12: cute.Pointer, s13: cute.Pointer, s14: cute.Pointer, s15: cute.Pointer,
+        s0: cute.Pointer,
+        s1: cute.Pointer,
+        s2: cute.Pointer,
+        s3: cute.Pointer,
+        s4: cute.Pointer,
+        s5: cute.Pointer,
+        s6: cute.Pointer,
+        s7: cute.Pointer,
+        s8: cute.Pointer,
+        s9: cute.Pointer,
+        s10: cute.Pointer,
+        s11: cute.Pointer,
+        s12: cute.Pointer,
+        s13: cute.Pointer,
+        s14: cute.Pointer,
+        s15: cute.Pointer,
         inp: cute.Pointer,
         weight: cute.Pointer,
         out: cute.Pointer,
@@ -2295,23 +2356,15 @@ class _IslandV4Norm3584Launch:
             element_type=Float32, layout=cute.make_layout((32,)), byte_alignment=16
         )
         if tidx == Int32(0):
-            sh_gen[0] = (
-                _atomic_add_global_u32(
-                    self_base + Int64(bidx) * Int64(4), Uint32(1)
-                )
-                + Uint32(1)
-            )
+            sh_gen[0] = _atomic_add_global_u32(
+                self_base + Int64(bidx) * Int64(4), Uint32(1)
+            ) + Uint32(1)
             ep = Uint32(0)
             if bidx < Int32(self._ab):
-                ep = (
-                    _atomic_add_global_u32(
-                        self_base
-                        + Int64(_ACTIVE_EPOCH_OFFSET)
-                        + Int64(bidx) * Int64(4),
-                        Uint32(1),
-                    )
-                    + Uint32(1)
-                )
+                ep = _atomic_add_global_u32(
+                    self_base + Int64(_ACTIVE_EPOCH_OFFSET) + Int64(bidx) * Int64(4),
+                    Uint32(1),
+                ) + Uint32(1)
             sh_gen[1] = ep
         cute.arch.barrier()
         call_no = Uint32(sh_gen[0])
@@ -2330,7 +2383,9 @@ class _IslandV4Norm3584Launch:
             for d in cutlass.range_constexpr(1, 4):
                 dl = self._lane ^ d
                 peer = self._island * 4 + dl
-                dst = Int64(slabs[peer].toint()) + stage_off + Int64(self._lane) * qbytes
+                dst = (
+                    Int64(slabs[peer].toint()) + stage_off + Int64(self._lane) * qbytes
+                )
                 src = in_addr + Int64(dl) * qbytes
                 idx = start
                 while idx < q_v4:
@@ -2354,7 +2409,9 @@ class _IslandV4Norm3584Launch:
                 pk = _pack_payload_words(totals, 4)
                 st_global_v4_u32(self_pt + idx * Int64(16), pk[0], pk[1], pk[2], pk[3])
                 idx += stride
-            self._sync3(slabs, self_base, _XS_ARRIVED, True, bidx, tidx, gen * Uint32(2))
+            self._sync3(
+                slabs, self_base, _XS_ARRIVED, True, bidx, tidx, gen * Uint32(2)
+            )
 
             idx = start
             while idx < q_v4:
@@ -2374,8 +2431,14 @@ class _IslandV4Norm3584Launch:
                     totals = _accumulate_payload_words(totals, loaded[isl], 4)
                 pk = _pack_payload_words(totals, 4)
                 st_global_v4_u32(
-                    self_base + final_off + Int64(self._lane) * qbytes + idx * Int64(16),
-                    pk[0], pk[1], pk[2], pk[3],
+                    self_base
+                    + final_off
+                    + Int64(self._lane) * qbytes
+                    + idx * Int64(16),
+                    pk[0],
+                    pk[1],
+                    pk[2],
+                    pk[3],
                 )
                 for d in cutlass.range_constexpr(1, 4):
                     peer = self._island * 4 + (self._lane ^ d)
@@ -2384,7 +2447,10 @@ class _IslandV4Norm3584Launch:
                         + final_off
                         + Int64(self._lane) * qbytes
                         + idx * Int64(16),
-                        pk[0], pk[1], pk[2], pk[3],
+                        pk[0],
+                        pk[1],
+                        pk[2],
+                        pk[3],
                     )
                 idx += stride
             self._sync3(slabs, self_base, _AG_ARRIVED, False, bidx, tidx, gen)
@@ -2416,9 +2482,7 @@ class _IslandV4Norm3584Launch:
                 for k in cutlass.range_constexpr(8, 16):
                     u[k] = Float32(0.0)
                 if tidx < Int32(192):
-                    w1 = _ld_cg_v4_u32(
-                        row_addr + Int64(tidx + Int32(256)) * Int64(16)
-                    )
+                    w1 = _ld_cg_v4_u32(row_addr + Int64(tidx + Int32(256)) * Int64(16))
                     for j in cutlass.range_constexpr(4):
                         lo, hi = unpack_bf16x2(w1[j])
                         u[8 + j * 2] = lo
@@ -2435,12 +2499,20 @@ class _IslandV4Norm3584Launch:
                 for j in cutlass.range_constexpr(4):
                     xl, xh = unpack_bf16x2(x[j])
                     wl, wh = unpack_bf16x2(wt[j])
-                    np = pack_f32x2_to_bf16x2(_mul_rn_f32(xl, rstd), _mul_rn_f32(xh, rstd))
+                    np = pack_f32x2_to_bf16x2(
+                        _mul_rn_f32(xl, rstd), _mul_rn_f32(xh, rstd)
+                    )
                     nl, nh = unpack_bf16x2(np)
-                    ow.append(pack_f32x2_to_bf16x2(_mul_rn_f32(nl, wl), _mul_rn_f32(nh, wh)))
+                    ow.append(
+                        pack_f32x2_to_bf16x2(_mul_rn_f32(nl, wl), _mul_rn_f32(nh, wh))
+                    )
                 st_global_v4_u32(
-                    Int64(out.toint()) + (Int64(bidx) * Int64(28) + Int64(tidx)) * Int64(16),
-                    ow[0], ow[1], ow[2], ow[3],
+                    Int64(out.toint())
+                    + (Int64(bidx) * Int64(28) + Int64(tidx)) * Int64(16),
+                    ow[0],
+                    ow[1],
+                    ow[2],
+                    ow[3],
                 )
 
 
@@ -2483,17 +2555,33 @@ class _IslandV4ResNorm7168Launch:
                     tag,
                 )
             for d in cutlass.range_constexpr(1, 4):
-                w = (self._island ^ d) if cutlass.const_expr(cross) else (self._lane ^ d)
+                w = (
+                    (self._island ^ d)
+                    if cutlass.const_expr(cross)
+                    else (self._lane ^ d)
+                )
                 _wait_nosleep(_flag_address(self_base, region, bidx, Int32(w)), tag)
         cute.arch.barrier()
 
     @cute.jit
     def __call__(
         self,
-        s0: cute.Pointer, s1: cute.Pointer, s2: cute.Pointer, s3: cute.Pointer,
-        s4: cute.Pointer, s5: cute.Pointer, s6: cute.Pointer, s7: cute.Pointer,
-        s8: cute.Pointer, s9: cute.Pointer, s10: cute.Pointer, s11: cute.Pointer,
-        s12: cute.Pointer, s13: cute.Pointer, s14: cute.Pointer, s15: cute.Pointer,
+        s0: cute.Pointer,
+        s1: cute.Pointer,
+        s2: cute.Pointer,
+        s3: cute.Pointer,
+        s4: cute.Pointer,
+        s5: cute.Pointer,
+        s6: cute.Pointer,
+        s7: cute.Pointer,
+        s8: cute.Pointer,
+        s9: cute.Pointer,
+        s10: cute.Pointer,
+        s11: cute.Pointer,
+        s12: cute.Pointer,
+        s13: cute.Pointer,
+        s14: cute.Pointer,
+        s15: cute.Pointer,
         inp: cute.Pointer,
         residual: cute.Pointer,
         weight: cute.Pointer,
@@ -2511,19 +2599,56 @@ class _IslandV4ResNorm7168Launch:
         stream: cuda.CUstream,
     ) -> None:
         self.kernel(
-            s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15,
-            inp, residual, weight, res_out, norm_out,
-            stage_off, part_off, final_off, qcap,
-            res_stride, res_out_stride, norm_out_stride, eps,
+            s0,
+            s1,
+            s2,
+            s3,
+            s4,
+            s5,
+            s6,
+            s7,
+            s8,
+            s9,
+            s10,
+            s11,
+            s12,
+            s13,
+            s14,
+            s15,
+            inp,
+            residual,
+            weight,
+            res_out,
+            norm_out,
+            stage_off,
+            part_off,
+            final_off,
+            qcap,
+            res_stride,
+            res_out_stride,
+            norm_out_stride,
+            eps,
         ).launch(grid=(blocks, 1, 1), block=(512, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(
         self,
-        s0: cute.Pointer, s1: cute.Pointer, s2: cute.Pointer, s3: cute.Pointer,
-        s4: cute.Pointer, s5: cute.Pointer, s6: cute.Pointer, s7: cute.Pointer,
-        s8: cute.Pointer, s9: cute.Pointer, s10: cute.Pointer, s11: cute.Pointer,
-        s12: cute.Pointer, s13: cute.Pointer, s14: cute.Pointer, s15: cute.Pointer,
+        s0: cute.Pointer,
+        s1: cute.Pointer,
+        s2: cute.Pointer,
+        s3: cute.Pointer,
+        s4: cute.Pointer,
+        s5: cute.Pointer,
+        s6: cute.Pointer,
+        s7: cute.Pointer,
+        s8: cute.Pointer,
+        s9: cute.Pointer,
+        s10: cute.Pointer,
+        s11: cute.Pointer,
+        s12: cute.Pointer,
+        s13: cute.Pointer,
+        s14: cute.Pointer,
+        s15: cute.Pointer,
         inp: cute.Pointer,
         residual: cute.Pointer,
         weight: cute.Pointer,
@@ -2550,23 +2675,15 @@ class _IslandV4ResNorm7168Launch:
             element_type=Float32, layout=cute.make_layout((32,)), byte_alignment=16
         )
         if tidx == Int32(0):
-            sh_gen[0] = (
-                _atomic_add_global_u32(
-                    self_base + Int64(bidx) * Int64(4), Uint32(1)
-                )
-                + Uint32(1)
-            )
+            sh_gen[0] = _atomic_add_global_u32(
+                self_base + Int64(bidx) * Int64(4), Uint32(1)
+            ) + Uint32(1)
             ep = Uint32(0)
             if bidx < Int32(self._ab):
-                ep = (
-                    _atomic_add_global_u32(
-                        self_base
-                        + Int64(_ACTIVE_EPOCH_OFFSET)
-                        + Int64(bidx) * Int64(4),
-                        Uint32(1),
-                    )
-                    + Uint32(1)
-                )
+                ep = _atomic_add_global_u32(
+                    self_base + Int64(_ACTIVE_EPOCH_OFFSET) + Int64(bidx) * Int64(4),
+                    Uint32(1),
+                ) + Uint32(1)
             sh_gen[1] = ep
         cute.arch.barrier()
         call_no = Uint32(sh_gen[0])
@@ -2585,7 +2702,9 @@ class _IslandV4ResNorm7168Launch:
             for d in cutlass.range_constexpr(1, 4):
                 dl = self._lane ^ d
                 peer = self._island * 4 + dl
-                dst = Int64(slabs[peer].toint()) + stage_off + Int64(self._lane) * qbytes
+                dst = (
+                    Int64(slabs[peer].toint()) + stage_off + Int64(self._lane) * qbytes
+                )
                 src = in_addr + Int64(dl) * qbytes
                 idx = start
                 while idx < q_v4:
@@ -2609,7 +2728,9 @@ class _IslandV4ResNorm7168Launch:
                 pk = _pack_payload_words(totals, 4)
                 st_global_v4_u32(self_pt + idx * Int64(16), pk[0], pk[1], pk[2], pk[3])
                 idx += stride
-            self._sync3(slabs, self_base, _XS_ARRIVED, True, bidx, tidx, gen * Uint32(2))
+            self._sync3(
+                slabs, self_base, _XS_ARRIVED, True, bidx, tidx, gen * Uint32(2)
+            )
 
             idx = start
             while idx < q_v4:
@@ -2629,8 +2750,14 @@ class _IslandV4ResNorm7168Launch:
                     totals = _accumulate_payload_words(totals, loaded[isl], 4)
                 pk = _pack_payload_words(totals, 4)
                 st_global_v4_u32(
-                    self_base + final_off + Int64(self._lane) * qbytes + idx * Int64(16),
-                    pk[0], pk[1], pk[2], pk[3],
+                    self_base
+                    + final_off
+                    + Int64(self._lane) * qbytes
+                    + idx * Int64(16),
+                    pk[0],
+                    pk[1],
+                    pk[2],
+                    pk[3],
                 )
                 for d in cutlass.range_constexpr(1, 4):
                     peer = self._island * 4 + (self._lane ^ d)
@@ -2639,7 +2766,10 @@ class _IslandV4ResNorm7168Launch:
                         + final_off
                         + Int64(self._lane) * qbytes
                         + idx * Int64(16),
-                        pk[0], pk[1], pk[2], pk[3],
+                        pk[0],
+                        pk[1],
+                        pk[2],
+                        pk[3],
                     )
                 idx += stride
             self._sync3(slabs, self_base, _AG_ARRIVED, False, bidx, tidx, gen)
@@ -2662,7 +2792,9 @@ class _IslandV4ResNorm7168Launch:
             red_addr = self_base + final_off + Int64(bidx) * Int64(7168 * 2)
             res_addr = Int64(residual.toint()) + Int64(bidx) * res_stride * Int64(2)
             rout_addr = Int64(res_out.toint()) + Int64(bidx) * res_out_stride * Int64(2)
-            nout_addr = Int64(norm_out.toint()) + Int64(bidx) * norm_out_stride * Int64(2)
+            nout_addr = Int64(norm_out.toint()) + Int64(bidx) * norm_out_stride * Int64(
+                2
+            )
             w_addr = Int64(weight.toint())
             ss = Float32(0.0)
             u = cute.make_rmem_tensor((32,), Float32)
@@ -2676,7 +2808,9 @@ class _IslandV4ResNorm7168Launch:
                     for j in cutlass.range_constexpr(4):
                         rl, rh = unpack_bf16x2(rd[j])
                         sl, sh = unpack_bf16x2(rs[j])
-                        p = pack_f32x2_to_bf16x2(_add_rn_f32(sl, rl), _add_rn_f32(sh, rh))
+                        p = pack_f32x2_to_bf16x2(
+                            _add_rn_f32(sl, rl), _add_rn_f32(sh, rh)
+                        )
                         pk.append(p)
                         ul, uh = unpack_bf16x2(p)
                         u[seg * 8 + j * 2] = ul
@@ -2694,7 +2828,9 @@ class _IslandV4ResNorm7168Launch:
                     for j in cutlass.range_constexpr(4):
                         rl, rh = unpack_bf16x2(rd[j])
                         sl, sh = unpack_bf16x2(rs[j])
-                        p = pack_f32x2_to_bf16x2(_add_rn_f32(sl, rl), _add_rn_f32(sh, rh))
+                        p = pack_f32x2_to_bf16x2(
+                            _add_rn_f32(sl, rl), _add_rn_f32(sh, rh)
+                        )
                         pk.append(p)
                         ul, uh = unpack_bf16x2(p)
                         u[24 + j * 2] = ul

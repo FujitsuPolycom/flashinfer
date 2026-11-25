@@ -380,7 +380,7 @@ def test_selected_compile_and_materialization_use_the_winning_profile(
     from b12x.comm.pcie import (
         _gather_preparation,
         _runtime_gather_cute,
-        _joint_cluster_cute,
+        _launch_geometry,
     )
 
     compiled, occupancy = [], []
@@ -395,7 +395,7 @@ def test_selected_compile_and_materialization_use_the_winning_profile(
     )
     monkeypatch.setattr(_gather_preparation, "load_programs", lambda value: value)
     monkeypatch.setattr(
-        _joint_cluster_cute,
+        _launch_geometry,
         "validate_cluster_residency",
         lambda *args: occupancy.append(args),
     )
@@ -430,7 +430,7 @@ def test_selected_compile_and_materialization_use_the_winning_profile(
     def reject(*args):
         raise CandidateResourceIneligibleError("compiled cluster does not fit")
 
-    monkeypatch.setattr(_joint_cluster_cute, "validate_cluster_residency", reject)
+    monkeypatch.setattr(_launch_geometry, "validate_cluster_residency", reject)
     if implementation == "dcp_phased":
         with pytest.raises(CandidateResourceIneligibleError, match="does not fit"):
             plan._materialize(SimpleNamespace(config=winner), device)

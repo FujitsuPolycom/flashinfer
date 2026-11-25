@@ -1,8 +1,7 @@
-"""Fixed-geometry column gathers with persistent device-selected profiles."""
+"""Fixed-geometry column gathers with static specialized barrier profiles."""
 
 from dataclasses import dataclass
 from math import prod
-from types import SimpleNamespace
 
 import torch
 
@@ -12,11 +11,8 @@ from b12x.preparation import MemoryRequirements, PersistentMemory, Plan, current
 from ._tuning import TUNING
 
 GATHER_MODES = {
-    "joint": ("barrier", "word_exchange"),
-    "selected_barrier": ("barrier",),
     "selected_phased_barrier": ("barrier",),
     "selected_phased_push": ("barrier",),
-    "selected_word_exchange": ("word_exchange",),
     "selected_ring": ("barrier",),
     "selected_switch_push": ("barrier",),
     "selected_recursive": ("barrier",),
@@ -40,18 +36,13 @@ def selected_gather_profile(transport, blocks, mode, active):
     ):
         raise ValueError("phased gather requires one complete eight-CTA cluster")
     if transport == "selected_recursive_pix_last":
-        if not (
-            (blocks == 8 and active == 8)
-            or (blocks == 16 and active in (8, 16))
-        ):
+        if not ((blocks == 8 and active == 8) or (blocks == 16 and active in (8, 16))):
             raise ValueError(
                 "pix-last recursive gather requires 8/8 or 16/(8|16) physical/active CTAs"
             )
     elif transport == "selected_ring":
         if not ((blocks == 8 and active == 8) or (blocks == 16 and active == 16)):
-            raise ValueError(
-                "ring gather requires 8/8 or 16/16 physical/active CTAs"
-            )
+            raise ValueError("ring gather requires 8/8 or 16/16 physical/active CTAs")
     elif transport == "selected_switch_push":
         if not ((blocks == 8 and active == 8) or (blocks == 16 and active in (8, 16))):
             raise ValueError(
@@ -62,10 +53,8 @@ def selected_gather_profile(transport, blocks, mode, active):
         "selected_recursive_ready",
         "selected_recursive_outer_first",
     ) and (blocks != 8 or active != 8):
-        raise ValueError(
-            "recursive gathers require eight active and physical CTAs"
-        )
-    return (int(mode == "word_exchange") << 16) | active
+        raise ValueError("recursive gathers require eight active and physical CTAs")
+    return active
 
 
 def validate_query(query):
@@ -82,7 +71,6 @@ def validate_query(query):
         )
     element = 1 if call["dtype"] == "torch.float8_e4m3fn" else 2
     row_bytes = prod(shape[1:]) * element
-    size = shape[0] * row_bytes
     if (
         shape[0] > query.setup["max_batch_size"]
         or shape[1] * query.world_size != query.setup["total_heads"]
@@ -142,32 +130,6 @@ def validate_query(query):
         raise ValueError(
             "selected gather requires disjoint contiguous 16-byte-aligned rows"
         )
-    if transport not in (
-        "selected_barrier",
-        "selected_phased_barrier",
-        "selected_phased_push",
-        "selected_ring",
-        "selected_switch_push",
-        "selected_recursive",
-        "selected_recursive_ready",
-        "selected_recursive_outer_first",
-        "selected_recursive_pix_last",
-    ):
-        chunks = query.setup["exchange_chunks"]
-        if (
-            query.world_size not in (2, 4)
-            or not 1 <= chunks <= 64
-            or size > chunks * 256
-            or (transport == "selected_word_exchange" and call["threads"] > 256)
-            or query.setup["exchange_offset"] < 0
-            or query.setup["exchange_offset"] % 256
-            or query.setup["exchange_offset"] + query.world_size * chunks * 512
-            > query.setup["slot_bytes"]
-            or query.setup["exchange_counter_offset"] != 2 * query.setup["slot_bytes"]
-        ):
-            raise ValueError(
-                "selected word exchange requires owned TP2/TP4 receive storage within 16 KiB"
-            )
 
 
 @dataclass
@@ -176,13 +138,6 @@ class SelectedGatherState:
     runtime: object
     launcher: object
     selector: torch.Tensor
-
-    @property
-    def initial_profile(self):
-        c = self.query.call
-        return selected_gather_profile(
-            c["gather_transport"], c["block_limit"], c["submode"], c["active_blocks"]
-        )
 
     def require_runtime(self, runtime):
         if runtime is not self.runtime:
@@ -194,13 +149,12 @@ class SelectedGatherState:
             raise ValueError(
                 "selected gather input differs from the prepared shape or dtype"
             )
-        barrier = "barrier" in GATHER_MODES[c["gather_transport"]]
-        if barrier and not runtime._device_slot_selection:
+        if not runtime._device_slot_selection:
             # Selected barrier kernels retire device epochs even in eager warmup.
             # Enter the same bank sequence as ordinary captured DCP operations.
             runtime._graph_base_slot = runtime._next_slot & 1
             runtime._device_slot_selection = True
-        bank = runtime._graph_base_slot if barrier else 0
+        bank = runtime._graph_base_slot
         self.launcher(
             source.data_ptr(),
             output.data_ptr(),
@@ -261,7 +215,7 @@ def plan(query, *, runtime, invocation, override):
     def materialize(selection, device):
         launcher = load_programs(compile_selected_gather(*args))
         if c["gather_transport"] in ("selected_phased_barrier", "selected_phased_push"):
-            from ._joint_cluster_cute import validate_cluster_residency
+            from ._launch_geometry import validate_cluster_residency
 
             validate_cluster_residency(launcher, c["block_limit"], c["threads"], 8)
         value = selected_gather_profile(
@@ -292,73 +246,6 @@ def plan(query, *, runtime, invocation, override):
         _materialize=materialize,
         _device=runtime.device,
     )
-
-
-class GatherInputs:
-    """Exact rank-interleaved fixtures with caller-independent persistent storage."""
-
-    def __init__(self, state):
-        q = state.query
-        shape, dtype = (
-            tuple(q.call["shape"]),
-            getattr(torch, q.call["dtype"].removeprefix("torch.")),
-        )
-        # Byte fixtures exercise FP8 payloads and FP32 bit views without arithmetic conversion.
-        rows, row_bytes = shape[0], prod(shape[1:]) * dtype.itemsize
-        values = (
-            torch.arange(
-                q.world_size * rows * row_bytes, device=state.runtime.device
-            ).reshape(q.world_size, rows, row_bytes)
-            % 251
-        ).to(torch.uint8)
-        cases = (values, torch.zeros_like(values), 255 - values)
-        self.source = torch.empty(shape, dtype=dtype, device=state.runtime.device)
-        self.out = torch.empty(
-            tuple(q.call["out_shape"]), dtype=dtype, device=state.runtime.device
-        )
-        self.reference = SimpleNamespace(
-            seeds=tuple(case[q.rank].clone().view(dtype).view(shape) for case in cases),
-            expected=tuple(
-                case.permute(1, 0, 2).contiguous().view(torch.uint8).reshape(-1)
-                for case in cases
-            ),
-        )
-        self.repetitions = 1
-
-    def produce(self, index):
-        self.source.copy_(self.reference.seeds[index])
-
-
-def startup_spec(plan, profiles):
-    from ._joint_startup import JointStartupSpec
-    import torch.distributed as dist
-
-    state = plan.prepared.state
-    c = state.query.call
-    if profiles is None or not profiles:
-        raise ValueError("gather startup tuning requires explicit offline profiles")
-    encoded = tuple(
-        selected_gather_profile(c["gather_transport"], c["block_limit"], mode, active)
-        for mode, active in profiles
-    )
-    if len(set(encoded)) != len(encoded):
-        raise ValueError("runtime gather profiles must be distinct")
-    pairs = tuple((value >> 16, value & 65535) for value in encoded)
-    key = (
-        "gather_startup",
-        1,
-        state.query.world_size,
-        tuple(dist.get_process_group_ranks(state.runtime.exchange_group)),
-        c["gather_transport"],
-        c["threads"],
-        c["block_limit"],
-        tuple(c["shape"]),
-        c["dtype"],
-        state.runtime._slot_bytes,
-        state.runtime._exchange_chunks,
-        pairs,
-    )
-    return JointStartupSpec(key, pairs, state.selector, state, False, state.query.rank)
 
 
 def validate_varlen_buffers(runtime, output, counts):

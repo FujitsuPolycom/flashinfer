@@ -625,7 +625,7 @@ def plan(
     def materialize(selection, device):
         launchers = load_programs(compile_twoshot_surface(payload, device.ordinal))
         if query.call.get("payload_schedule") == "pairwise":
-            from ._joint_cluster_cute import validate_cluster_residency
+            from ._launch_geometry import validate_cluster_residency
 
             for launcher in launchers.values():
                 validate_cluster_residency(

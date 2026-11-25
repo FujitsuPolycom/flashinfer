@@ -25,8 +25,6 @@ from ._tuning import (
     TUNING as NATIVE,
 )
 
-from ._joint_profile import JOINT_FAMILIES, profile_records
-
 
 # Compiled choices for local push, cross-island scatter/gather, and cross-island DMA.
 ISLAND_VARIANTS = {
@@ -154,42 +152,6 @@ def _configs(query, device=None):
                         submode="barrier",
                         active_blocks=active,
                     )
-            continue
-        if name in JOINT_FAMILIES:
-            cluster_size = call.get("joint_cluster_size", 1)
-            if cluster_size != 1:
-                from ._joint_profile import JOINT_MODES, validate_cluster_geometry
-
-                validate_cluster_geometry(blocks, threads, cluster_size)
-                modes = {value: mode for mode, value in JOINT_MODES.items()}
-                for mode, active in profile_records(
-                    name, blocks, cluster_size=cluster_size
-                ):
-                    yield CollectiveConfig(
-                        implementation=name,
-                        threads=threads,
-                        blocks=blocks,
-                        submode=modes[mode],
-                        active_blocks=active,
-                    )
-                continue
-            for count_threads in (32, 64, 128, 256, 512):
-                for mode in JOINT_FAMILIES[name]:
-                    units = int(call["size_packs"])
-                    if mode in ("bulk_push", "bulk_pull"):
-                        units = -(-units // query.world_size)
-                    covering = max(1, -(-units // count_threads))
-                    for active in dict.fromkeys(
-                        min(count, blocks)
-                        for count in (1, 2, 4, 8, 16, 32, 36, blocks, covering)
-                    ):
-                        yield CollectiveConfig(
-                            implementation=name,
-                            threads=count_threads,
-                            blocks=blocks,
-                            submode=mode,
-                            active_blocks=active,
-                        )
             continue
         yield CollectiveConfig(implementation=name, threads=threads, blocks=blocks)
         if (
@@ -613,8 +575,6 @@ def _bucket(query):
                 if field in setup
             },
         )
-        if "joint_cluster_size" in call:
-            alternatives[name]["joint_cluster_size"] = call["joint_cluster_size"]
         if call.get("has_addend", False):
             alternatives[name]["has_addend"] = True
         if setup.get("payload_ready_max_blocks", 36) > 36:
@@ -712,7 +672,7 @@ def plan(
         call["blocks" if "blocks" in call else "block_limit"] = config.blocks
         if config.implementation in ISLAND_VARIANTS:
             call["active_blocks"] = config.active_blocks
-        if config.implementation in JOINT_FAMILIES or config.implementation in (
+        if config.implementation in (
             "dcp_phased",
             "dcp_phased_push",
             "dcp_ring",
@@ -807,8 +767,6 @@ def oneshot_alternatives(query, runtime):
             <= int(query.setup["eager_storage_shards"]) * capacity
         ):
             modes += ["remote_push_full", "remote_push_rsag"]
-            if query.setup.get("joint_max_blocks", 0) > 0:
-                modes += list(JOINT_FAMILIES)
     elif query.world_size == 4:
         modes += ["stage_remote_push"]
         # The payload-ready fused specialization uses an isolated incoming region.
@@ -827,13 +785,6 @@ def oneshot_alternatives(query, runtime):
             call.update(threads=128, blocks=min(36, -(-call["size_packs"] // 128)))
         if field == "transport" and mode in ("remote_push_full", "remote_push_rsag"):
             call.update(threads=256, blocks=16)
-        if mode in JOINT_FAMILIES:
-            call.update(
-                threads=256,
-                blocks=query.setup["joint_max_blocks"],
-                submode=JOINT_FAMILIES[mode][0],
-                active_blocks=min(16, query.setup["joint_max_blocks"]),
-            )
         if mode not in alternatives:
             alternatives[mode] = (replace(query, call=FrozenMapping(call)), runtime)
     return alternatives

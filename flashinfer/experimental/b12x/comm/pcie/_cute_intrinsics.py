@@ -789,3 +789,20 @@ def redux_max_u32(value: Uint32, *, loc=None, ip=None) -> Uint32:
             ip=ip,
         )
     )
+
+
+@dsl_user_op
+def _globaltimer(*, loc=None, ip=None):
+    return Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "mov.u64 $0, %globaltimer;",
+            "=l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )

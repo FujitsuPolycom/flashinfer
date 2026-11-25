@@ -54,10 +54,6 @@ META = OpMeta(
     group="comm",
     api_style="planned",
     entry_points=(
-        "joint_finalist_policy",
-        "joint_startup_spec",
-        "prepare_joint_startup_tuner",
-        "StartupTuningStorage",
         "Plan",
         "PcieConfig",
         "PcieQuery",
@@ -95,10 +91,6 @@ META = OpMeta(
 
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
-        joint_finalist_policy,
-        joint_startup_spec,
-        prepare_joint_startup_tuner,
-        StartupTuningStorage,
         Plan,
         PcieConfig,
         PcieQuery,

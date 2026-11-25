@@ -190,7 +190,6 @@ class PCIeAllReduce:
         ipc=None,
         single_channel: bool = False,
         max_concurrent_channels: int = 1,
-        joint: bool = False,
     ) -> "PCIeAllReduce":
         world_size = dist.get_world_size(group=exchange_group)
         algorithm = _algorithm_for_world_size(world_size)
@@ -210,7 +209,6 @@ class PCIeAllReduce:
                     ipc=ipc,
                     single_channel=single_channel,
                     max_concurrent_channels=max_concurrent_channels,
-                    joint=joint,
                 )
             except DirectMappingUnavailable:
                 if not qualify_direct:
@@ -337,7 +335,6 @@ class PCIeAllReduce:
         ext_module=None,
         single_channel: bool = False,
         max_concurrent_channels: int = 1,
-        joint: bool = False,
     ) -> "PCIeAllReduce":
         return cls.from_exchange_group(
             exchange_group=process_group,
@@ -350,7 +347,6 @@ class PCIeAllReduce:
             ext_module=ext_module,
             single_channel=single_channel,
             max_concurrent_channels=max_concurrent_channels,
-            joint=joint,
         )
 
     @property
@@ -488,31 +484,18 @@ class PCIeAllReduce:
         channel_id: Optional[str] = None,
         invocation: FrozenMapping = FrozenMapping(),
         override: PcieConfig | CollectiveConfig | None = None,
-        joint_only: bool = False,
-        joint_cluster_size: int = 1,
         has_addend: bool = False,
         **call,
     ) -> Plan:
         """Select an existing native channel once, then declare its plan.
 
         Semantic channels must already exist. This does not construct transports,
-        register inputs, allocate workspace, or compile any program. Joint kernels
-        require explicit ``joint_only=True``; ordinary plans use static transports.
-        ``joint_cluster_size=8`` admits phased profiles in a 64-CTA, 512-thread
-        cluster launch. The default retains the ordinary query and launch policy.
+        register inputs, allocate workspace, or compile any program.
         """
         from ._preparation import plan, query_from_runtime
 
-        if type(joint_cluster_size) is not int or joint_cluster_size not in (1, 8):
-            raise ValueError("joint cluster size must be 1 or 8")
-        if joint_cluster_size != 1 and (not joint_only or operation != "all_reduce"):
-            raise ValueError(
-                "clustered joint planning requires joint_only=True and plain all_reduce"
-            )
-        if has_addend and (joint_only or operation != "all_reduce"):
-            raise ValueError(
-                "fused input addend requires static plain all_reduce planning"
-            )
+        if has_addend and operation != "all_reduce":
+            raise ValueError("fused input addend requires plain all_reduce planning")
 
         if operation not in (
             "all_reduce",
@@ -582,40 +565,6 @@ class PCIeAllReduce:
                         )
                     if self._use_bf16_twoshot(inp, output):
                         default = "twoshot"
-                from ._joint_profile import JOINT_FAMILIES
-
-                alternatives = {
-                    name: value
-                    for name, value in alternatives.items()
-                    if (name in JOINT_FAMILIES) == joint_only
-                }
-                if joint_only:
-                    if not alternatives:
-                        raise ValueError(
-                            "joint-only planning requires a provisioned BF16 joint channel"
-                        )
-                    if default not in alternatives:
-                        default = next(iter(alternatives))
-                    if joint_cluster_size != 1:
-                        from dataclasses import replace
-
-                        alternatives = {
-                            name: (
-                                replace(
-                                    native,
-                                    call=FrozenMapping(
-                                        {
-                                            **native.call,
-                                            "joint_cluster_size": joint_cluster_size,
-                                            "threads": 512,
-                                            "blocks": 64,
-                                        }
-                                    ),
-                                ),
-                                runtime,
-                            )
-                            for name, (native, runtime) in alternatives.items()
-                        }
                 return collective_plan(
                     alternatives,
                     default=default,
@@ -623,10 +572,6 @@ class PCIeAllReduce:
                     invocation=invocation,
                     override=override,
                 )
-        if joint_only:
-            raise ValueError(
-                "joint-only planning requires a staged all-peer BF16 collective"
-            )
         if has_addend:
             raise ValueError(
                 "fused input addend requires a single-channel staged BF16 all-reduce"

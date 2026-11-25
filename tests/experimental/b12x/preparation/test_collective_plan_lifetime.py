@@ -19,7 +19,6 @@ from b12x.preparation import (
     autotune_effort,
 )
 from b12x.preparation.types import _plan_scope
-from .test_joint_clusters import native_query as joint_query
 from .test_static_gather import native_query as gather_query
 
 
@@ -149,32 +148,19 @@ def test_compilation_and_materialization_preserve_the_selected_owner(
     assert state.launcher() is launcher
 
 
-@pytest.mark.parametrize("kind", ["gather", "joint"])
-def test_profile_memory_keys_follow_binding_and_configuration(kind):
-    if kind == "gather":
-        from b12x.comm.pcie import _gather_preparation as provider
+def test_profile_memory_keys_follow_binding_and_configuration():
+    from b12x.comm.pcie import _gather_preparation as provider
 
-        query, runtime = gather_query()
-        query = _preparation._selected_gather_query(
-            query, "selected_phased_barrier", (128, 256, 512)
-        )
-        role = "pcie-gather-selector"
-    else:
-        from b12x.comm.pcie import _joint_preparation as provider
-
-        query, runtime = joint_query(), SimpleNamespace(device=torch.device("cpu"))
-        role = "pcie-joint-profile"
-    first = (
-        provider.plan(query, runtime=runtime, invocation=FrozenMapping(), override=None)
-        if kind == "gather"
-        else provider.plan(query, runtime=runtime)
+    query, runtime = gather_query()
+    query = _preparation._selected_gather_query(
+        query, "selected_phased_barrier", (128, 256, 512)
     )
-    second = (
-        provider.plan(
-            replace(query), runtime=runtime, invocation=FrozenMapping(), override=None
-        )
-        if kind == "gather"
-        else provider.plan(replace(query), runtime=runtime)
+    role = "pcie-gather-selector"
+    first = provider.plan(
+        query, runtime=runtime, invocation=FrozenMapping(), override=None
+    )
+    second = provider.plan(
+        replace(query), runtime=runtime, invocation=FrozenMapping(), override=None
     )
     config = first.contract.default_config(query, DEVICE.identity)
     other_config = replace(config, backend="other")

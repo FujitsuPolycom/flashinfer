@@ -321,13 +321,8 @@ def _oneshot_plan_runtime(world):
 
 
 @pytest.mark.parametrize("world", (2, 4))
-@pytest.mark.parametrize("joint_blocks", (0, 64))
-@pytest.mark.parametrize("option", (None, False, True))
-def test_public_plan_requires_explicit_joint_opt_in(
-    monkeypatch, world, joint_blocks, option
-):
+def test_public_plan_exposes_static_transports(monkeypatch, world):
     from b12x.comm.pcie import _oneshot_preparation, _preparation
-    from b12x.comm.pcie._joint_profile import JOINT_FAMILIES
     from b12x.comm.pcie._tuning import PcieQuery
     from b12x.preparation import FrozenMapping, autotune_effort
 
@@ -360,36 +355,25 @@ def test_public_plan_requires_explicit_joint_opt_in(
                 eager_buffer_bytes=16384,
                 eager_storage_shards=1 + 2 * (world - 1) + world,
                 variants=((False, 0), (True, 0), (True, 1)),
-                joint_max_blocks=joint_blocks,
                 rank_data_nbytes=rank_bytes,
                 owned_slab_nbytes=slab_bytes,
                 owned_slab_count=slabs,
-                joint_workspace_nbytes=0,
             )
         ),
     )
     monkeypatch.setattr(_preparation, "query_from_runtime", lambda *a, **k: query)
-    options = {} if option is None else {"joint_only": option}
-    if option and not joint_blocks:
-        with pytest.raises(ValueError, match="provisioned BF16 joint channel"):
-            manager.plan(torch.empty(256, dtype=torch.bfloat16), **options)
-        return
-    plan = manager.plan(torch.empty(256, dtype=torch.bfloat16), **options)
-    expected = (
-        set(JOINT_FAMILIES)
-        if option
-        else {
-            "pull",
-            "remote_push_ll",
-            "remote_push_simple",
-            "remote_push_full",
-            "remote_push_rsag",
-        }
-    )
-    if not option and world == 2:
+    plan = manager.plan(torch.empty(256, dtype=torch.bfloat16))
+    expected = {
+        "pull",
+        "remote_push_ll",
+        "remote_push_simple",
+        "remote_push_full",
+        "remote_push_rsag",
+    }
+    if world == 2:
         expected |= {"tp2_remote_push", "tp2_remote_push_simple"}
     assert set(plan.query.alternatives) == expected
-    assert plan.query.default.implementation == ("joint_latency" if option else "pull")
+    assert plan.query.default.implementation == "pull"
     with autotune_effort("default"):
         configs = tuple(
             config

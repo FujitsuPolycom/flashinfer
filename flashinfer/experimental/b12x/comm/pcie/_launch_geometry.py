@@ -37,3 +37,46 @@ def require_diagnostic_geometry(
         f"{family} non-default launch geometry is diagnostic-only: {details}; "
         f"set {DIAGNOSTIC_GEOMETRY_ENV}=1 to opt in"
     )
+
+
+def validate_cluster_residency(launcher, blocks, threads, cluster_size):
+    """Reject unsupported compiled cluster geometry without changing the captured grid."""
+    import cuda.bindings.driver as cuda
+    from b12x.preparation.types import CandidateResourceIneligibleError
+
+    (raw,) = launcher.__b12x_dependencies__
+    executable = raw._executable
+    if len(executable.kernel_info) != 1:
+        raise RuntimeError("clustered collective launcher must retain one CUDA kernel")
+    (name,) = executable.kernel_info
+    status, kernel = cuda.cuLibraryGetKernel(
+        cuda.CUlibrary(int(executable.library)), name.encode()
+    )
+    if status != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError("cannot resolve clustered collective kernel")
+    status, function = cuda.cuKernelGetFunction(kernel)
+    if status != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError("cannot query clustered collective kernel")
+    attribute = cuda.CUlaunchAttribute()
+    attribute.id = cuda.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+    attribute.value.clusterDim.x = cluster_size
+    attribute.value.clusterDim.y = attribute.value.clusterDim.z = 1
+    config = cuda.CUlaunchConfig()
+    config.gridDimX, config.gridDimY, config.gridDimZ = blocks, 1, 1
+    config.blockDimX, config.blockDimY, config.blockDimZ = threads, 1, 1
+    config.sharedMemBytes = 0
+    config.attrs, config.numAttrs = [attribute], 1
+    status, potential = cuda.cuOccupancyMaxPotentialClusterSize(function, config)
+    if status != cuda.CUresult.CUDA_SUCCESS:
+        raise CandidateResourceIneligibleError(
+            "cannot support the prepared collective cluster geometry"
+        )
+    status, resident = cuda.cuOccupancyMaxActiveClusters(function, config)
+    if (
+        status != cuda.CUresult.CUDA_SUCCESS
+        or potential < cluster_size
+        or resident * cluster_size < blocks
+    ):
+        raise CandidateResourceIneligibleError(
+            "collective cluster grid exceeds compiled kernel residency"
+        )
