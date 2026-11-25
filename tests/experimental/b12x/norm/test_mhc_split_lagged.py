@@ -22,8 +22,10 @@ from b12x.moe.fused_moe._binding_ops import (
 from b12x.norm import mhc
 from b12x.norm.mhc import _impl as mhc_impl
 from b12x.norm.mhc._split_lagged import (
+    SPLIT_LAGGED_MAX_TOKENS,
     compile_cluster_post_y_norm,
     compile_readonly_fn_sinkhorn,
+    split_lagged_cluster_size,
     split_lagged_partials_shape,
     supports_split_lagged,
 )
@@ -39,18 +41,23 @@ def _sm120_required():
 
 
 @pytest.mark.parametrize("hidden", [4096, 5120, 7168])
-@pytest.mark.parametrize("tokens", [1, 4, 7, 8])
+@pytest.mark.parametrize("tokens", [1, 4, 7, 8, 13, 16, 32, 64, 65, 127, 128])
 @pytest.mark.parametrize("pre_only", [False, True])
 @pytest.mark.parametrize("norm_dtype", [torch.bfloat16, torch.float32])
 def test_split_lagged_mhc_matches_reference_and_emits_bit_exact_mxfp8(
     hidden: int, tokens: int, pre_only: bool, norm_dtype: torch.dtype
 ):
     _sm120_required()
-    if hidden != 5120 and (tokens not in (1, 8) or norm_dtype == torch.float32):
+    if hidden != 5120 and (tokens not in (1, 8, 64, 128) or norm_dtype == torch.float32):
         pytest.skip("reduced matrix for non-5120 hidden sizes")
+    if hidden == 5120 and norm_dtype == torch.float32 and tokens not in (1, 8, 16, 64, 128):
+        pytest.skip("reduced matrix for FP32 norm weights")
 
     device = torch.device("cuda", torch.cuda.current_device())
+    assert SPLIT_LAGGED_MAX_TOKENS == 128
     assert supports_split_lagged(device, tokens, hidden, norm_dtype)
+    assert not supports_split_lagged(device, 0, hidden, norm_dtype)
+    assert not supports_split_lagged(device, SPLIT_LAGGED_MAX_TOKENS + 1, hidden, norm_dtype)
 
     torch.manual_seed(1234 + hidden + tokens)
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device) * 0.5
@@ -85,7 +92,7 @@ def test_split_lagged_mhc_matches_reference_and_emits_bit_exact_mxfp8(
     plan = mhc.plan(
         mhc.Caps(device=device, max_tokens=tokens, hidden_size=hidden), invocation=inv
     )
-    session = PreparationSession(compile_workers=0)
+    session = PreparationSession(compile_workers=0, autotune=False)
     out_ref = torch.empty((tokens, 4, hidden), dtype=torch.bfloat16, device=device)
     post_ref = torch.empty((tokens, 4), dtype=torch.float32, device=device)
     comb_ref = torch.empty((tokens, 4, 4), dtype=torch.float32, device=device)
@@ -157,9 +164,22 @@ def test_split_lagged_mhc_matches_reference_and_emits_bit_exact_mxfp8(
 
     ordinal = int(device.index or 0)
     post_y_runner = compile_cluster_post_y_norm(
-        ordinal, hidden, pre_only, 1e-20, norm_dtype, emit_mxfp8=True
+        ordinal,
+        hidden,
+        pre_only,
+        1e-20,
+        norm_dtype,
+        cluster_size=split_lagged_cluster_size(tokens),
+        emit_mxfp8=True,
     )
-    fn_sink_runner = compile_readonly_fn_sinkhorn(ordinal, hidden, 1e-20, 1e-6, 20)
+    fn_sink_runner = compile_readonly_fn_sinkhorn(
+        ordinal,
+        hidden,
+        1e-20,
+        1e-6,
+        20,
+        max_tokens=8 if tokens <= 8 else SPLIT_LAGGED_MAX_TOKENS,
+    )
     load_programs(post_y_runner)
     load_programs(fn_sink_runner)
 
@@ -200,14 +220,146 @@ def test_split_lagged_mhc_matches_reference_and_emits_bit_exact_mxfp8(
 
     torch.testing.assert_close(out_new.float(), out_ref.float(), atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(y_new.float(), y_ref.float(), atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(pre_new, pre_ref, atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(post_new, post_ref, atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(comb_new, comb_ref, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(pre_new, pre_ref, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(post_new, post_ref, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(comb_new, comb_ref, atol=1e-4, rtol=1e-4)
     assert torch.equal(a_values, av_ref)
     assert torch.equal(a_scales, as_ref)
 
+    # Feeding the exact reference residual_out proves ReadOnlyFnPartial + _SplitFinalize
+    # matches _FusedPartial + _FusedFinalize to 0 ULP for M > 8 (and <= 1e-5 for M <= 8 k-split).
+    fn_sink_runner(out_ref, fn, scale, bias, partials, pre_new, post_new, comb_new)
+    torch.cuda.synchronize()
+    if tokens > 8:
+        assert torch.equal(pre_new, pre_ref)
+        assert torch.equal(post_new, post_ref)
+        assert torch.equal(comb_new, comb_ref)
+    else:
+        torch.testing.assert_close(pre_new, pre_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(post_new, post_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(comb_new, comb_ref, atol=1e-5, rtol=1e-5)
 
-@pytest.mark.parametrize("tokens", [1, 4, 8])
+
+@pytest.mark.parametrize("tokens", [1, 8, 16, 32, 64, 128])
+def test_split_lagged_mhc_cuda_graph_replay_and_live_mutation(tokens: int):
+    _sm120_required()
+    device = torch.device("cuda", torch.cuda.current_device())
+    hidden = 5120
+    ordinal = int(device.index or 0)
+
+    # Exercise default auto-dispatched runners (cluster_size=None, max_tokens=None).
+    post_y_runner = compile_cluster_post_y_norm(
+        ordinal, hidden, False, 1e-20, torch.bfloat16, emit_mxfp8=True
+    )
+    fn_sink_runner = compile_readonly_fn_sinkhorn(ordinal, hidden, 1e-20, 1e-6, 20)
+    load_programs(post_y_runner)
+    load_programs(fn_sink_runner)
+
+    def make_inputs(seed: int):
+        torch.manual_seed(seed)
+        return (
+            torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device) * 0.5,
+            torch.randn(tokens, 4, hidden, dtype=torch.bfloat16, device=device) * 0.5,
+            torch.rand(tokens, 4, dtype=torch.float32, device=device),
+            torch.softmax(
+                torch.randn(tokens, 4, 4, dtype=torch.float32, device=device), dim=-1
+            ),
+            torch.softmax(
+                torch.randn(tokens, 4, dtype=torch.float32, device=device), dim=-1
+            ),
+        )
+
+    torch.manual_seed(9001 + tokens)
+    fn = torch.randn(24, 4 * hidden, dtype=torch.float32, device=device) * 0.02
+    scale = torch.tensor([0.1, 0.1, 0.1], dtype=torch.float32, device=device)
+    bias = torch.randn(24, dtype=torch.float32, device=device) * 0.1
+    norm_weight = (
+        torch.randn(hidden, dtype=torch.bfloat16, device=device) * 0.2 + 1.0
+    ).contiguous()
+
+    x, residual, prev_post, prev_comb, pre_mix = make_inputs(500 + tokens)
+    out = torch.empty_like(residual)
+    y = torch.empty_like(x)
+    a_values = torch.empty((tokens, hidden), dtype=torch.uint8, device=device)
+    a_scales = torch.empty((tokens, hidden // 32), dtype=torch.uint8, device=device)
+    partials = torch.empty(
+        split_lagged_partials_shape(tokens, hidden), dtype=torch.float32, device=device
+    )
+    pre_out = torch.empty_like(pre_mix)
+    post_out = torch.empty_like(prev_post)
+    comb_out = torch.empty_like(prev_comb)
+
+    main_stream = torch.cuda.Stream(device=device)
+    aux_stream = torch.cuda.Stream(device=device)
+
+    def run_step():
+        post_y_runner(
+            x,
+            residual,
+            prev_post,
+            prev_comb,
+            pre_mix,
+            norm_weight,
+            out,
+            y,
+            a_values=a_values,
+            a_scales=a_scales,
+            stream=main_stream,
+        )
+        aux_stream.wait_stream(main_stream)
+        with torch.cuda.stream(aux_stream):
+            fn_sink_runner(
+                out, fn, scale, bias, partials, pre_out, post_out, comb_out, stream=aux_stream
+            )
+        main_stream.wait_stream(aux_stream)
+
+    with torch.cuda.stream(main_stream):
+        run_step()
+    torch.cuda.synchronize()
+    eager1 = tuple(
+        t.clone() for t in (out, y, a_values, a_scales, pre_out, post_out, comb_out)
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=main_stream):
+        run_step()
+    with torch.cuda.stream(main_stream):
+        graph.replay()
+    torch.cuda.synchronize()
+    for actual, expected in zip(
+        (out, y, a_values, a_scales, pre_out, post_out, comb_out), eager1, strict=True
+    ):
+        assert torch.equal(actual, expected)
+
+    # Mutate live inputs in-place on main_stream and verify graph replay matches fresh eager outputs.
+    x2, r2, pp2, pc2, pm2 = make_inputs(700 + tokens)
+    torch.cuda.synchronize()
+    with torch.cuda.stream(main_stream):
+        x.copy_(x2)
+        residual.copy_(r2)
+        prev_post.copy_(pp2)
+        prev_comb.copy_(pc2)
+        pre_mix.copy_(pm2)
+        graph.replay()
+    torch.cuda.synchronize()
+    replayed2 = tuple(
+        t.clone() for t in (out, y, a_values, a_scales, pre_out, post_out, comb_out)
+    )
+    assert not torch.equal(replayed2[0], eager1[0])
+    assert not torch.equal(replayed2[4], eager1[4])
+
+    with torch.cuda.stream(main_stream):
+        run_step()
+    torch.cuda.synchronize()
+    for actual, expected in zip(
+        replayed2,
+        (out, y, a_values, a_scales, pre_out, post_out, comb_out),
+        strict=True,
+    ):
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("tokens", [1, 4, 8, 16])
 def test_compact_micro_moe_prequant_mxfp8_is_bit_exact(tokens: int):
     _sm120_required()
     device = torch.device("cuda", torch.cuda.current_device())
