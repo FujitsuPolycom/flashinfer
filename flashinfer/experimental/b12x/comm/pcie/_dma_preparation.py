@@ -163,6 +163,9 @@ class _DmaExecutionState:
     def run_reduce_scatter(self, inp, *, out=None):
         return self.runtime._run_prepared_reduce_scatter(inp, out=out, state=self)
 
+    def run_all_to_all(self, inp, *, out=None):
+        return self.runtime._run_prepared_all_to_all(inp, out=out, state=self)
+
     def prime(self, inp, *, out) -> None:
         """Prime the actual caller-owned collective transport after loading code."""
         if self.runtime._fp8 and (
