@@ -124,7 +124,10 @@ def _single_pass(query: SparseMlaQuery, device: DeviceIdentity | None) -> bool:
 
     if query.mode in ("extend", "verify", "draft_extend"):
         return True
-    return query.cache_format == "deepseek_v4" and _should_use_sm121_single_pass_decode(
+    return query.cache_format in (
+        "deepseek_v4",
+        "deepseek_v41",
+    ) and _should_use_sm121_single_pass_decode(
         rows=query.query_rows,
         heads=query.num_q_heads,
         swa_width=query.swa_width,

@@ -885,3 +885,177 @@ def test_v41_bf16_extend_mg2_matches_mg1_and_reference_across_boundaries(
     torch.testing.assert_close(
         lse_64, ref_lse * 1.4426950408889634, atol=1e-4, rtol=1e-4
     )
+
+
+@pytest.mark.parametrize("swa_width,indexed_width", [(128, 0), (128, 512), (64, 512)])
+@pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("lse_scale", ["base2", "natural"])
+@torch.inference_mode()
+def test_v41_bf16_decode_single_split_direct_output_matches_reference_and_multisplit(
+    swa_width: int,
+    indexed_width: int,
+    with_sink: bool,
+    lse_scale: str,
+    mla_session,
+) -> None:
+    """Single-split DSV4.1 BF16 decode bypasses merge and matches reference/multi-split."""
+    from b12x.attention._shared.mla.compressed_reference import (
+        pack_deepseek_v41_cache_reference,
+    )
+
+    device = require_sm120()
+    rows, heads = 9, 16
+    gen = torch.Generator(device=device).manual_seed(
+        4200 + swa_width + indexed_width + int(with_sink)
+    )
+    q = (torch.randn((rows, heads, 512), device=device, generator=gen) * 0.2).bfloat16()
+    sink = (
+        torch.linspace(-0.4, 0.3, heads, device=device, dtype=torch.float32)
+        if with_sink
+        else None
+    )
+
+    swa_vals = (torch.randn((128, 512), device=device, generator=gen) * 0.25).bfloat16()
+    swa = pack_deepseek_v41_cache_reference(swa_vals, page_size=64, cache_kind="swa")
+    swa_indices = (
+        torch.arange(swa_width, device=device, dtype=torch.int32)
+        .unsqueeze(0)
+        .repeat(rows, 1)
+    )
+    swa_indices[2, 5::13] = -1
+    swa_lengths = torch.tensor(
+        [min(x, swa_width) for x in (0, 1, 63, 64, 65, 127, 128, swa_width, 0)],
+        device=device,
+        dtype=torch.int32,
+    )
+
+    indexed = None
+    indexed_indices = None
+    indexed_lengths = None
+    if indexed_width > 0:
+        idx_vals = (
+            torch.randn((10 * 64, 512), device=device, generator=gen) * 0.25
+        ).bfloat16()
+        indexed = pack_deepseek_v41_cache_reference(
+            idx_vals, page_size=64, cache_kind="indexed"
+        )
+        indexed_indices = (
+            (
+                (torch.arange(indexed_width, device=device, dtype=torch.int32) * 3)
+                % (10 * 64)
+            )
+            .unsqueeze(0)
+            .repeat(rows, 1)
+        )
+        indexed_indices[4, 7::17] = -1
+        indexed_lengths = torch.tensor(
+            [0, 512, 65, 129, 64, 63, 1, 257, 0],
+            device=device,
+            dtype=torch.int32,
+        )
+
+    out_direct = torch.full_like(q, float("nan"))
+    caps = compressed_sparse_mla.Caps(
+        device=device,
+        num_q_heads=heads,
+        max_q_rows=rows,
+        max_width=swa_width + indexed_width,
+        swa_width=swa_width,
+        indexed_width=indexed_width,
+        max_page_table_width=1,
+        swa_page_size=64,
+        indexed_page_size=64,
+        cache_format="deepseek_v41",
+        compute_mode="bf16",
+        mode="decode",
+    )
+    invocation = compressed_sparse_mla.invocation_from_tensors(
+        q=q,
+        swa_k_cache=swa,
+        indexed_k_cache=indexed,
+        attn_sink=sink,
+        out=out_direct,
+        return_lse=True,
+        lse_scale=lse_scale,
+    )
+    base_plan = compressed_sparse_mla.plan(caps, invocation=invocation)
+    default_cfg = TUNING.configure(
+        base_plan.query, device=mla_session.device.identity
+    ).default
+    direct_cfg = replace(
+        default_cfg,
+        max_chunks_per_row=1,
+        split_chunk_size=1024,
+        v41_compute_mode="bf16",
+        v41_heads_per_block=16,
+    )
+    direct_plan = compressed_sparse_mla.plan(
+        caps, invocation=invocation, override=direct_cfg
+    )
+
+    bind_args = dict(q=q, swa_indices=swa_indices, swa_lengths=swa_lengths)
+    run_args = dict(
+        swa_k_cache=swa,
+        swa_page_size=64,
+        attn_sink=sink,
+        sm_scale=_SM_SCALE,
+        return_lse=True,
+        lse_scale=lse_scale,
+    )
+    if indexed is not None:
+        bind_args.update(
+            indexed_indices=indexed_indices, indexed_lengths=indexed_lengths
+        )
+        run_args.update(indexed_k_cache=indexed, indexed_page_size=64)
+
+    binding_direct, _ = _prepare_binding(
+        mla_session, direct_plan, bind_args, run_args, out_direct
+    )
+    mla_session.freeze()
+    _, lse_direct = compressed_sparse_mla.run(
+        binding=binding_direct, out=out_direct, **run_args
+    )
+
+    def _compact_valid_prefix(idx_2d: torch.Tensor, lens: torch.Tensor):
+        comp_idx = torch.full_like(idx_2d, -1)
+        comp_len = torch.zeros_like(lens)
+        for r in range(idx_2d.shape[0]):
+            lim = min(int(lens[r].item()), idx_2d.shape[1])
+            valid_r = idx_2d[r, :lim]
+            valid_r = valid_r[valid_r >= 0]
+            comp_len[r] = int(valid_r.numel())
+            if valid_r.numel() > 0:
+                comp_idx[r, : valid_r.numel()] = valid_r
+        return comp_idx, comp_len
+
+    ref_swa_idx, ref_swa_len = _compact_valid_prefix(swa_indices, swa_lengths)
+    if indexed is not None:
+        ref_idx_idx, ref_idx_len = _compact_valid_prefix(
+            indexed_indices, indexed_lengths
+        )
+    else:
+        ref_idx_idx, ref_idx_len = None, None
+
+    ref_out, ref_lse = compressed_sparse_mla_reference(
+        q,
+        swa,
+        ref_swa_idx,
+        ref_swa_len,
+        extra_k_cache=indexed,
+        extra_indices=ref_idx_idx,
+        extra_topk_lengths=ref_idx_len,
+        swa_page_size=64,
+        extra_page_size=64,
+        cache_format="deepseek_v41",
+        attn_sink=sink,
+        sm_scale=_SM_SCALE,
+        return_lse=True,
+    )
+    expected_lse = ref_lse * 1.4426950408889634 if lse_scale == "base2" else ref_lse
+    torch.testing.assert_close(out_direct, ref_out, atol=3e-3, rtol=3e-3)
+    torch.testing.assert_close(lse_direct, expected_lse, atol=1e-3, rtol=1e-3)
+    assert torch.equal(out_direct[0], torch.zeros_like(out_direct[0]))
+    assert torch.equal(out_direct[8], torch.zeros_like(out_direct[8]))
+    if not with_sink:
+        assert torch.isneginf(lse_direct[0]).all()
+        assert torch.isneginf(lse_direct[8]).all()

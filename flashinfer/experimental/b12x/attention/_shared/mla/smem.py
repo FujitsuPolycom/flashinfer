@@ -553,10 +553,22 @@ def _assert_model(model_type: int, compute_mode: int, scale_format: int) -> int:
 
 
 def _run_module_asserts() -> None:
-    from .traits import ComputeMode, ModelType, ScaleFormat
+    from .traits import (
+        ComputeMode,
+        DSV41_INDEXED_SMEM_STRIDE,
+        ModelType,
+        ScaleFormat,
+        make_unified_traits,
+    )
 
     dsv4 = _assert_model(ModelType.DSV4, ComputeMode.FP8, ScaleFormat.UE8M0_BYTE)
     _assert_model(ModelType.DSV4, ComputeMode.BF16, ScaleFormat.UE8M0_BYTE)
+    dsv41 = _assert_model(ModelType.DSV41, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)
+    dsv41_layout = make_smem_layout(
+        make_unified_traits(ModelType.DSV41, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)
+    )
+    assert dsv41_layout.kv_fp8_buf_bytes >= 64 * DSV41_INDEXED_SMEM_STRIDE
+    assert dsv41 < SM120_SMEM_CARVEOUT_BYTES
     glm = _assert_model(ModelType.GLM_NSA, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32)
     _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.ARBITRARY_FP32)
     _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)

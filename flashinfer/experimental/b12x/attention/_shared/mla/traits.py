@@ -48,6 +48,14 @@ class ScaleFormat:
     NVFP4_E4M3 = 2  # GLM/DS MLA latent: E2M1 data + E4M3 group-16 scales.
 
 
+# DSV4.1 BF16 SMEM row strides inside the double-buffered 64x544B KV stage:
+# SWA records (528B payload + 4B tag at +528) use 544B; pure NVFP4 indexed
+# records (288B payload + 4B tag at +288) use 304B (76 dwords, gcd(76,32)=4,
+# bank-conflict-free) inside the same 64x544B buffer slot.
+DSV41_SWA_SMEM_STRIDE = 544
+DSV41_INDEXED_SMEM_STRIDE = 304
+
+
 @dataclass(frozen=True)
 class UnifiedMLATraits:
     """Frozen, hashable trait bundle for one (model, compute, scale) tuple.
