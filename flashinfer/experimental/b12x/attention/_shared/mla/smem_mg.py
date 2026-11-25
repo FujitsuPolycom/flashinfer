@@ -140,12 +140,21 @@ def make_smem_layout_mg(
     # ldmatrix fragments live (and spilled) across the full kernel.
     alias_qrope = bf16_qk or is_glm
     dsv41_fp8_pv = traits.model_type == ModelType.DSV41 and traits.fp8_internal
+    # DSV4.1 BF16 at mg_n_hg==2 uses a hybrid KV stage: two 64x304B buffers
+    # (38,912B total) double-buffer indexed NVFP4 tiles (304B bank-conflict-free
+    # stride) and single-buffer 64x544B SWA MXFP8 tiles (34,816B <= 38,912B),
+    # fitting 32 heads/CTA within the 101,376B SM120 carveout (80,512B total).
+    dsv41_hybrid_kv = (
+        traits.model_type == ModelType.DSV41
+        and not traits.fp8_internal
+        and mg_n_hg == 2
+    )
     # Keep the model-native padded KV row in both compute modes.  DSV4's 464-B
     # stride (448-B payload + 16-B pad) is part of the shared-memory bank layout,
     # not merely copy padding; FlashInfer retains it for BF16 QK as well.  The
     # XV-RoPE weights alias W_FP8 below, so the padded double buffer still fits
     # the SM120 carveout.
-    kv_smem_stride = traits.kv_smem_stride
+    kv_smem_stride = 304 if dsv41_hybrid_kv else traits.kv_smem_stride
 
     off = 0
 
@@ -536,6 +545,25 @@ def _run_module_asserts() -> None:
         f"SM120 carveout {SM120_SMEM_CARVEOUT_BYTES}B"
     )
     get_prefill_mg_shared_storage_cls(v41_fp8, mg_n_hg=1)
+
+    v41_bf16 = make_unified_traits(
+        ModelType.DSV41, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3
+    )
+    v41_bf16_1 = make_smem_layout_mg(v41_bf16, mg_n_hg=1)
+    assert v41_bf16_1.kv_smem_stride == 544
+    assert v41_bf16_1.total_bytes < SM120_SMEM_CARVEOUT_BYTES
+    get_prefill_mg_shared_storage_cls(v41_bf16, mg_n_hg=1)
+
+    v41_bf16_2 = make_smem_layout_mg(v41_bf16, mg_n_hg=2)
+    assert v41_bf16_2.heads_per_cta == 32
+    assert v41_bf16_2.kv_smem_stride == 304
+    assert v41_bf16_2.kv_fp8_buf_bytes == 64 * 304
+    assert v41_bf16_2.kv_fp8_buf_bytes * v41_bf16_2.kv_bufs >= 64 * 544
+    assert v41_bf16_2.total_bytes < SM120_SMEM_CARVEOUT_BYTES, (
+        f"V4.1 BF16 MG2 prefill smem {v41_bf16_2.total_bytes}B exceeds "
+        f"SM120 carveout {SM120_SMEM_CARVEOUT_BYTES}B"
+    )
+    get_prefill_mg_shared_storage_cls(v41_bf16, mg_n_hg=2)
 
     # mg_n_hg==1 (heads==16): one head group. Every group buffer is exactly half
     # the mg_n_hg==2 size; the per-group *_group_bytes (and so the group-0 byte

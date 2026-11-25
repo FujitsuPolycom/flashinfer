@@ -237,11 +237,16 @@ def test_dsv4_bf16_prefill_partitions_24_heads(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("heads", "expected_active", "expected_offsets"),
-    [(24, [16, 8], [0, 16]), (32, [32], [0])],
+    ("heads", "expected_mg_n_hg", "expected_active", "expected_offsets"),
+    [
+        (16, [1], [16], [0]),
+        (24, [1, 1], [16, 8], [0, 16]),
+        (32, [2], [32], [0]),
+        (64, [2], [64], [0]),
+    ],
 )
 def test_dsv41_prefill_partitions_tp_shards(
-    monkeypatch, heads, expected_active, expected_offsets
+    monkeypatch, heads, expected_mg_n_hg, expected_active, expected_offsets
 ) -> None:
     import b12x.attention._shared.mla.prefill_mg as prefill_mg
     from b12x.attention._shared.mla.prefill import run_unified_prefill
@@ -272,9 +277,54 @@ def test_dsv41_prefill_partitions_tp_shards(
         scale_format=ScaleFormat.NVFP4_E4M3,
     )
 
-    assert [call["mg_n_hg"] for call in calls] == [1] * len(calls)
+    assert [call["mg_n_hg"] for call in calls] == expected_mg_n_hg
     assert [call.get("active_heads", heads) for call in calls] == expected_active
     assert [call.get("head_offset", 0) for call in calls] == expected_offsets
+
+
+def test_dsv41_fp8_prefill_keeps_single_head_group_partition(monkeypatch) -> None:
+    from dataclasses import replace
+    import b12x.attention._shared.mla.prefill_mg as prefill_mg
+    from b12x.attention._shared.mla.prefill import run_unified_prefill
+    from b12x.attention._shared.mla.traits import (
+        ComputeMode,
+        ModelType,
+        ScaleFormat,
+        make_unified_traits,
+    )
+
+    calls = []
+
+    def fake_run_unified_prefill_mg(**kwargs):
+        calls.append(kwargs)
+        return kwargs["output"], kwargs["lse_out"]
+
+    monkeypatch.setattr(
+        prefill_mg, "run_unified_prefill_mg", fake_run_unified_prefill_mg
+    )
+
+    q = torch.empty((2, 32, 512), dtype=torch.bfloat16)
+    kv_cache = torch.empty((4, 432), dtype=torch.uint8)
+    topk_indices = torch.zeros((2, 512), dtype=torch.int32)
+    traits = replace(
+        make_unified_traits(ModelType.DSV41, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3),
+        fp8_internal=True,
+    )
+
+    run_unified_prefill(
+        q=q,
+        kv_cache=kv_cache,
+        topk_indices=topk_indices,
+        sm_scale=0.1,
+        page_block_size=64,
+        stride_kv_block=64 * 432,
+        model_type=ModelType.DSV41,
+        scale_format=ScaleFormat.NVFP4_E4M3,
+        traits_override=traits,
+    )
+
+    assert [call["mg_n_hg"] for call in calls] == [1]
+    assert [call.get("active_heads", 32) for call in calls] == [32]
 
 
 def test_sm120_prefill_dual_partitions_40_heads_with_8_tail(monkeypatch) -> None:
