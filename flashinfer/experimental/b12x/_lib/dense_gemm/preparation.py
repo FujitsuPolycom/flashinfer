@@ -497,7 +497,7 @@ def _lower_dense_gemm(
             f"C row stride, but N={n} and c_dtype={c_dtype!r} produce "
             f"{c_row_stride_bytes} bytes; {remedy}"
         )
-    if is_mxfp8 and _tile_k_override is None and mma_tiler_mn[0] != 128:
+    if is_mxfp8 and _tile_k_override is None and mma_tiler_mn[0] != 128 and k % 128 == 0:
         tile_k = 128
     if is_mxfp8 and swap_ab:
         # BK64 packed-scale staging requires the weight operand to remain in
@@ -548,7 +548,9 @@ def _lower_dense_gemm(
             )
         b_launch_torch = rhs_values_tiled
     if is_mxfp8:
-        _validate_mxfp8_bk64_plan(tile_k, mma_tiler_mn, swap_ab)
+        _validate_mxfp8_bk64_plan(
+            tile_k, mma_tiler_mn, swap_ab, allow_short_m=(k % 128 != 0)
+        )
     # k-reuse relies on SFB being the 128x128-block weight operand; with
     # swap_ab the smem B slot holds activations, so force it off there.
     sfb_k_reuse = bool(sfb_k_replicated) and not swap_ab and is_mxfp8

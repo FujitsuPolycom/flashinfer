@@ -104,6 +104,11 @@ class _DenseGemmLaunch:
         input_k: Optional[int] = None,
         programmatic_serialization: bool = False,
         evict_first: bool = False,
+        has_residual: bool = False,
+        rope_head_dim: int = 0,
+        rope_dim: int = 0,
+        rope_split: bool = False,
+        rope_inverse: bool = False,
     ):
         self._weight_only = weight_only
         self._mma_warps = mma_warps
@@ -111,6 +116,11 @@ class _DenseGemmLaunch:
         self._input_k = k if input_k is None else input_k
         self._programmatic_serialization = programmatic_serialization
         self._evict_first = evict_first
+        self._has_residual = bool(has_residual)
+        self._rope_head_dim = int(rope_head_dim)
+        self._rope_dim = int(rope_dim)
+        self._rope_split = bool(rope_split)
+        self._rope_inverse = bool(rope_inverse)
         self._storage_k = k // (
             block_codec(weight_only).pack_factor
             if weight_only in BLOCK_CODECS
@@ -248,17 +258,23 @@ class _DenseGemmLaunch:
             self._evict_first,
         )
 
-        return (
-            key
-            if self._weight_only is None
-            else key
-            + (
+        if self._weight_only is not None:
+            key = key + (
                 self._weight_only,
                 self._mma_warps,
                 self._alpha_reciprocal,
                 self._input_k,
             )
-        )
+        if self._has_residual or self._rope_dim > 0:
+            key = key + (
+                "epilogue_ext",
+                self._has_residual,
+                self._rope_head_dim,
+                self._rope_dim,
+                self._rope_split,
+                self._rope_inverse,
+            )
+        return key
 
     @cute.jit
     def __call__(
@@ -272,6 +288,8 @@ class _DenseGemmLaunch:
         quant_c_scale_rows_ptr: cute.Pointer,
         quant_c_scale_mma_ptr: cute.Pointer,
         alpha_ptr: cute.Pointer,
+        residual_ptr: cute.Pointer,
+        rope_cos_sin_ptr: cute.Pointer,
         m: cutlass.Int32,
         current_stream: cuda.CUstream,
     ):
@@ -326,6 +344,7 @@ class _DenseGemmLaunch:
         quant_c_width = self._n * self._l
         quant_c_chunks = max(1, (quant_c_width + 31) // 32)
         quant_c_k_tiles = max(1, (quant_c_width + 127) // 128)
+        quant_c_m_tiles = (m + Int32(127)) // Int32(128)
         quant_c_values_tensor = cute.make_tensor(
             quant_c_values_ptr,
             layout=cute.make_ordered_layout((m, quant_c_width), order=(1, 0)),
@@ -337,20 +356,33 @@ class _DenseGemmLaunch:
         quant_c_scale_mma_tensor = cute.make_tensor(
             quant_c_scale_mma_ptr,
             layout=cute.make_layout(
-                (32, 4, 1, 4, quant_c_k_tiles, 1),
+                (32, 4, quant_c_m_tiles, 4, quant_c_k_tiles, 1),
                 stride=(
                     16,
                     4,
                     quant_c_k_tiles * 512,
                     1,
                     512,
-                    quant_c_k_tiles * 512,
+                    quant_c_m_tiles * quant_c_k_tiles * 512,
                 ),
             ),
         )
         alpha_tensor = cute.make_tensor(
             alpha_ptr,
             layout=cute.make_ordered_layout((1,), order=(0,)),
+        )
+        residual_tensor = cute.make_tensor(
+            residual_ptr,
+            layout=cute.make_ordered_layout(
+                (cutlass.Int64(m), self._n, self._c_l),
+                order=(0, 1, 2) if self._c_major == "m" else (1, 0, 2),
+            ),
+        )
+        rope_cos_sin_tensor = cute.make_tensor(
+            rope_cos_sin_ptr,
+            layout=cute.make_layout(
+                (cutlass.Int64(m) * cutlass.Int64(max(1, self._rope_dim)),)
+            ),
         )
         if cutlass.const_expr(self._weight_only is not None):
             scale_bytes = (
@@ -432,6 +464,11 @@ class _DenseGemmLaunch:
             alpha_reciprocal=self._alpha_reciprocal,
             programmatic_serialization=self._programmatic_serialization,
             evict_first=self._evict_first,
+            has_residual=self._has_residual,
+            rope_head_dim=self._rope_head_dim,
+            rope_dim=self._rope_dim,
+            rope_split=self._rope_split,
+            rope_inverse=self._rope_inverse,
         )(
             a_tensor,
             a_tensor,
@@ -447,6 +484,8 @@ class _DenseGemmLaunch:
             alpha_tensor,
             self._max_active_clusters,
             current_stream,
+            residual=residual_tensor,
+            rope_cos_sin=rope_cos_sin_tensor,
         )
 
 
@@ -1672,11 +1711,18 @@ def _get_compiled_dense_gemm(
     input_k: Optional[int] = None,
     programmatic_serialization: bool = False,
     evict_first: bool = False,
+    has_residual: bool = False,
+    rope_head_dim: int = 0,
+    rope_dim: int = 0,
+    rope_split: bool = False,
+    rope_inverse: bool = False,
     device_ordinal: Optional[int] = None,
 ) -> Callable:
     def _make_runtime_pointers(
         input_tensors: Optional[List[torch.Tensor]],
         quant_c_tensors: Optional[List[torch.Tensor]] = None,
+        residual_tensor: Optional[torch.Tensor] = None,
+        rope_cos_sin_tensor: Optional[torch.Tensor] = None,
     ) -> List[cute.Pointer]:
         if input_tensors is None:
             (
@@ -1724,6 +1770,10 @@ def _get_compiled_dense_gemm(
             quant_c_values_ptr = quant_c_values_gpu.data_ptr()
             quant_c_scale_rows_ptr = quant_c_scale_rows_gpu.data_ptr()
             quant_c_scale_mma_ptr = quant_c_scale_mma_gpu.data_ptr()
+        residual_ptr = residual_tensor.data_ptr() if residual_tensor is not None else 16
+        rope_cos_sin_ptr = (
+            rope_cos_sin_tensor.data_ptr() if rope_cos_sin_tensor is not None else 16
+        )
 
         return [
             make_ptr(ab_dtype, a_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
@@ -1756,6 +1806,13 @@ def _get_compiled_dense_gemm(
             ),
             make_ptr(
                 alpha_dtype, alpha_data_ptr, cute.AddressSpace.gmem, assumed_align=16
+            ),
+            make_ptr(c_dtype, residual_ptr, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(
+                cutlass.Float32,
+                rope_cos_sin_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
             ),
         ]
 
@@ -1813,6 +1870,11 @@ def _get_compiled_dense_gemm(
         ),
         programmatic_serialization=programmatic_serialization,
         evict_first=evict_first,
+        has_residual=has_residual,
+        rope_head_dim=rope_head_dim,
+        rope_dim=rope_dim,
+        rope_split=rope_split,
+        rope_inverse=rope_inverse,
     )
     if weight_only is not None and torch.cuda.is_current_stream_capturing():
         raise RuntimeError("A16 dense GEMM must be prewarmed before CUDA graph capture")
@@ -1827,7 +1889,7 @@ def _get_compiled_dense_gemm(
         *_make_runtime_pointers(None),
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("gemm.dense", 4, compile_key),
+        compile_spec=KernelCompileSpec.from_key("gemm.dense", 5, compile_key),
     )
 
     def tensor_api(
@@ -1841,6 +1903,8 @@ def _get_compiled_dense_gemm(
         quant_c_values_gpu: Optional[torch.Tensor] = None,
         quant_c_scale_rows_gpu: Optional[torch.Tensor] = None,
         quant_c_scale_mma_gpu: Optional[torch.Tensor] = None,
+        residual_gpu: Optional[torch.Tensor] = None,
+        rope_cos_sin_gpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         m = a_tensor_gpu.shape[0]
         if c_tensor_gpu is None:
@@ -1864,6 +1928,10 @@ def _get_compiled_dense_gemm(
                 quant_c_scale_rows_gpu,
                 quant_c_scale_mma_gpu,
             ]
+        if has_residual and residual_gpu is None:
+            raise ValueError("residual tensor is required when has_residual=True")
+        if rope_dim > 0 and rope_cos_sin_gpu is None:
+            raise ValueError("rope_cos_sin tensor is required when rope_dim > 0")
 
         nonlocal compiled_kernel
         compiled_kernel(
@@ -1877,6 +1945,8 @@ def _get_compiled_dense_gemm(
                     alpha_tensor_gpu,
                 ],
                 quant_c_tensors,
+                residual_tensor=residual_gpu,
+                rope_cos_sin_tensor=rope_cos_sin_gpu,
             ),
             m,
             cuda_stream_from_int_or_current(stream_int),

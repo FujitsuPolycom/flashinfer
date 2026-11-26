@@ -175,6 +175,11 @@ class DenseGemmKernel:
         weight_only: Optional[str] = None,
         mma_warps: Optional[int] = None,
         alpha_reciprocal: bool = False,
+        has_residual: bool = False,
+        rope_head_dim: int = 0,
+        rope_dim: int = 0,
+        rope_split: bool = False,
+        rope_inverse: bool = False,
     ):
         if weight_only not in (None, "nvfp4", "mxfp8", "iq2_xs", "iq2_xxs", "q8_0"):
             raise ValueError("weight_only must be nvfp4, mxfp8, or iq2_xs")
@@ -391,6 +396,24 @@ class DenseGemmKernel:
         self.fused_quant_a_wide = fused_quant_a_wide
         self.b_tile_major = b_tile_major
         self.quantize_c = quantize_c
+        self.has_residual = bool(has_residual)
+        self.rope_head_dim = int(rope_head_dim)
+        self.rope_dim = int(rope_dim)
+        self.rope_split = bool(rope_split)
+        self.rope_inverse = bool(rope_inverse)
+        if self.has_residual:
+            assert not quantize_c, "residual addend is not wired for quantize_c"
+            assert split_k_slices == 1, "residual addend is not wired for split-K"
+            assert not swap_ab, "residual addend is not wired for swap_ab"
+        if self.rope_dim > 0:
+            assert not quantize_c, "RoPE epilogue is not wired for quantize_c"
+            assert split_k_slices == 1, "RoPE epilogue is not wired for split-K"
+            assert not swap_ab, "RoPE epilogue is not wired for swap_ab"
+            assert self.rope_dim == 64, "RoPE epilogue currently requires rope_dim=64"
+            assert (
+                self.rope_head_dim >= self.rope_dim
+                and self.rope_head_dim % self.rope_dim == 0
+            ), "RoPE epilogue requires rope_head_dim divisible by rope_dim"
         self.alpha_is_one = alpha_is_one
         # Per-row output scale applied in the epilogue, replacing a separate
         # ``result.mul_(inv_gs)`` launch. It is NOT foldable into ``alpha``:
@@ -773,6 +796,8 @@ class DenseGemmKernel:
         epilogue_op: cutlass.Constexpr = lambda x: x,
         x_bf16: cute.Tensor = None,
         w_gscale: cute.Tensor = None,
+        residual: cute.Tensor = None,
+        rope_cos_sin: cute.Tensor = None,
     ):
         """Execute the GEMM operation.
 
@@ -788,6 +813,8 @@ class DenseGemmKernel:
             epilogue_op: Elementwise epilogue function
             x_bf16: BF16 activation input (MX-FP6 fused quant mode only)
             w_gscale: Weight global scale, shape (1,), f32 (fused mode only)
+            residual: Optional BF16 residual tensor added to BF16-rounded output
+            rope_cos_sin: Optional FP32 cos/sin table for tail-64 Q-RoPE epilogue
         """
         # Dead kernel arguments on every non-fused path; substitute a
         # type-compatible live tensor so the traced signature stays uniform.
@@ -797,6 +824,10 @@ class DenseGemmKernel:
             x_bf16 = alpha
         if cutlass.const_expr(w_gscale is None):
             w_gscale = alpha
+        if cutlass.const_expr(residual is None):
+            residual = c
+        if cutlass.const_expr(rope_cos_sin is None):
+            rope_cos_sin = alpha
         # Setup static attributes
         self.a_dtype = a.element_type
         self.b_dtype = cutlass.BFloat16 if self.a16 else b.element_type
@@ -1036,6 +1067,8 @@ class DenseGemmKernel:
             alpha,
             x_bf16,
             w_gscale,
+            residual,
+            rope_cos_sin,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1385,6 +1418,8 @@ class DenseGemmKernel:
         alpha: cute.Tensor,
         directX_bf16: cute.Tensor,
         w_gscale: cute.Tensor,
+        residual_mnl: cute.Tensor,
+        rope_cos_sin: cute.Tensor,
     ):
         # Keep alpha in FP32 for precision
         alpha_value = alpha[0].to(cutlass.Float32)
@@ -2948,14 +2983,368 @@ class DenseGemmKernel:
                                 )
                                 self.epilog_sync_barrier.arrive_and_wait()
 
+                                if cutlass.const_expr(self.has_residual):
+                                    # Add BF16 residual onto BF16-rounded sC in FP32,
+                                    # matching standalone (down(x) + residual) at 0-ULP.
+                                    res_vec_cols = self.epi_tile[1] // 8
+                                    res_total = self.epi_tile[0] * res_vec_cols
+                                    res_threads = (
+                                        self.num_mma_warps * self.num_threads_per_warp
+                                    )
+                                    res_iters = (
+                                        res_total + res_threads - 1
+                                    ) // res_threads
+                                    res_batch_offset = (
+                                        Int64(tile_coord_mnl[2])
+                                        * Int64(directC_mnl.shape[0])
+                                        * Int64(directC_mnl.shape[1])
+                                    )
+                                    for res_iter in cutlass.range(
+                                        res_iters, unroll=1
+                                    ):
+                                        res_idx = Int32(tidx) + Int32(
+                                            res_iter * res_threads
+                                        )
+                                        if res_idx < Int32(res_total):
+                                            res_row_local = res_idx // Int32(
+                                                res_vec_cols
+                                            )
+                                            res_col_vec = (
+                                                res_idx
+                                                - res_row_local * Int32(res_vec_cols)
+                                            )
+                                            res_col_local = res_col_vec * Int32(8)
+                                            res_global_row = (
+                                                tile_coord_mnl[0]
+                                                * Int32(self.tile_shape_mnk[0])
+                                                + Int32(epi_m * self.epi_tile[0])
+                                                + res_row_local
+                                            )
+                                            res_global_col = (
+                                                tile_coord_mnl[1]
+                                                * Int32(self.tile_shape_mnk[1])
+                                                + Int32(epi_n * self.epi_tile[1])
+                                                + res_col_local
+                                            )
+                                            if res_global_row < Int32(
+                                                directC_mnl.shape[0]
+                                            ) and res_global_col < Int32(
+                                                directC_mnl.shape[1]
+                                            ):
+                                                rw0, rw1, rw2, rw3 = ld_global_v4_u32(
+                                                    get_ptr_as_int64(
+                                                        residual_mnl,
+                                                        res_batch_offset
+                                                        + Int64(res_global_row)
+                                                        * Int64(directC_mnl.shape[1])
+                                                        + Int64(res_global_col),
+                                                    )
+                                                )
+                                                r0, r1 = bfloat2_to_float2_scaled(
+                                                    rw0, cutlass.Float32(1.0)
+                                                )
+                                                r2, r3 = bfloat2_to_float2_scaled(
+                                                    rw1, cutlass.Float32(1.0)
+                                                )
+                                                r4, r5 = bfloat2_to_float2_scaled(
+                                                    rw2, cutlass.Float32(1.0)
+                                                )
+                                                r6, r7 = bfloat2_to_float2_scaled(
+                                                    rw3, cutlass.Float32(1.0)
+                                                )
+                                                sC[
+                                                    (
+                                                        res_row_local,
+                                                        res_col_local,
+                                                        epi_buffer,
+                                                    )
+                                                ] = cutlass.BFloat16(
+                                                    cutlass.Float32(
+                                                        sC[
+                                                            (
+                                                                res_row_local,
+                                                                res_col_local,
+                                                                epi_buffer,
+                                                            )
+                                                        ]
+                                                    )
+                                                    + r0
+                                                )
+                                                sC[
+                                                    (
+                                                        res_row_local,
+                                                        res_col_local + Int32(1),
+                                                        epi_buffer,
+                                                    )
+                                                ] = cutlass.BFloat16(
+                                                    cutlass.Float32(
+                                                        sC[
+                                                            (
+                                                                res_row_local,
+                                                                res_col_local
+                                                                + Int32(1),
+                                                                epi_buffer,
+                                                            )
+                                                        ]
+                                                    )
+                                                    + r1
+                                                )
+                                                sC[
+                                                    (
+                                                        res_row_local,
+                                                        res_col_local + Int32(2),
+                                                        epi_buffer,
+                                                    )
+                                                ] = cutlass.BFloat16(
+                                                    cutlass.Float32(
+                                                        sC[
+                                                            (
+                                                                res_row_local,
+                                                                res_col_local
+                                                                + Int32(2),
+                                                                epi_buffer,
+                                                            )
+                                                        ]
+                                                    )
+                                                    + r2
+                                                )
+                                                sC[
+                                                    (
+                                                        res_row_local,
+                                                        res_col_local + Int32(3),
+                                                        epi_buffer,
+                                                    )
+                                                ] = cutlass.BFloat16(
+                                                    cutlass.Float32(
+                                                        sC[
+                                                            (
+                                                                res_row_local,
+                                                                res_col_local
+                                                                + Int32(3),
+                                                                epi_buffer,
+                                                            )
+                                                        ]
+                                                    )
+                                                    + r3
+                                                )
+                                                sC[
+                                                    (
+                                                        res_row_local,
+                                                        res_col_local + Int32(4),
+                                                        epi_buffer,
+                                                    )
+                                                ] = cutlass.BFloat16(
+                                                    cutlass.Float32(
+                                                        sC[
+                                                            (
+                                                                res_row_local,
+                                                                res_col_local
+                                                                + Int32(4),
+                                                                epi_buffer,
+                                                            )
+                                                        ]
+                                                    )
+                                                    + r4
+                                                )
+                                                sC[
+                                                    (
+                                                        res_row_local,
+                                                        res_col_local + Int32(5),
+                                                        epi_buffer,
+                                                    )
+                                                ] = cutlass.BFloat16(
+                                                    cutlass.Float32(
+                                                        sC[
+                                                            (
+                                                                res_row_local,
+                                                                res_col_local
+                                                                + Int32(5),
+                                                                epi_buffer,
+                                                            )
+                                                        ]
+                                                    )
+                                                    + r5
+                                                )
+                                                sC[
+                                                    (
+                                                        res_row_local,
+                                                        res_col_local + Int32(6),
+                                                        epi_buffer,
+                                                    )
+                                                ] = cutlass.BFloat16(
+                                                    cutlass.Float32(
+                                                        sC[
+                                                            (
+                                                                res_row_local,
+                                                                res_col_local
+                                                                + Int32(6),
+                                                                epi_buffer,
+                                                            )
+                                                        ]
+                                                    )
+                                                    + r6
+                                                )
+                                                sC[
+                                                    (
+                                                        res_row_local,
+                                                        res_col_local + Int32(7),
+                                                        epi_buffer,
+                                                    )
+                                                ] = cutlass.BFloat16(
+                                                    cutlass.Float32(
+                                                        sC[
+                                                            (
+                                                                res_row_local,
+                                                                res_col_local
+                                                                + Int32(7),
+                                                                epi_buffer,
+                                                            )
+                                                        ]
+                                                    )
+                                                    + r7
+                                                )
+                                    cute.arch.fence_proxy(
+                                        "async.shared",
+                                        space="cta",
+                                    )
+                                    self.epilog_sync_barrier.arrive_and_wait()
+
+                                if cutlass.const_expr(self.rope_dim > 0):
+                                    # Rotate the trailing rope_dim=64 columns of each
+                                    # head in-place in BF16-rounded sC before TMA store.
+                                    rope_tile_n_base = tile_coord_mnl[1] * Int32(
+                                        self.tile_shape_mnk[1]
+                                    ) + Int32(epi_n * self.epi_tile[1])
+                                    rope_head_off = rope_tile_n_base % Int32(
+                                        self.rope_head_dim
+                                    )
+                                    rope_start_in_head = Int32(
+                                        self.rope_head_dim - self.rope_dim
+                                    )
+                                    if (
+                                        rope_head_off + Int32(self.epi_tile[1])
+                                        > rope_start_in_head
+                                    ):
+                                        rope_col0 = rope_start_in_head - rope_head_off
+                                        rope_half = self.rope_dim // 2
+                                        rope_warp = Int32(tidx) // Int32(32)
+                                        rope_pair = Int32(tidx) % Int32(32)
+                                        rope_row_iters = (
+                                            self.epi_tile[0] + self.num_mma_warps - 1
+                                        ) // self.num_mma_warps
+                                        for rope_row_iter in cutlass.range(
+                                            rope_row_iters, unroll=1
+                                        ):
+                                            rope_row_local = rope_warp + Int32(
+                                                rope_row_iter * self.num_mma_warps
+                                            )
+                                            rope_row_global = (
+                                                tile_coord_mnl[0]
+                                                * Int32(self.tile_shape_mnk[0])
+                                                + Int32(epi_m * self.epi_tile[0])
+                                                + rope_row_local
+                                            )
+                                            if rope_row_local < Int32(
+                                                self.epi_tile[0]
+                                            ) and rope_row_global < Int32(
+                                                directC_mnl.shape[0]
+                                            ):
+                                                rope_cs_base = Int64(
+                                                    rope_row_global
+                                                ) * Int64(self.rope_dim)
+                                                if cutlass.const_expr(self.rope_split):
+                                                    cos_v = cutlass.Float32(
+                                                        rope_cos_sin[
+                                                            rope_cs_base
+                                                            + Int64(rope_pair)
+                                                        ]
+                                                    )
+                                                    sin_v = cutlass.Float32(
+                                                        rope_cos_sin[
+                                                            rope_cs_base
+                                                            + Int64(rope_half)
+                                                            + Int64(rope_pair)
+                                                        ]
+                                                    )
+                                                else:
+                                                    cos_v = cutlass.Float32(
+                                                        rope_cos_sin[
+                                                            rope_cs_base
+                                                            + Int64(
+                                                                rope_pair * Int32(2)
+                                                            )
+                                                        ]
+                                                    )
+                                                    sin_v = cutlass.Float32(
+                                                        rope_cos_sin[
+                                                            rope_cs_base
+                                                            + Int64(
+                                                                rope_pair * Int32(2)
+                                                                + Int32(1)
+                                                            )
+                                                        ]
+                                                    )
+                                                if cutlass.const_expr(
+                                                    self.rope_inverse
+                                                ):
+                                                    sin_v = -sin_v
+                                                rope_col_even = (
+                                                    rope_col0 + rope_pair * Int32(2)
+                                                )
+                                                rope_a = cutlass.Float32(
+                                                    sC[
+                                                        (
+                                                            rope_row_local,
+                                                            rope_col_even,
+                                                            epi_buffer,
+                                                        )
+                                                    ]
+                                                )
+                                                rope_b = cutlass.Float32(
+                                                    sC[
+                                                        (
+                                                            rope_row_local,
+                                                            rope_col_even + Int32(1),
+                                                            epi_buffer,
+                                                        )
+                                                    ]
+                                                )
+                                                sC[
+                                                    (
+                                                        rope_row_local,
+                                                        rope_col_even,
+                                                        epi_buffer,
+                                                    )
+                                                ] = cutlass.BFloat16(
+                                                    rope_a * cos_v - rope_b * sin_v
+                                                )
+                                                sC[
+                                                    (
+                                                        rope_row_local,
+                                                        rope_col_even + Int32(1),
+                                                        epi_buffer,
+                                                    )
+                                                ] = cutlass.BFloat16(
+                                                    rope_a * sin_v + rope_b * cos_v
+                                                )
+                                        cute.arch.fence_proxy(
+                                            "async.shared",
+                                            space="cta",
+                                        )
+                                        self.epilog_sync_barrier.arrive_and_wait()
+
                                 if cutlass.const_expr(self.quantize_c):
                                     quant_chunks_per_epi = self.epi_tile[1] // 32
-                                    quant_active_warps = min(self.num_mma_warps, 4)
+                                    quant_epi_rows = self.epi_tile[0]
+                                    quant_total_tasks = (
+                                        quant_epi_rows * quant_chunks_per_epi
+                                    )
+                                    quant_active_warps = self.num_mma_warps
                                     quant_subgroups = quant_active_warps * 8
                                     quant_lane = Int32(tidx % 4)
                                     quant_subgroup = Int32(tidx // 4)
                                     quant_iters = (
-                                        16 * quant_chunks_per_epi + quant_subgroups - 1
+                                        quant_total_tasks + quant_subgroups - 1
                                     ) // quant_subgroups
                                     if warp_idx < Int32(quant_active_warps):
                                         for quant_iter in cutlass.range(
@@ -2966,227 +3355,224 @@ class DenseGemmKernel:
                                             quant_task = quant_subgroup + Int32(
                                                 quant_iter * quant_subgroups
                                             )
-                                            quant_row = quant_task // Int32(
+                                            quant_task_valid = quant_task < Int32(
+                                                quant_total_tasks
+                                            )
+                                            quant_task_safe = quant_task
+                                            if not quant_task_valid:
+                                                quant_task_safe = Int32(0)
+                                            quant_row_local = quant_task_safe // Int32(
                                                 quant_chunks_per_epi
                                             )
                                             quant_chunk = (
-                                                quant_task
-                                                - quant_row
+                                                quant_task_safe
+                                                - quant_row_local
                                                 * Int32(quant_chunks_per_epi)
                                             )
-                                            quant_row_valid = quant_row < Int32(
-                                                quantC_values.shape[0]
+                                            quant_global_row = (
+                                                tile_coord_mnl[0]
+                                                * Int32(self.tile_shape_mnk[0])
+                                                + Int32(epi_m * self.epi_tile[0])
+                                                + quant_row_local
                                             )
-                                            quant_row_safe = quant_row
-                                            if quant_row_safe >= Int32(
-                                                quantC_values.shape[0]
-                                            ):
-                                                quant_row_safe = Int32(0)
-                                            if quant_row_safe < Int32(
-                                                quantC_values.shape[0]
-                                            ):
-                                                quant_elem0 = quant_chunk * Int32(
-                                                    32
-                                                ) + quant_lane * Int32(8)
-                                                quant_v0 = cutlass.Float32(
-                                                    sC[
-                                                        (
-                                                            quant_row_safe,
-                                                            quant_elem0,
-                                                            epi_buffer,
-                                                        )
-                                                    ]
+                                            quant_local_n = (
+                                                tile_coord_mnl[1]
+                                                * Int32(self.tile_shape_mnk[1])
+                                                + Int32(epi_n * self.epi_tile[1])
+                                                + quant_chunk * Int32(32)
+                                            )
+                                            quant_valid = (
+                                                quant_task_valid
+                                                and (
+                                                    quant_global_row
+                                                    < Int32(quantC_values.shape[0])
                                                 )
-                                                quant_v1 = cutlass.Float32(
-                                                    sC[
-                                                        (
-                                                            quant_row_safe,
-                                                            quant_elem0 + Int32(1),
-                                                            epi_buffer,
-                                                        )
-                                                    ]
+                                                and (
+                                                    quant_local_n
+                                                    < Int32(directC_mnl.shape[1])
                                                 )
-                                                quant_v2 = cutlass.Float32(
-                                                    sC[
-                                                        (
-                                                            quant_row_safe,
-                                                            quant_elem0 + Int32(2),
-                                                            epi_buffer,
-                                                        )
-                                                    ]
-                                                )
-                                                quant_v3 = cutlass.Float32(
-                                                    sC[
-                                                        (
-                                                            quant_row_safe,
-                                                            quant_elem0 + Int32(3),
-                                                            epi_buffer,
-                                                        )
-                                                    ]
-                                                )
-                                                quant_v4 = cutlass.Float32(
-                                                    sC[
-                                                        (
-                                                            quant_row_safe,
-                                                            quant_elem0 + Int32(4),
-                                                            epi_buffer,
-                                                        )
-                                                    ]
-                                                )
-                                                quant_v5 = cutlass.Float32(
-                                                    sC[
-                                                        (
-                                                            quant_row_safe,
-                                                            quant_elem0 + Int32(5),
-                                                            epi_buffer,
-                                                        )
-                                                    ]
-                                                )
-                                                quant_v6 = cutlass.Float32(
-                                                    sC[
-                                                        (
-                                                            quant_row_safe,
-                                                            quant_elem0 + Int32(6),
-                                                            epi_buffer,
-                                                        )
-                                                    ]
-                                                )
-                                                quant_v7 = cutlass.Float32(
-                                                    sC[
-                                                        (
-                                                            quant_row_safe,
-                                                            quant_elem0 + Int32(7),
-                                                            epi_buffer,
-                                                        )
-                                                    ]
-                                                )
+                                            )
+                                            quant_elem0 = quant_chunk * Int32(
+                                                32
+                                            ) + quant_lane * Int32(8)
+                                            quant_v0 = cutlass.Float32(
+                                                sC[
+                                                    (
+                                                        quant_row_local,
+                                                        quant_elem0,
+                                                        epi_buffer,
+                                                    )
+                                                ]
+                                            )
+                                            quant_v1 = cutlass.Float32(
+                                                sC[
+                                                    (
+                                                        quant_row_local,
+                                                        quant_elem0 + Int32(1),
+                                                        epi_buffer,
+                                                    )
+                                                ]
+                                            )
+                                            quant_v2 = cutlass.Float32(
+                                                sC[
+                                                    (
+                                                        quant_row_local,
+                                                        quant_elem0 + Int32(2),
+                                                        epi_buffer,
+                                                    )
+                                                ]
+                                            )
+                                            quant_v3 = cutlass.Float32(
+                                                sC[
+                                                    (
+                                                        quant_row_local,
+                                                        quant_elem0 + Int32(3),
+                                                        epi_buffer,
+                                                    )
+                                                ]
+                                            )
+                                            quant_v4 = cutlass.Float32(
+                                                sC[
+                                                    (
+                                                        quant_row_local,
+                                                        quant_elem0 + Int32(4),
+                                                        epi_buffer,
+                                                    )
+                                                ]
+                                            )
+                                            quant_v5 = cutlass.Float32(
+                                                sC[
+                                                    (
+                                                        quant_row_local,
+                                                        quant_elem0 + Int32(5),
+                                                        epi_buffer,
+                                                    )
+                                                ]
+                                            )
+                                            quant_v6 = cutlass.Float32(
+                                                sC[
+                                                    (
+                                                        quant_row_local,
+                                                        quant_elem0 + Int32(6),
+                                                        epi_buffer,
+                                                    )
+                                                ]
+                                            )
+                                            quant_v7 = cutlass.Float32(
+                                                sC[
+                                                    (
+                                                        quant_row_local,
+                                                        quant_elem0 + Int32(7),
+                                                        epi_buffer,
+                                                    )
+                                                ]
+                                            )
+                                            quant_max = fmax_f32(
+                                                fmax_f32(
+                                                    fmax_f32(
+                                                        fabs_f32(quant_v0),
+                                                        fabs_f32(quant_v1),
+                                                    ),
+                                                    fmax_f32(
+                                                        fabs_f32(quant_v2),
+                                                        fabs_f32(quant_v3),
+                                                    ),
+                                                ),
+                                                fmax_f32(
+                                                    fmax_f32(
+                                                        fabs_f32(quant_v4),
+                                                        fabs_f32(quant_v5),
+                                                    ),
+                                                    fmax_f32(
+                                                        fabs_f32(quant_v6),
+                                                        fabs_f32(quant_v7),
+                                                    ),
+                                                ),
+                                            )
+                                            for (
+                                                quant_shift
+                                            ) in cutlass.range_constexpr(2):
                                                 quant_max = fmax_f32(
-                                                    fmax_f32(
-                                                        fmax_f32(
-                                                            fabs_f32(quant_v0),
-                                                            fabs_f32(quant_v1),
-                                                        ),
-                                                        fmax_f32(
-                                                            fabs_f32(quant_v2),
-                                                            fabs_f32(quant_v3),
-                                                        ),
-                                                    ),
-                                                    fmax_f32(
-                                                        fmax_f32(
-                                                            fabs_f32(quant_v4),
-                                                            fabs_f32(quant_v5),
-                                                        ),
-                                                        fmax_f32(
-                                                            fabs_f32(quant_v6),
-                                                            fabs_f32(quant_v7),
-                                                        ),
-                                                    ),
-                                                )
-                                                for (
-                                                    quant_shift
-                                                ) in cutlass.range_constexpr(2):
-                                                    quant_max = fmax_f32(
+                                                    quant_max,
+                                                    cute.arch.shuffle_sync_bfly(
                                                         quant_max,
-                                                        cute.arch.shuffle_sync_bfly(
-                                                            quant_max,
-                                                            offset=1 << quant_shift,
-                                                        ),
-                                                    )
-                                                _, quant_scale_byte = pow2_ceil_ue8m0(
-                                                    quant_max
-                                                    * cutlass.Float32(
-                                                        1.0 / FLOAT8_E4M3_MAX
-                                                    )
+                                                        offset=1 << quant_shift,
+                                                    ),
                                                 )
-                                                if quant_max == cutlass.Float32(0.0):
-                                                    quant_scale_byte = cutlass.Uint32(
-                                                        127
-                                                    )
-                                                quant_inv_scale = ue8m0_to_output_scale(
-                                                    quant_scale_byte
+                                            _, quant_scale_byte = pow2_ceil_ue8m0(
+                                                quant_max
+                                                * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
+                                            )
+                                            if quant_max == cutlass.Float32(0.0):
+                                                quant_scale_byte = cutlass.Uint32(127)
+                                            quant_inv_scale = ue8m0_to_output_scale(
+                                                quant_scale_byte
+                                            )
+                                            quant_payload_lo = cvt_f32x4_to_e4m3x4(
+                                                quant_v0 * quant_inv_scale,
+                                                quant_v1 * quant_inv_scale,
+                                                quant_v2 * quant_inv_scale,
+                                                quant_v3 * quant_inv_scale,
+                                            )
+                                            quant_payload_hi = cvt_f32x4_to_e4m3x4(
+                                                quant_v4 * quant_inv_scale,
+                                                quant_v5 * quant_inv_scale,
+                                                quant_v6 * quant_inv_scale,
+                                                quant_v7 * quant_inv_scale,
+                                            )
+                                            quant_payload = (
+                                                Uint64(quant_payload_hi) << Uint64(32)
+                                            ) | Uint64(quant_payload_lo)
+                                            quant_global_chunk = (
+                                                tile_coord_mnl[2]
+                                                * Int32(directC_mnl.shape[1] // 32)
+                                                + tile_coord_mnl[1]
+                                                * Int32(self.tile_shape_mnk[1] // 32)
+                                                + Int32(epi_n * quant_chunks_per_epi)
+                                                + quant_chunk
+                                            )
+                                            quant_global_col = (
+                                                quant_global_chunk * Int32(32)
+                                                + quant_lane * Int32(8)
+                                            )
+                                            if quant_valid:
+                                                st_global_u64(
+                                                    get_ptr_as_int64(
+                                                        quantC_values,
+                                                        Int64(quant_global_row)
+                                                        * Int64(quantC_values.shape[1])
+                                                        + Int64(quant_global_col),
+                                                    ),
+                                                    quant_payload,
                                                 )
-                                                quant_payload_lo = cvt_f32x4_to_e4m3x4(
-                                                    quant_v0 * quant_inv_scale,
-                                                    quant_v1 * quant_inv_scale,
-                                                    quant_v2 * quant_inv_scale,
-                                                    quant_v3 * quant_inv_scale,
-                                                )
-                                                quant_payload_hi = cvt_f32x4_to_e4m3x4(
-                                                    quant_v4 * quant_inv_scale,
-                                                    quant_v5 * quant_inv_scale,
-                                                    quant_v6 * quant_inv_scale,
-                                                    quant_v7 * quant_inv_scale,
-                                                )
-                                                quant_payload = (
-                                                    Uint64(quant_payload_hi)
-                                                    << Uint64(32)
-                                                ) | Uint64(quant_payload_lo)
-                                                quant_global_chunk = (
-                                                    tile_coord_mnl[2]
-                                                    * Int32(directC_mnl.shape[1] // 32)
-                                                    + tile_coord_mnl[1]
-                                                    * Int32(
-                                                        self.tile_shape_mnk[1] // 32
-                                                    )
-                                                    + Int32(
-                                                        epi_n * quant_chunks_per_epi
-                                                    )
-                                                    + quant_chunk
-                                                )
-                                                quant_global_col = (
-                                                    quant_global_chunk * Int32(32)
-                                                    + quant_lane * Int32(8)
-                                                )
-                                                if quant_row_valid:
-                                                    st_global_u64(
-                                                        get_ptr_as_int64(
-                                                            quantC_values,
-                                                            quant_row
-                                                            * Int32(
-                                                                quantC_values.shape[1]
-                                                            )
-                                                            + quant_global_col,
-                                                        ),
-                                                        quant_payload,
-                                                    )
-                                                    if quant_lane == Int32(0):
-                                                        quant_scale = cutlass.Uint8(
-                                                            quant_scale_byte
-                                                        ).bitcast(cutlass.Float8E8M0FNU)
-                                                        quantC_scale_rows[
+                                                if quant_lane == Int32(0):
+                                                    quant_scale = cutlass.Uint8(
+                                                        quant_scale_byte
+                                                    ).bitcast(cutlass.Float8E8M0FNU)
+                                                    quantC_scale_rows[
+                                                        (
+                                                            quant_global_row,
+                                                            quant_global_chunk,
+                                                        )
+                                                    ] = quant_scale
+                                                    quantC_scale_mma[
+                                                        (
+                                                            quant_global_row
+                                                            % Int32(32),
                                                             (
-                                                                quant_row,
-                                                                quant_global_chunk,
+                                                                quant_global_row
+                                                                // Int32(32)
                                                             )
-                                                        ] = quant_scale
-                                                        quantC_scale_mma[
-                                                            (
-                                                                quant_row,
-                                                                Int32(0),
-                                                                Int32(0),
-                                                                quant_global_chunk
-                                                                % Int32(4),
-                                                                quant_global_chunk
-                                                                // Int32(4),
-                                                                Int32(0),
-                                                            )
-                                                        ] = quant_scale
-
-                                    # Only synchronize before a persistent CTA
-                                    # reuses sC for another work tile. Kernel
-                                    # completion orders terminal-tile stores.
-                                    if cutlass.const_expr(
-                                        self.single_work_tile_per_cta
-                                    ):
-                                        work_tile = WorkTileInfo(
-                                            work_tile.tile_idx,
-                                            cutlass.Boolean(0),
-                                        )
-                                    else:
-                                        tile_sched.advance_to_next_work()
-                                        work_tile = tile_sched.get_current_work()
-                                    if work_tile.is_valid_tile:
-                                        self.epilog_sync_barrier.arrive_and_wait()
+                                                            % Int32(4),
+                                                            quant_global_row
+                                                            // Int32(128),
+                                                            quant_global_chunk
+                                                            % Int32(4),
+                                                            quant_global_chunk
+                                                            // Int32(4),
+                                                            Int32(0),
+                                                        )
+                                                    ] = quant_scale
 
                                 # Copy from shared memory to global memory
                                 if cutlass.const_expr(
@@ -3237,17 +3623,16 @@ class DenseGemmKernel:
                                             tma_store_pipeline.producer_acquire()
 
                     # Advance to the next work tile
-                    if cutlass.const_expr(not self.quantize_c):
-                        if cutlass.const_expr(self.single_work_tile_per_cta):
-                            work_tile = WorkTileInfo(
-                                work_tile.tile_idx,
-                                cutlass.Boolean(0),
-                            )
-                        else:
-                            tile_sched.advance_to_next_work()
-                            work_tile = tile_sched.get_current_work()
+                    if cutlass.const_expr(self.single_work_tile_per_cta):
+                        work_tile = WorkTileInfo(
+                            work_tile.tile_idx,
+                            cutlass.Boolean(0),
+                        )
+                    else:
+                        tile_sched.advance_to_next_work()
+                        work_tile = tile_sched.get_current_work()
                     if has_multi_epi_store and cutlass.const_expr(
-                        self.split_k_slices == 1
+                        self.split_k_slices == 1 and not self.quantize_c
                     ):
                         tma_store_pipeline.producer_tail()
 
@@ -4265,21 +4650,28 @@ class DenseGemmKernel:
                         )
                     elif cutlass.const_expr(self.manual_bk64_sf):
                         lane = Int32(tidx % self.num_threads_per_warp)
-                        sf_k_tiles = Int32(k_tile_cnt // 2)
+                        sf_k_tiles = (Int32(k_tile_cnt) + Int32(1)) // Int32(2)
                         sf_k_tile = k_tile_global // Int32(2)
                         sf_k_half = k_tile_global - sf_k_tile * Int32(2)
-                        sfa_tile = tile_coord_mnl[0]
+                        if cutlass.const_expr(self.sfa_tiles_per_block > 1):
+                            sfa_tile = tile_coord_mnl[0] // Int32(
+                                self.sfa_tiles_per_block
+                            )
+                            problem_m_tiles = Int32(
+                                tile_sched_params.problem_shape_ntile_mnl[0]
+                            )
+                            sfa_scale_m_tiles = (
+                                problem_m_tiles + Int32(self.sfa_tiles_per_block - 1)
+                            ) // Int32(self.sfa_tiles_per_block)
+                            sfa_l_stride = sfa_scale_m_tiles * sf_k_tiles * Int32(512)
+                        else:
+                            sfa_tile = tile_coord_mnl[0]
+                            sfa_l_stride = (
+                                Int32(tile_sched_params.problem_shape_ntile_mnl[0])
+                                * sf_k_tiles
+                                * Int32(512)
+                            )
                         sfb_tile = tile_coord_mnl[1] // Int32(self.sfb_tiles_per_block)
-                        # directSFA/directSFB retain the physical packed-scale
-                        # storage order [L, MN-tile, K128-tile, 32, 4, 4].
-                        # The original BK64 address arithmetic covered only
-                        # L=1; without these strides every later grouped GEMM
-                        # batch silently consumed batch 0's scales.
-                        sfa_l_stride = (
-                            Int32(tile_sched_params.problem_shape_ntile_mnl[0])
-                            * sf_k_tiles
-                            * Int32(512)
-                        )
                         problem_n_tiles = Int32(
                             tile_sched_params.problem_shape_ntile_mnl[1]
                         )
@@ -5017,11 +5409,13 @@ class DenseGemmKernel:
         # A must be K-major, B must be K-major
         if a_major != "k" or b_major != "k":
             return False
-        # Alignment: K must be divisible by tile_k
+        # Alignment: K must be divisible by tile_k (unswapped MXFP8 supports BK64)
         if block_fp8:
             tile_k = 128
-        elif ab_dtype == cutlass.Float8E4M3FN or is_mxfp6_ab_dtype(ab_dtype):
-            tile_k = mxfp6_tile_k() if is_mxfp6_ab_dtype(ab_dtype) else 128
+        elif ab_dtype == cutlass.Float8E4M3FN:
+            tile_k = 64 if not swap_ab else 128
+        elif is_mxfp6_ab_dtype(ab_dtype):
+            tile_k = mxfp6_tile_k()
         else:
             tile_k = sf_vec_size * 8
         return k % tile_k == 0
