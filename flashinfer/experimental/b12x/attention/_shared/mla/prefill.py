@@ -309,10 +309,11 @@ def run_unified_prefill(
         from .prefill_mg import run_unified_prefill_mg
 
         partitions = _mg_head_partitions(heads, hpb)
-        if model_type == ModelType.DSV41:
-            # DSV4.1's 544-byte records permit one 16-head group per CTA.
-            # One launch covers the full 16-aligned prefix; only an 8-head
-            # remainder needs a separate valid-HPB launch.
+        if model_type == ModelType.DSV41 and traits.fp8_internal:
+            # DSV4.1 FP8-PV requires 544-byte in-place normalization plus
+            # sidecar scale/ratio buffers (99.7 KiB at mg_n_hg=1), permitting
+            # one 16-head group per CTA. BF16 mode uses the 80.5 KiB hybrid
+            # SWA/NVFP4 staging layout and supports mg_n_hg=2 (32 heads/CTA).
             prefix_heads = heads - heads % hpb
             partitions = ((1, prefix_heads, 0),) if prefix_heads else ()
             if prefix_heads != heads:

@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64, Uint32, Uint64
+from cutlass import Int32, Int64, Uint32
 
 from b12x._lib.intrinsics.memory import (
-    cp_async_bulk_g2s_mbar_l2hint,
+    cp_async_bulk_g2s_mbar,
     get_ptr_as_int64,
     ld_global_nc_v2_u32,
     shared_ptr_to_u32,
@@ -55,7 +55,6 @@ def io_issue_gather_dsv4_nope(
     page_block_size: Int32,
     stride_kv_block: Int64,
     io_lane: Int32,
-    cache_policy: Uint64,
     *,
     bi: cutlass.Constexpr,
     kv_smem_stride: cutlass.Constexpr,
@@ -79,7 +78,6 @@ def io_issue_gather_dsv4_nope(
             page_block_size,
             stride_kv_block,
             io_lane,
-            cache_policy,
             bi=bi,
             kv_smem_stride=kv_smem_stride,
             io_threads=io_threads,
@@ -142,12 +140,11 @@ def io_issue_gather_dsv4_nope(
             block_idx = idx // page_block_size
             local_idx = idx - block_idx * page_block_size
             data_base_off = Int64(block_idx) * stride_kv_block + Int64(local_idx) * _ios
-            cp_async_bulk_g2s_mbar_l2hint(
+            cp_async_bulk_g2s_mbar(
                 kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
                 get_ptr_as_int64(kv_cache_u8, data_base_off),
                 _nope,
                 full_mbar_u32,
-                cache_policy,
             )
         eo += Int32(io_threads)
 
@@ -163,7 +160,6 @@ def io_issue_gather_glm_mg(
     page_block_size: Int32,
     stride_kv_block: Int64,
     io_lane: Int32,
-    cache_policy: Uint64,
     *,
     bi: cutlass.Constexpr,
     kv_smem_stride: cutlass.Constexpr,  # 528 GLM / 288 NVFP4 (smem nope row stride)
@@ -194,6 +190,7 @@ def io_issue_gather_glm_mg(
     if cutlass.const_expr(dsv41):
         _ios = Int64(528 if dsv41_swa else 288)
         _nope = Int32(528 if dsv41_swa else 288)
+        _tag_off = Int32(528 if (dsv41_swa or kv_smem_stride >= 544) else 288)
         eo = Int32(0)
         for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
             entry = eo + io_lane
@@ -205,7 +202,7 @@ def io_issue_gather_glm_mg(
                 if idx_raw >= Int32(0):
                     source_tag = Uint32(1 if dsv41_swa else 0)
                 st_shared_u32(
-                    kv_fp8_dst_addr + entry * Int32(kv_smem_stride) + Int32(528),
+                    kv_fp8_dst_addr + entry * Int32(kv_smem_stride) + _tag_off,
                     source_tag,
                 )
                 if cutlass.const_expr(dsv41_fp8):
@@ -223,6 +220,7 @@ def io_issue_gather_glm_mg(
                         idx_raw >= Int32(0),
                         swa=dsv41_swa,
                     )
+            eo += Int32(io_threads)
         cute.arch.fence_acq_rel_cta()
     elif cutlass.const_expr(scale_format == 2):
         if cutlass.const_expr(fp8_rope):
@@ -285,11 +283,10 @@ def io_issue_gather_glm_mg(
             local_idx = idx - block_idx * page_block_size
             data_base_off = Int64(block_idx) * stride_kv_block + Int64(local_idx) * _ios
             # NoPE + inline fp32 scales (528B) -> kv_fp8 row.
-            cp_async_bulk_g2s_mbar_l2hint(
+            cp_async_bulk_g2s_mbar(
                 kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
                 get_ptr_as_int64(kv_cache_u8, data_base_off),
                 _nope,
                 full_mbar_u32,
-                cache_policy,
             )
         eo += Int32(io_threads)
