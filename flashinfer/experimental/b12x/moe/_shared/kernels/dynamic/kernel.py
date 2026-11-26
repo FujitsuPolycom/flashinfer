@@ -211,7 +211,9 @@ class MoEDynamicKernelBackend:
         self.csf_down_reader = None
         if self.csf_inline_scales and quant_recipe not in {"nvfp4", "w4a8_mx"}:
             raise ValueError("Inline CSF requires native FP4 weights")
-        if self.csf_inline_scales and mma_tiler_mn[0] not in {16, 32}:
+        if self.csf_inline_scales and mma_tiler_mn[0] not in {16, 32} and not (
+            w4a8_n64_repacked and mma_tiler_mn[0] in {64, 128}
+        ):
             raise ValueError("Inline FP4 scales require M16 or M32 operand staging")
         if self.nvfp4_csf_inline and (
             quant_recipe != "nvfp4"
@@ -585,14 +587,14 @@ class MoEDynamicKernelBackend:
         if self.external_route_plan and not (
             (
                 quant_recipe == "nvfp4"
-                or (quant_recipe == "w4a8_mx" and self.w4a8_n64_repacked)
+                or (quant_recipe == "w4a8_mx" and (self.w4a8_n64_repacked or prequantized_input))
             )
             and not self.direct_routing
             and work_source
             in {_WORK_SOURCE_MATERIALIZED_QUEUE, _WORK_SOURCE_PERSISTENT_GRID}
         ):
             raise ValueError(
-                "external route planning requires grouped NVFP4 or compact W4A8 with the "
+                "external route planning requires grouped NVFP4 or compact/prequantized W4A8 with the "
                 "materialized or persistent work source"
             )
         if self.is_w4a8 and swap_ab:
@@ -608,6 +610,13 @@ class MoEDynamicKernelBackend:
         self.dynamic_down_scale = dynamic_down_scale
         self.share_input_across_experts = share_input_across_experts
         self.prequantized_input = bool(prequantized_input)
+        self.external_full_route_plan = bool(
+            self.external_route_plan
+            and self.prequantized_input
+            and self.w4a8_split_materialized
+            and not self.direct_routing
+            and not self.w4a8_trellis
+        )
         if self.prequantized_input and not (
             self.is_w4a8
             and self.w4a8_repacked
@@ -2059,129 +2068,132 @@ class MoEDynamicKernelBackend:
                 self.materialized_phase2_kernel.csf_inline = True
                 self.materialized_phase2_kernel.csf_reader = self.csf_down_reader
 
-        sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            packed_a.shape, self.sf_vec_size
-        )
-        sfa_tensor = cute.make_tensor(sfa_ptr, sfa_layout)
+        if cutlass.const_expr(not self.external_full_route_plan):
+            sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
+                packed_a.shape, self.sf_vec_size
+            )
+            sfa_tensor = cute.make_tensor(sfa_ptr, sfa_layout)
 
-        # Single SF tensor for FC1 weights. Gated activation packs [up, gate]
-        # along the N dimension; relu2 uses a single FC1 pass.
-        # With packed FP6 B the gmem K extent is 3K/4 bytes, but scale-factor
-        # geometry follows the LOGICAL K (one UE8M0 per 32 codes).
-        if cutlass.const_expr(self.is_w6a8):
-            b_w13_sf_shape = (
-                cute.size(b_w13.shape[0]),
-                cute.size(b_w13.shape[1]) * 4 // 3,
-                cute.size(b_w13.shape[2]),
-            )
-        else:
-            b_w13_sf_shape = b_w13.shape
-        sfb_w13_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            b_w13_sf_shape, self.sf_vec_size
-        )
-        sfb_w13_tensor = cute.make_tensor(sfb_w13_ptr, sfb_w13_layout)
-        if cutlass.const_expr(self.separate_w13_halves):
-            sfb_w13_gate_layout = blockscaled_utils.tile_atom_to_shape_SF(
-                b_w13_gate.shape, self.sf_vec_size
-            )
-            sfb_w13_gate_tensor = cute.make_tensor(
-                sfb_w13_gate_ptr,
-                sfb_w13_gate_layout,
-            )
-        else:
-            sfb_w13_gate_tensor = sfb_w13_tensor
-        # TMA descriptors
-        tma_a, gA = self._dense_cls._make_tma_atoms_and_tensors(
-            packed_a,
-            self.a_smem_layout_staged,
-            self.sa_tile_shape_mk,
-            1,
-        )
-        tma_sfa, gSFA = self._dense_cls._make_tma_atoms_and_tensors(
-            sfa_tensor,
-            self.sfa_smem_layout_staged,
-            self.sfa_tile_shape_mk,
-            1,
-            internal_type=cutlass.Int16,
-        )
-        # Single TMA descriptor over FC1 weights. Gated activation packs
-        # [up, gate] across N; relu2 uses a single FC1 slice.
-        if cutlass.const_expr(self.is_w6a8):
-            # TMA loads the packed tile (tile_n, 3*tile_k/4 bytes) into the
-            # plain staging layout; the swizzled sB is filled in-kernel.
-            tma_b_w13, gB_w13 = self._dense_cls._make_tma_atoms_and_tensors(
-                b_w13,
-                self.b_packed_smem_layout_staged,
-                (self.tile_shape_mnk[1], self.tile_shape_mnk[2] * 3 // 4),
-                1,
-            )
-        else:
-            tma_b_w13, gB_w13 = self._dense_cls._make_tma_atoms_and_tensors(
-                b_w13,
-                self.b_smem_layout_staged,
-                (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
-                1,
-            )
-        tma_sfb_w13, gSFB_w13 = self._dense_cls._make_tma_atoms_and_tensors(
-            sfb_w13_tensor,
-            self.sfb_smem_layout_staged,
-            self.sfb_tile_shape_nk,
-            1,
-            internal_type=cutlass.Int16,
-        )
-        if cutlass.const_expr(self.separate_w13_halves):
-            tma_b_w13_gate, gB_w13_gate = self._dense_cls._make_tma_atoms_and_tensors(
-                b_w13_gate,
-                self.b_smem_layout_staged,
-                (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
-                1,
-            )
-            tma_sfb_w13_gate, gSFB_w13_gate = (
-                self._dense_cls._make_tma_atoms_and_tensors(
-                    sfb_w13_gate_tensor,
-                    self.sfb_smem_layout_staged,
-                    self.sfb_tile_shape_nk,
-                    1,
-                    internal_type=cutlass.Int16,
+            # Single SF tensor for FC1 weights. Gated activation packs [up, gate]
+            # along the N dimension; relu2 uses a single FC1 pass.
+            # With packed FP6 B the gmem K extent is 3K/4 bytes, but scale-factor
+            # geometry follows the LOGICAL K (one UE8M0 per 32 codes).
+            if cutlass.const_expr(self.is_w6a8):
+                b_w13_sf_shape = (
+                    cute.size(b_w13.shape[0]),
+                    cute.size(b_w13.shape[1]) * 4 // 3,
+                    cute.size(b_w13.shape[2]),
                 )
+            else:
+                b_w13_sf_shape = b_w13.shape
+            sfb_w13_layout = blockscaled_utils.tile_atom_to_shape_SF(
+                b_w13_sf_shape, self.sf_vec_size
             )
-        else:
-            tma_b_w13_gate, gB_w13_gate = tma_b_w13, gB_w13
-            tma_sfb_w13_gate, gSFB_w13_gate = tma_sfb_w13, gSFB_w13
-        # B_down TMA
-        if cutlass.const_expr(self.is_w6a8):
-            b_down_sf_shape = (
-                cute.size(b_down.shape[0]),
-                cute.size(b_down.shape[1]) * 4 // 3,
-                cute.size(b_down.shape[2]),
-            )
-        else:
-            b_down_sf_shape = b_down.shape
-        sfb_down_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            b_down_sf_shape, self.sf_vec_size
-        )
-        sfb_down_tensor = cute.make_tensor(sfb_down_ptr, sfb_down_layout)
-        if cutlass.const_expr(self.is_w6a8):
-            tma_b_down, gB_down = self._dense_cls._make_tma_atoms_and_tensors(
-                b_down,
-                self.b_packed_smem_layout_staged,
-                (self.tile_shape_mnk[1], self.tile_shape_mnk[2] * 3 // 4),
+            sfb_w13_tensor = cute.make_tensor(sfb_w13_ptr, sfb_w13_layout)
+            if cutlass.const_expr(self.separate_w13_halves):
+                sfb_w13_gate_layout = blockscaled_utils.tile_atom_to_shape_SF(
+                    b_w13_gate.shape, self.sf_vec_size
+                )
+                sfb_w13_gate_tensor = cute.make_tensor(
+                    sfb_w13_gate_ptr,
+                    sfb_w13_gate_layout,
+                )
+            else:
+                sfb_w13_gate_tensor = sfb_w13_tensor
+            # TMA descriptors
+            tma_a, gA = self._dense_cls._make_tma_atoms_and_tensors(
+                packed_a,
+                self.a_smem_layout_staged,
+                self.sa_tile_shape_mk,
                 1,
             )
-        else:
-            tma_b_down, gB_down = self._dense_cls._make_tma_atoms_and_tensors(
-                b_down,
-                self.b_smem_layout_staged,
-                (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
+            tma_sfa, gSFA = self._dense_cls._make_tma_atoms_and_tensors(
+                sfa_tensor,
+                self.sfa_smem_layout_staged,
+                self.sfa_tile_shape_mk,
                 1,
+                internal_type=cutlass.Int16,
             )
-        tma_sfb_down, gSFB_down = self._dense_cls._make_tma_atoms_and_tensors(
-            sfb_down_tensor,
-            self.sfb_smem_layout_staged,
-            self.sfb_tile_shape_nk,
-            1,
-            internal_type=cutlass.Int16,
-        )
+            # Single TMA descriptor over FC1 weights. Gated activation packs
+            # [up, gate] across N; relu2 uses a single FC1 slice.
+            if cutlass.const_expr(self.is_w6a8):
+                # TMA loads the packed tile (tile_n, 3*tile_k/4 bytes) into the
+                # plain staging layout; the swizzled sB is filled in-kernel.
+                tma_b_w13, gB_w13 = self._dense_cls._make_tma_atoms_and_tensors(
+                    b_w13,
+                    self.b_packed_smem_layout_staged,
+                    (self.tile_shape_mnk[1], self.tile_shape_mnk[2] * 3 // 4),
+                    1,
+                )
+            else:
+                tma_b_w13, gB_w13 = self._dense_cls._make_tma_atoms_and_tensors(
+                    b_w13,
+                    self.b_smem_layout_staged,
+                    (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
+                    1,
+                )
+            tma_sfb_w13, gSFB_w13 = self._dense_cls._make_tma_atoms_and_tensors(
+                sfb_w13_tensor,
+                self.sfb_smem_layout_staged,
+                self.sfb_tile_shape_nk,
+                1,
+                internal_type=cutlass.Int16,
+            )
+            if cutlass.const_expr(self.separate_w13_halves):
+                tma_b_w13_gate, gB_w13_gate = (
+                    self._dense_cls._make_tma_atoms_and_tensors(
+                        b_w13_gate,
+                        self.b_smem_layout_staged,
+                        (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
+                        1,
+                    )
+                )
+                tma_sfb_w13_gate, gSFB_w13_gate = (
+                    self._dense_cls._make_tma_atoms_and_tensors(
+                        sfb_w13_gate_tensor,
+                        self.sfb_smem_layout_staged,
+                        self.sfb_tile_shape_nk,
+                        1,
+                        internal_type=cutlass.Int16,
+                    )
+                )
+            else:
+                tma_b_w13_gate, gB_w13_gate = tma_b_w13, gB_w13
+                tma_sfb_w13_gate, gSFB_w13_gate = tma_sfb_w13, gSFB_w13
+            # B_down TMA
+            if cutlass.const_expr(self.is_w6a8):
+                b_down_sf_shape = (
+                    cute.size(b_down.shape[0]),
+                    cute.size(b_down.shape[1]) * 4 // 3,
+                    cute.size(b_down.shape[2]),
+                )
+            else:
+                b_down_sf_shape = b_down.shape
+            sfb_down_layout = blockscaled_utils.tile_atom_to_shape_SF(
+                b_down_sf_shape, self.sf_vec_size
+            )
+            sfb_down_tensor = cute.make_tensor(sfb_down_ptr, sfb_down_layout)
+            if cutlass.const_expr(self.is_w6a8):
+                tma_b_down, gB_down = self._dense_cls._make_tma_atoms_and_tensors(
+                    b_down,
+                    self.b_packed_smem_layout_staged,
+                    (self.tile_shape_mnk[1], self.tile_shape_mnk[2] * 3 // 4),
+                    1,
+                )
+            else:
+                tma_b_down, gB_down = self._dense_cls._make_tma_atoms_and_tensors(
+                    b_down,
+                    self.b_smem_layout_staged,
+                    (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
+                    1,
+                )
+            tma_sfb_down, gSFB_down = self._dense_cls._make_tma_atoms_and_tensors(
+                sfb_down_tensor,
+                self.sfb_smem_layout_staged,
+                self.sfb_tile_shape_nk,
+                1,
+                internal_type=cutlass.Int16,
+            )
 
         if cutlass.const_expr(self.separate_w13_halves):
             n_int = Int32(b_w13.shape[0])
@@ -2257,115 +2269,116 @@ class MoEDynamicKernelBackend:
                 and down_rp is not None
                 and down_sfb_rp is not None
             ), "repacked w4a8_mx requires all four prepared weight tensors"
-        # Raw u32 views over the packed-FP4 weight bytes for the w4a8 direct
-        # global-load path (the TMA-derived gB tensors are coordinate tensors
-        # and not byte-addressable).
-        b_w13_u32 = cute.recast_tensor(b_w13, cutlass.Uint32)
-        b_down_u32 = cute.recast_tensor(b_down, cutlass.Uint32)
-        frontend_clusters = max_active_clusters
-        if cutlass.const_expr(self.external_materialized_fc1):
-            # Reserve 8 SMs for concurrent streams (e.g., prefill DMA wait_flag)
-            # so a full-device resident-grid frontend cannot deadlock them, while
-            # preserving a positive grid for small explicit cluster caps (<= 8).
-            if max_active_clusters > Int32(8):
-                frontend_clusters = max_active_clusters - Int32(8)
-        grid = (*self.cluster_shape_mn, frontend_clusters)
-        self.kernel(
-            a_input,
-            topk_ids,
-            topk_weights,
-            packed_a_storage,
-            scale_storage,
-            intermediate_u32,
-            barrier_count,
-            barrier_epoch,
-            pair_head,
-            producers_done_count,
-            all_work_published,
-            task_head,
-            task_tail,
-            task_ready,
-            task_expert,
-            task_m_tile,
-            task_slice_begin,
-            task_slice_count,
-            task_valid_rows,
-            tile_write_count,
-            tma_a,
-            gA,
-            tma_sfa,
-            gSFA,
-            tma_b_w13,
-            gB_w13,
-            tma_sfb_w13,
-            gSFB_w13,
-            tma_b_w13_gate,
-            gB_w13_gate,
-            tma_sfb_w13_gate,
-            gSFB_w13_gate,
-            tma_b_down,
-            gB_down,
-            tma_sfb_down,
-            gSFB_down,
-            self.tiled_mma,
-            self.mma_atom,
-            self.cta_layout_mnk,
-            self.a_smem_layout_staged,
-            self.b_smem_layout_staged,
-            self.sfa_smem_layout_staged,
-            self.sfb_smem_layout_staged,
-            self.epi_smem_layout_staged,
-            # Packed FP6 B staging layout (placeholder when not w6a8_mx; only
-            # traced under the const_expr is_w6a8 branches).
-            self.b_packed_smem_layout_staged
-            if self.is_w6a8
-            else self.sfa_smem_layout_staged,
-            # swap_ab FC1 objects (placeholders when off; only used under the
-            # const_expr swap branch). cute requires region-local values, so the
-            # fc1 tiled_mma + SF layouts are passed as params, not via self.
-            self.fc1_tiled_mma if self.swap_ab else self.tiled_mma,
-            self.fc1_sfa_smem_layout_staged
-            if self.swap_ab
-            else self.sfa_smem_layout_staged,
-            self.fc1_sfb_smem_layout_staged
-            if self.swap_ab
-            else self.sfb_smem_layout_staged,
-            launch_params,
-            expert_write_rows,
-            expert_tile_base,
-            input_global_scale,
-            alpha,
-            down_alpha,
-            global_scale,
-            scatter_output,
-            token_map,
-            token_weights,
-            sfb_w13_mx,
-            sfb_down_mx,
-            w13_residual,
-            down_residual,
-            b_w13_u32,
-            b_down_u32,
-            w13_rp,
-            w13_sfb_rp,
-            down_rp,
-            down_sfb_rp,
-            trellis_lut,
-            trellis_rotations,
-            sfb_w13_ptr,
-            sfb_down_ptr,
-        ).launch(
-            grid=grid,
-            block=[self.threads_per_cta, 1, 1],
-            cluster=[1, 1, 1],
-            # The phase boundaries below use a software grid barrier.  A
-            # regular launch can admit only part of the grid while auxiliary
-            # stream work occupies the remaining SMs, leaving resident CTAs
-            # spinning and the unscheduled CTAs unable to arrive.  Cooperative
-            # launch makes the all-CTA residency contract explicit.
-            cooperative=True,
-            stream=stream,
-        )
+        if cutlass.const_expr(not self.external_full_route_plan):
+            # Raw u32 views over the packed-FP4 weight bytes for the w4a8 direct
+            # global-load path (the TMA-derived gB tensors are coordinate tensors
+            # and not byte-addressable).
+            b_w13_u32 = cute.recast_tensor(b_w13, cutlass.Uint32)
+            b_down_u32 = cute.recast_tensor(b_down, cutlass.Uint32)
+            frontend_clusters = max_active_clusters
+            if cutlass.const_expr(self.external_materialized_fc1):
+                # Reserve 8 SMs for concurrent streams (e.g., prefill DMA wait_flag)
+                # so a full-device resident-grid frontend cannot deadlock them, while
+                # preserving a positive grid for small explicit cluster caps (<= 8).
+                if max_active_clusters > Int32(8):
+                    frontend_clusters = max_active_clusters - Int32(8)
+            grid = (*self.cluster_shape_mn, frontend_clusters)
+            self.kernel(
+                a_input,
+                topk_ids,
+                topk_weights,
+                packed_a_storage,
+                scale_storage,
+                intermediate_u32,
+                barrier_count,
+                barrier_epoch,
+                pair_head,
+                producers_done_count,
+                all_work_published,
+                task_head,
+                task_tail,
+                task_ready,
+                task_expert,
+                task_m_tile,
+                task_slice_begin,
+                task_slice_count,
+                task_valid_rows,
+                tile_write_count,
+                tma_a,
+                gA,
+                tma_sfa,
+                gSFA,
+                tma_b_w13,
+                gB_w13,
+                tma_sfb_w13,
+                gSFB_w13,
+                tma_b_w13_gate,
+                gB_w13_gate,
+                tma_sfb_w13_gate,
+                gSFB_w13_gate,
+                tma_b_down,
+                gB_down,
+                tma_sfb_down,
+                gSFB_down,
+                self.tiled_mma,
+                self.mma_atom,
+                self.cta_layout_mnk,
+                self.a_smem_layout_staged,
+                self.b_smem_layout_staged,
+                self.sfa_smem_layout_staged,
+                self.sfb_smem_layout_staged,
+                self.epi_smem_layout_staged,
+                # Packed FP6 B staging layout (placeholder when not w6a8_mx; only
+                # traced under the const_expr is_w6a8 branches).
+                self.b_packed_smem_layout_staged
+                if self.is_w6a8
+                else self.sfa_smem_layout_staged,
+                # swap_ab FC1 objects (placeholders when off; only used under the
+                # const_expr swap branch). cute requires region-local values, so the
+                # fc1 tiled_mma + SF layouts are passed as params, not via self.
+                self.fc1_tiled_mma if self.swap_ab else self.tiled_mma,
+                self.fc1_sfa_smem_layout_staged
+                if self.swap_ab
+                else self.sfa_smem_layout_staged,
+                self.fc1_sfb_smem_layout_staged
+                if self.swap_ab
+                else self.sfb_smem_layout_staged,
+                launch_params,
+                expert_write_rows,
+                expert_tile_base,
+                input_global_scale,
+                alpha,
+                down_alpha,
+                global_scale,
+                scatter_output,
+                token_map,
+                token_weights,
+                sfb_w13_mx,
+                sfb_down_mx,
+                w13_residual,
+                down_residual,
+                b_w13_u32,
+                b_down_u32,
+                w13_rp,
+                w13_sfb_rp,
+                down_rp,
+                down_sfb_rp,
+                trellis_lut,
+                trellis_rotations,
+                sfb_w13_ptr,
+                sfb_down_ptr,
+            ).launch(
+                grid=grid,
+                block=[self.threads_per_cta, 1, 1],
+                cluster=[1, 1, 1],
+                # The phase boundaries below use a software grid barrier.  A
+                # regular launch can admit only part of the grid while auxiliary
+                # stream work occupies the remaining SMs, leaving resident CTAs
+                # spinning and the unscheduled CTAs unable to arrive.  Cooperative
+                # launch makes the all-CTA residency contract explicit.
+                cooperative=True,
+                stream=stream,
+            )
         # External split-materialized launch (same @cute.jit call, same
         # stream as the cooperative front-end above, so CUDA-graph capture
         # covers every kernel with no host reads and no replay-time

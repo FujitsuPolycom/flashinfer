@@ -96,7 +96,9 @@ class CsfInlineReader:
         return word
 
     @cute.jit
-    def expand_warp_rows(self, storage, slot, rows, warp, lane):
+    def expand_warp_rows(
+        self, storage, slot, rows, warp, lane, value_offset=None
+    ):
         """Rebuild one warp's 32 rows of a staged row-major slot into ``rows``.
 
         Each lane reconstructs one row's scale word from the staged codes and bases;
@@ -113,35 +115,46 @@ class CsfInlineReader:
             Int32(self.plane.storage.rows)
             - source_group // Int32(self.plane.storage.column_groups) * Int32(128),
         )
-        nc = cutlass.min(
-            Int32(4),
-            Int32(self.plane.columns)
-            - source_group % Int32(self.plane.storage.column_groups) * Int32(4),
-        )
+        if cutlass.const_expr(self.plane.columns % 4 == 0):
+            nc = Int32(4)
+        else:
+            nc = cutlass.min(
+                Int32(4),
+                Int32(self.plane.columns)
+                - source_group % Int32(self.plane.storage.column_groups) * Int32(4),
+            )
         row = warp * Int32(32) + lane
         word = Uint32(0)
         if row < nr:
-            field = row * nc
-            shift = field % Int32(32)
-            codes = ld_shared_u32(slot + field // Int32(32) * Int32(4)) >> shift.to(
-                Uint32
-            )
-            if shift + nc > Int32(32):
-                codes |= ld_shared_u32(
-                    slot + field // Int32(32) * Int32(4) + Int32(4)
-                ) << (Int32(32) - shift).to(Uint32)
-            codes &= (Uint32(1) << nc.to(Uint32)) - Uint32(1)
-            codes = (codes | (codes << Uint32(14))) & Uint32(0x00030003)
-            codes = (codes | (codes << Uint32(7))) & Uint32(0x01010101)
             base = (
-                ld_shared_u32(slot + Int32(256) + row // Int32(4) * Int32(4))
-                >> ((row % Int32(4)) * Int32(8)).to(Uint32)
+                ld_shared_u32(slot + Int32(256) + ((row >> Int32(2)) << Int32(2)))
+                >> ((row & Int32(3)) << Int32(3)).to(Uint32)
             ) & Uint32(255)
-            word = (
-                base * (Uint32(0x01010101) >> ((Int32(4) - nc) * Int32(8)).to(Uint32))
-                + codes
-            )
-        st_shared_u32(rows + row * Int32(4), word)
+            if nc == Int32(4):
+                codes = (
+                    ld_shared_u32(slot + ((row >> Int32(3)) << Int32(2)))
+                    >> ((row & Int32(7)) << Int32(2)).to(Uint32)
+                ) & Uint32(15)
+                codes = (codes * Uint32(0x00204081)) & Uint32(0x01010101)
+                word = base * Uint32(0x01010101) + codes
+            else:
+                field = row * nc
+                shift = field & Int32(31)
+                codes = ld_shared_u32(slot + ((field >> Int32(5)) << Int32(2))) >> (
+                    shift.to(Uint32)
+                )
+                if shift + nc > Int32(32):
+                    codes |= ld_shared_u32(
+                        slot + ((field >> Int32(5)) << Int32(2)) + Int32(4)
+                    ) << (Int32(32) - shift).to(Uint32)
+                codes &= (Uint32(1) << nc.to(Uint32)) - Uint32(1)
+                codes = (codes * Uint32(0x00204081)) & Uint32(0x01010101)
+                word = (
+                    base
+                    * (Uint32(0x01010101) >> ((Int32(4) - nc) * Int32(8)).to(Uint32))
+                    + codes
+                )
+        st_shared_u32(rows + (row << Int32(2)), word)
         cute.arch.sync_warp()
         first = ld_shared_u32(slot + Int32(384))
         end = ld_shared_u32(slot + Int32(388))
@@ -149,28 +162,132 @@ class CsfInlineReader:
             p = (first & Uint32(1)).to(Int32) + lane
             position = (
                 (
-                    ld_shared_u32(slot + Int32(392) + p // Int32(2) * Int32(4))
-                    >> ((p % Int32(2)) * Int32(16)).to(Uint32)
+                    ld_shared_u32(slot + Int32(392) + ((p >> Int32(1)) << Int32(2)))
+                    >> ((p & Int32(1)) << Int32(4)).to(Uint32)
                 )
                 & Uint32(65535)
             ).to(Int32)
             v = ld_shared_u32(slot + Int32(496)).to(Int32) + lane
             value = (
-                ld_shared_u32(slot + Int32(460) + v // Int32(4) * Int32(4))
-                >> ((v % Int32(4)) * Int32(8)).to(Uint32)
+                ld_shared_u32(slot + Int32(460) + ((v >> Int32(2)) << Int32(2)))
+                >> ((v & Int32(3)) << Int32(3)).to(Uint32)
             ) & Uint32(255)
-            if position // nc // Int32(32) == warp:
+            erow = position >> Int32(2)
+            ecol = position & Int32(3)
+            if nc != Int32(4):
+                erow = position // nc
+                ecol = position % nc
+            if (erow >> Int32(5)) == warp:
                 st_shared_u8(
-                    rows + position // nc * Int32(4) + position % nc,
+                    rows + (erow << Int32(2)) + ecol,
                     value.to(cutlass.Uint8),
                 )
-        value_offset = self.plane.group_value_offset(storage)
-        entry = first + Uint32(32) + lane.to(Uint32)
-        while entry < end:
-            position, value = self.plane.load_group_record(storage, entry, value_offset)
-            if position // nc // Int32(32) == warp:
-                st_shared_u8(rows + position // nc * Int32(4) + position % nc, value)
-            entry += Uint32(32)
+        if first + Uint32(32) < end:
+            vo = (
+                value_offset
+                if cutlass.const_expr(value_offset is not None)
+                else self.plane.group_value_offset(storage)
+            )
+            entry = first + Uint32(32) + lane.to(Uint32)
+            while entry < end:
+                position, value = self.plane.load_group_record(storage, entry, vo)
+                erow = position >> Int32(2)
+                ecol = position & Int32(3)
+                if nc != Int32(4):
+                    erow = position // nc
+                    ecol = position % nc
+                if (erow >> Int32(5)) == warp:
+                    st_shared_u8(rows + (erow << Int32(2)) + ecol, value)
+                entry += Uint32(32)
+        cute.arch.sync_warp()
+
+    @cute.jit
+    def expand_warp_half_pair(
+        self,
+        storage,
+        gate_slot,
+        up_slot,
+        dst_warp_rows,
+        half_idx,
+        warp,
+        lane,
+        value_offset=None,
+    ):
+        """Rebuild one warp's 16 gate + 16 up rows for N64 without CTA sync.
+
+        Lanes 0..15 reconstruct 16 gate rows into ``dst_warp_rows[0:64]`` and
+        lanes 16..31 reconstruct 16 up rows into ``dst_warp_rows[64:128]``.
+        Requires 1-bit row-major destination=3 CSF with columns divisible by 4.
+        """
+        assert (
+            self.plane.destination == 3
+            and self.plane.storage.bits == 1
+            and self.plane.columns % 4 == 0
+        )
+        storage = cute.recast_ptr(storage, dtype=cutlass.Uint8)
+        proj = lane >> Int32(4)
+        r_local = lane & Int32(15)
+        row_start = (half_idx << Int32(6)) + (warp << Int32(4))
+        row = row_start + r_local
+        slot = gate_slot
+        if proj != Int32(0):
+            slot = up_slot
+        codes = (
+            ld_shared_u32(slot + ((row >> Int32(3)) << Int32(2)))
+            >> ((row & Int32(7)) << Int32(2)).to(Uint32)
+        ) & Uint32(15)
+        codes = (codes * Uint32(0x00204081)) & Uint32(0x01010101)
+        base = (
+            ld_shared_u32(slot + Int32(256) + ((row >> Int32(2)) << Int32(2)))
+            >> ((row & Int32(3)) << Int32(3)).to(Uint32)
+        ) & Uint32(255)
+        word = base * Uint32(0x01010101) + codes
+        st_shared_u32(dst_warp_rows + (lane << Int32(2)), word)
+        cute.arch.sync_warp()
+        for p in cutlass.range_constexpr(2):
+            pslot = gate_slot if cutlass.const_expr(p == 0) else up_slot
+            pdst = dst_warp_rows + Int32(p * 64)
+            first = ld_shared_u32(pslot + Int32(384))
+            end = ld_shared_u32(pslot + Int32(388))
+            if first + lane.to(Uint32) < end:
+                idx_p = (first & Uint32(1)).to(Int32) + lane
+                position = (
+                    (
+                        ld_shared_u32(
+                            pslot + Int32(392) + ((idx_p >> Int32(1)) << Int32(2))
+                        )
+                        >> ((idx_p & Int32(1)) << Int32(4)).to(Uint32)
+                    )
+                    & Uint32(65535)
+                ).to(Int32)
+                v = ld_shared_u32(pslot + Int32(496)).to(Int32) + lane
+                value = (
+                    ld_shared_u32(pslot + Int32(460) + ((v >> Int32(2)) << Int32(2)))
+                    >> ((v & Int32(3)) << Int32(3)).to(Uint32)
+                ) & Uint32(255)
+                erow = position >> Int32(2)
+                ecol = position & Int32(3)
+                local_r = erow - row_start
+                if local_r >= Int32(0) and local_r < Int32(16):
+                    st_shared_u8(
+                        pdst + (local_r << Int32(2)) + ecol,
+                        value.to(cutlass.Uint8),
+                    )
+            if first + Uint32(32) < end:
+                vo = (
+                    value_offset
+                    if cutlass.const_expr(value_offset is not None)
+                    else self.plane.group_value_offset(storage)
+                )
+                entry = first + Uint32(32) + lane.to(Uint32)
+                while entry < end:
+                    position, value = self.plane.load_group_record(storage, entry, vo)
+                    erow = position >> Int32(2)
+                    ecol = position & Int32(3)
+                    local_r = erow - row_start
+                    if local_r >= Int32(0) and local_r < Int32(16):
+                        st_shared_u8(pdst + (local_r << Int32(2)) + ecol, value)
+                    entry += Uint32(32)
         cute.arch.sync_warp()
 
     @cute.jit
@@ -388,19 +505,22 @@ class CsfInlineReader:
             self.plane.write_group_record(
                 source_group, target, position, replacement.to(cutlass.Uint8)
             )
-        self.plane.patch_group_records(
-            storage,
-            source_group,
-            lane,
-            target,
-            cutlass.min(first + Uint32(32), end),
-            end,
-        )
+        if first + Uint32(32) < end:
+            self.plane.patch_group_records(
+                storage,
+                source_group,
+                lane,
+                target,
+                first + Uint32(32),
+                end,
+            )
         cute.arch.sync_warp()
 
     @cute.jit
     def pad_rows(self, group, target, lane):
-        if cutlass.const_expr(self.plane.destination == 3):
+        if cutlass.const_expr(
+            self.plane.destination == 3 and self.plane.columns % 4 != 0
+        ):
             column = group % Int32(self.plane.storage.column_groups)
             nc = cutlass.min(Int32(4), Int32(self.plane.columns) - column * Int32(4))
             if nc == Int32(2):
