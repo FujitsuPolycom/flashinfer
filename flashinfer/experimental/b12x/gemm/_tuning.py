@@ -461,7 +461,7 @@ def knob_values(query):
         if fp4 and query.output_mode == "provided"
         else (None,),
         programmatic_serialization=(False, True) if ready_small_mxfp8 else (False,),
-        evict_first=(False, True) if ready_small_mxfp8 else (False,),
+        evict_first=(False,),
     )
 
 

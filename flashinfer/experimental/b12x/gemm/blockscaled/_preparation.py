@@ -211,7 +211,7 @@ def compile_packed(
                     _dequantize_mxfp8,
                 )
 
-                k = query.padded_in_features
+                k = query.in_features
                 programs["dequant"] = _dequantize_mxfp8.warmup(
                     torch.float8_e4m3fn,
                     torch.uint8,
@@ -220,6 +220,7 @@ def compile_packed(
                     K=k,
                     BLOCK_R=DEQUANT_BLOCK_R,
                     BLOCK_K=DEQUANT_BLOCK_K,
+                    W_K=query.padded_in_features,
                     grid=(
                         triton.cdiv(query.out_features, DEQUANT_BLOCK_R),
                         triton.cdiv(k, DEQUANT_BLOCK_K),
@@ -344,7 +345,7 @@ def _projection_workspace_bytes(query, config, device):
             slices * query.num_tokens * query.out_features * 4 if slices > 1 else 0
         )
         if mxfp8_a16_dequant(query, config):
-            return max(partials, query.out_features * query.padded_in_features * 2)
+            return max(partials, query.out_features * query.in_features * 2)
         return partials
     if functional_mxfp8_quantization(query, config):
         if not query.codegen["split_k_atomic"] or not query.allow_bf16_atomic_reduction:
@@ -613,7 +614,7 @@ class _PackedExecutionState:
             ):
                 from ._dequant import DEQUANT_BLOCK_K, DEQUANT_BLOCK_R
 
-                k = q.padded_in_features
+                k = q.in_features
                 weight = (
                     workspace[: q.out_features * k * 2]
                     .view(torch.bfloat16)
@@ -633,6 +634,7 @@ class _PackedExecutionState:
                     k,
                     DEQUANT_BLOCK_R,
                     DEQUANT_BLOCK_K,
+                    q.padded_in_features,
                 )
                 torch.mm(
                     source.view(m, q.in_features),

@@ -246,8 +246,11 @@ def _automatic_a16(query, device):
 
 
 def _tc_gemv_default_config(query):
+    from ._mxfp8_tc_gemv import mxfp8_tc_gemv_active_k
+
     sk = mxfp8_a16_tc_gemv_splits(query)[0]
-    chunks_per_split = (query.padded_in_features // 64) // sk
+    active_k = mxfp8_tc_gemv_active_k(query.in_features, query.padded_in_features)
+    chunks_per_split = (active_k // 64) // sk
     warps = 2 if chunks_per_split <= 4 else 4
     return BlockscaledConfig(
         mode="a16",
@@ -359,8 +362,8 @@ def mxfp8_a16_dequant(query, config):
     """Whether an A16 MXFP8 plan carries the expanded-weight lowering.
 
     It needs the caller-provided workspace (a plan-owned copy per layer would
-    duplicate the weight in BF16), an unpadded K and a BF16 weight that fits both
-    the caller's workspace limit and MXFP8_A16_DEQUANT_MAX_BYTES.
+    duplicate the weight in BF16), a 32-aligned logical K and a BF16 weight
+    that fits both the caller's workspace limit and MXFP8_A16_DEQUANT_MAX_BYTES.
     """
     limit = MXFP8_A16_DEQUANT_MAX_BYTES
     if query.workspace_nbytes is not None:
@@ -371,8 +374,8 @@ def mxfp8_a16_dequant(query, config):
         and config.a16_backend == "auto"
         and query.workspace_form == "provided"
         and query.num_tokens >= MXFP8_A16_DEQUANT_MIN_ROWS
-        and query.in_features == query.padded_in_features
-        and query.out_features * query.padded_in_features * 2 <= limit
+        and query.in_features % 32 == 0
+        and query.out_features * query.in_features * 2 <= limit
     )
 
 
@@ -409,15 +412,18 @@ def mxfp8_a16_tc_gemv_eligible(query, device):
 
 
 def mxfp8_a16_tc_gemv_splits(query, n_per_cta: int = 16):
-    from ._mxfp8_tc_gemv import mxfp8_tc_gemv_workspace_bytes
+    from ._mxfp8_tc_gemv import (
+        mxfp8_tc_gemv_active_k,
+        mxfp8_tc_gemv_workspace_bytes,
+    )
 
     n_per_cta = int(n_per_cta)
     n_blocks = (query.out_features + n_per_cta - 1) // n_per_cta
-    chunks = query.padded_in_features // 64
+    chunks = mxfp8_tc_gemv_active_k(query.in_features, query.padded_in_features) // 64
     cands = []
     if n_blocks >= 48 or chunks <= 2:
         cands.append(1)
-    for sk in (2, 4, 7, 8, 16):
+    for sk in (2, 3, 4, 7, 8, 16):
         if chunks % sk != 0:
             continue
         if query.workspace_nbytes is not None:
@@ -458,17 +464,21 @@ def _validate_config(query, config, device):
     ):
         raise ValueError("explicit packed A16 backend requires MXFP8 A16 execution")
     if config.a16_backend == "tc_gemv":
-        from ._mxfp8_tc_gemv import mxfp8_tc_gemv_workspace_bytes
+        from ._mxfp8_tc_gemv import (
+            mxfp8_tc_gemv_active_k,
+            mxfp8_tc_gemv_workspace_bytes,
+        )
 
         if not mxfp8_a16_tc_gemv_eligible(query, device):
             raise ValueError("MXFP8 TC-GEMV A16 backend is ineligible for this query")
+        active_k = mxfp8_tc_gemv_active_k(query.in_features, query.padded_in_features)
         if (
             config.tile_m not in (None, 16)
             or config.tile_n not in (16, 32)
             or config.tile_k != 64
             or type(config.split_k) is not int
-            or config.split_k not in (1, 2, 4, 7, 8, 16)
-            or (query.padded_in_features // 64) % config.split_k != 0
+            or config.split_k not in (1, 2, 3, 4, 7, 8, 16)
+            or (active_k // 64) % config.split_k != 0
             or type(config.mma_warps) is not int
             or config.mma_warps not in (2, 4, 8)
             or config.dense_config is not None
@@ -623,11 +633,18 @@ def _tuning_parameters(query, device):
                 for _, config in DENSE_TUNING.choices(inner, device)
             )
 
+    from ._mxfp8_tc_gemv import mxfp8_tc_gemv_active_k
+
     expanded = mxfp8_a16_dequant(query, BlockscaledConfig(mode="a16"))
     tc_gemv = mxfp8_a16_tc_gemv_eligible(query, device)
     tc_splits_16 = mxfp8_a16_tc_gemv_splits(query, 16) if tc_gemv else ()
     tc_n32_ok = tc_gemv and query.num_tokens >= 17 and query.out_features >= 512
     tc_splits_32 = mxfp8_a16_tc_gemv_splits(query, 32) if tc_n32_ok else ()
+    tc_active_k = (
+        mxfp8_tc_gemv_active_k(query.in_features, query.padded_in_features)
+        if tc_gemv
+        else query.padded_in_features
+    )
 
     def eligible(parameters):
         if (
@@ -657,14 +674,14 @@ def _tuning_parameters(query, device):
                     return False
             else:
                 return False
-            chunks_per_split = (query.padded_in_features // 64) // parameters["split_k"]
+            chunks_per_split = (tc_active_k // 64) // parameters["split_k"]
             if chunks_per_split <= 4:
                 return parameters["mma_warps"] in (2, 4)
             return parameters["mma_warps"] in (4, 8)
         if (
             parameters["tile_n"] == 16
             or parameters["mma_warps"] == 8
-            or parameters["split_k"] == 7
+            or parameters["split_k"] in (3, 7)
         ):
             return False
         if parameters["tile_n"] == 32 and not (
@@ -797,15 +814,19 @@ def _equivalence(query, device, config):
             "dense_config": None if dense is None else dense.to_dict(),
         }
     if config.a16_backend == "tc_gemv":
-        from ._mxfp8_tc_gemv import effective_mxfp8_tc_gemv_warps
+        from ._mxfp8_tc_gemv import (
+            effective_mxfp8_tc_gemv_warps,
+            mxfp8_tc_gemv_active_k,
+        )
 
+        active_k = mxfp8_tc_gemv_active_k(query.in_features, query.padded_in_features)
         return {
             "mode": "a16",
             "backend": "tc_gemv",
             "tile_n": config.tile_n,
             "split_k": config.split_k,
             "warps": effective_mxfp8_tc_gemv_warps(
-                query.padded_in_features, config.split_k, config.mma_warps or 8
+                active_k, config.split_k, config.mma_warps or 8
             ),
         }
     if mxfp8_a16_dequant(query, config):
@@ -853,7 +874,7 @@ TUNING = TuningContract(
         Knob(name="tile_k", values=(64, 128, 256), when=FrozenMapping({"mode": "a16"})),
         Knob(
             name="split_k",
-            values=(1, 2, 4, 7, 8, 16),
+            values=(1, 2, 3, 4, 7, 8, 16),
             when=FrozenMapping({"mode": "a16"}),
         ),
         Knob(

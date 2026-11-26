@@ -792,9 +792,23 @@ def _csf_default_config(query, config, device):
         not query.csf_inline_scales
         or device is None
         or device.compute_capability != (12, 0)
-        or _compact_w4a8_query(query)
     ):
         return config
+    if _compact_w4a8_query(query):
+        return replace(
+            config,
+            csf_inline_scales=bool(
+                _csf_inline_eligible(query, config)
+                and (
+                    config.backend == "micro"
+                    or (
+                        config.dynamic_tile_m is not None
+                        and query.routed_rows
+                        <= config.dynamic_tile_m * query.num_experts
+                    )
+                )
+            ),
+        )
     nvfp4 = _nvfp4_query(query)
     if (
         nvfp4

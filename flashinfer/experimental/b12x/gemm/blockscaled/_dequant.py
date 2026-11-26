@@ -26,8 +26,10 @@ def _dequantize_mxfp8(
     K: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    W_K: tl.constexpr = 0,
 ):
     """Expand E4M3 weights with UE8M0 block-32 scales into BF16 (1 scale load per 32 elements)."""
+    STRIDE_K: tl.constexpr = K if W_K == 0 else W_K
     rows = tl.program_id(0).to(tl.int64) * BLOCK_R + tl.arange(0, BLOCK_R)
     r_mask = rows < N
     k0 = tl.program_id(1) * BLOCK_K
@@ -35,7 +37,7 @@ def _dequantize_mxfp8(
     g = k0 // 32 + groups
     g_mask = g < (K // 32)
     e_u8 = tl.load(
-        S + _scale_offset(rows[:, None], g[None, :], K // 32),
+        S + _scale_offset(rows[:, None], g[None, :], STRIDE_K // 32),
         r_mask[:, None] & g_mask[None, :],
         127,
     ).to(tl.uint32)
@@ -50,5 +52,9 @@ def _dequantize_mxfp8(
     )
     k_offs = k0 + groups[None, :, None] * 32 + tl.arange(0, 32)[None, None, :]
     m3 = r_mask[:, None, None] & (k_offs < K)
-    w = tl.load(W + rows[:, None, None] * K + k_offs, m3, 0.0).to(tl.float32)
-    tl.store(OUT + rows[:, None, None] * K + k_offs, (w * scale[:, :, None]).to(tl.bfloat16), m3)
+    w = tl.load(W + rows[:, None, None] * STRIDE_K + k_offs, m3, 0.0).to(tl.float32)
+    tl.store(
+        OUT + rows[:, None, None] * K + k_offs,
+        (w * scale[:, :, None]).to(tl.bfloat16),
+        m3,
+    )

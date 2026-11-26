@@ -2312,7 +2312,8 @@ _MICRO_DYNAMIC_CUTOVER_PAIRS_DEFAULT = 64
 # Micro keeps the m tokens' activations resident in registers; 8 is the budget
 # ceiling. Micro is correct for any 1<=m<=8 (not just powers of two).
 _MICRO_MAX_TOKENS = 8
-_COMPACT_W4A8_MAX_TOKENS = 16
+_COMPACT_W4A8_MAX_TOKENS = 8
+_COMPACT_W4A8_MAX_TOKENS_SM121 = 4
 # Prepared MXFP4 decode keeps the shared-input producer through M=8, while
 # pair-direct routing wins through M=4 for the common top-k=8 regime.
 _W4A8_DECODE_MAX_ROUTED_ROWS = 64
@@ -2711,19 +2712,25 @@ def _w4a8_mx_micro_preferred(
         swiglu_beta=query.swiglu_beta,
     ):
         return False
-    if (
-        query.source_format == "fp4_e8m0_k32"
-        and query.intermediate_size % 128 == 64
-        and query.num_tokens > _COMPACT_W4A8_MAX_TOKENS
-    ):
-        # No-tune heuristic: compact decode stays on the per-row micro kernel
-        # only through 16 tokens. Larger launches race it instead.
-        return False
     capability = (
         device.compute_capability
         if device is not None
         else _current_compute_capability()
     )
+    compact_max_tokens = (
+        _COMPACT_W4A8_MAX_TOKENS_SM121
+        if capability == (12, 1)
+        else _COMPACT_W4A8_MAX_TOKENS
+    )
+    if (
+        query.source_format == "fp4_e8m0_k32"
+        and query.intermediate_size % 128 == 64
+        and query.num_tokens > compact_max_tokens
+    ):
+        # No-tune heuristic: keep per-row compact micro within the L2-resident
+        # token band (<=8 on SM120, <=4 on SM121) and route larger capacities
+        # to grouped M16 dynamic to avoid ungrouped expert weight thrash.
+        return False
     return not (
         capability == (12, 1)
         and query.num_tokens >= 3

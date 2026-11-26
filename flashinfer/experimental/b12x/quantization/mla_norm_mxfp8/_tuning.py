@@ -17,6 +17,8 @@ class Query:
     affine_prefetch_ready: bool = False
     # A dependent GEMM may start early but waits before reading encoded rows.
     release_dependents: bool = False
+    # Optional trailing KV rotary dimension (0 disables KV RoPE; 64 fuses it).
+    kv_rope_dim: int = 0
 
 
 @dataclass(frozen=True)
@@ -31,6 +33,8 @@ def validate_query(query, device):
         raise TypeError("affine prefetch readiness must be boolean")
     if type(query.release_dependents) is not bool:
         raise TypeError("dependent launch release must be boolean")
+    if type(query.kv_rope_dim) is not int or query.kv_rope_dim not in (0, 64):
+        raise ValueError("kv_rope_dim must be 0 or 64")
     if (
         type(query.rows) is not int
         or not 0 < query.rows <= 2**31 - 1
@@ -59,7 +63,7 @@ def validate_config(query, config, device):
 
 TUNING = TuningContract(
     component_id="quantization.mla_norm_mxfp8",
-    query_schema_version=2,
+    query_schema_version=3,
     config_schema_version=1,
     query_fields=frozenset(f.name for f in fields(Query)),
     config_fields=frozenset({"programmatic_serialization"}),
