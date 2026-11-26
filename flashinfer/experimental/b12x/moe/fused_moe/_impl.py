@@ -2921,10 +2921,20 @@ def _heuristic_moe_decode_config(
         # kernel; there is no micro specialization for them.
         backend = "dynamic"
     elif query.quant_mode == "w4a8_mx":
+        compact_prequant_micro = bool(
+            query.prequantized_input
+            and query.source_format == "fp4_e8m0_k32"
+            and query.intermediate_size % 128 == 64
+            and _w4a8_mx_micro_preferred(query, device)
+        )
         backend = (
-            "dynamic"
-            if query.prequantized_input
-            else ("micro" if _w4a8_mx_micro_preferred(query, device) else "dynamic")
+            "micro"
+            if compact_prequant_micro
+            else (
+                "dynamic"
+                if query.prequantized_input
+                else ("micro" if _w4a8_mx_micro_preferred(query, device) else "dynamic")
+            )
         )
     else:
         backend = select_tp_moe_backend(
@@ -2949,11 +2959,14 @@ def _heuristic_moe_decode_config(
             and query.intermediate_size % 128 == 64
         )
         if compact_n64_pipeline:
-            # Larger compact launches use the split-materialized M16 kernels.
-            # The direct compact micro path owns one through sixteen live tokens.
-            # Pre-quantized MXFP8 inputs require the dense shared-input repacked
-            # path, which selects M64 for N % 128 == 64 shapes.
-            dynamic_tile_m = 64 if query.prequantized_input else 16
+            # Larger compact launches use the split-materialized M16 kernels
+            # through 128 tokens (including pre-quantized MXFP8 inputs), and
+            # switch to M64 for wider pre-quantized prefill batches.
+            dynamic_tile_m = (
+                64
+                if (query.prequantized_input and query.num_tokens > 128)
+                else 16
+            )
             dynamic_route_mode = "grouped"
         else:
             dynamic_n = _dynamic_kernel_intermediate_size(
@@ -14299,8 +14312,16 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             fast_math=fast_math,
             csf_inline_scales=inline_scales is not None,
             fuse_input_quantization=plan.decode_config.compact_fuse_input_quantization,
-            prequant_a_values=binding.prequant_a_values,
-            prequant_a_scales=binding.prequant_a_scales,
+            prequant_a_values=(
+                a.view(torch.uint8)
+                if prequantized_input
+                else binding.prequant_a_values
+            ),
+            prequant_a_scales=(
+                binding.a_scales.view(torch.uint8)
+                if prequantized_input
+                else binding.prequant_a_scales
+            ),
         )
         return scatter_output
 

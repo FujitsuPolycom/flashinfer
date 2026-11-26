@@ -460,10 +460,11 @@ def _compact_input_quantization_eligible(query, config):
         config.backend == "micro"
         and config.micro_fc1_tile_n == 128
         and _compact_w4a8_query(query)
+        and not query.prequantized_input
         and query.io_dtype == "bfloat16"
         and query.activation == "silu"
         and query.hidden_size % 256 == 0
-        and 4 <= query.num_tokens <= 8
+        and 2 <= query.num_tokens <= 16
     )
 
 
@@ -652,15 +653,25 @@ def validate_moe_decode_config(
         )
     if config.backend not in {"micro", "dynamic", "w4a16"}:
         raise ValueError(f"unsupported MoE backend {config.backend!r}")
-    if query.prequantized_input and (
-        config.backend != "dynamic"
-        or query.quant_mode != "w4a8_mx"
-        or config.dynamic_route_mode == "direct"
-        or config.dynamic_tile_m not in {32, 64, 128}
-    ):
-        raise ValueError(
-            "prequantized MXFP8 MoE inputs require grouped dynamic W4A8 MX execution"
+    if query.prequantized_input:
+        compact_micro_ok = (
+            config.backend == "micro"
+            and _compact_w4a8_query(query)
+            and not config.compact_fuse_input_quantization
         )
+        dynamic_tiles = (
+            {16, 32, 64, 128} if _compact_w4a8_query(query) else {32, 64, 128}
+        )
+        dynamic_ok = (
+            config.backend == "dynamic"
+            and query.quant_mode == "w4a8_mx"
+            and config.dynamic_route_mode != "direct"
+            and config.dynamic_tile_m in dynamic_tiles
+        )
+        if not (compact_micro_ok or dynamic_ok):
+            raise ValueError(
+                "prequantized MXFP8 MoE inputs require grouped dynamic W4A8 MX execution"
+            )
     if config.w4a16_packed_schedule not in {"fused", "split"}:
         raise ValueError("W4A16 packed schedule must be 'fused' or 'split'")
     if config.w4a16_packed_schedule == "split" and not (
