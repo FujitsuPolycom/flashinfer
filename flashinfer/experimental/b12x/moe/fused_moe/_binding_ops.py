@@ -332,11 +332,20 @@ def supports_prequant_mxfp8(plan, tokens: int) -> bool:
     state = getattr(prepared, "state", None)
     if state is None:
         return False
-    variant = state.for_tokens(int(tokens)) if hasattr(state, "for_tokens") else state
-    return bool(
+    tokens = int(tokens)
+    variant = state.for_tokens(tokens) if hasattr(state, "for_tokens") else state
+    if (
         getattr(variant, "compact_launches", None) is not None
         and not getattr(variant.config, "compact_fuse_input_quantization", False)
-        and int(variant.scratch.caps.max_tokens) == int(tokens)
+        and int(variant.scratch.caps.max_tokens) == tokens
+    ):
+        return True
+    return bool(
+        getattr(variant.config, "backend", None) == "dynamic"
+        and getattr(variant.scratch.caps, "prequantized_input", False)
+        and getattr(variant.config, "dynamic_route_mode", None) != "direct"
+        and 0 < tokens <= 128
+        and tokens <= int(variant.scratch.caps.max_tokens)
     )
 
 
@@ -365,10 +374,22 @@ def prepared_moe_prequant_out(
     a4_prefill: bool | None,
 ) -> None:
     state = require_prepared(plan_from_handle(plan_handle), "moe.decode", a.device)
+    variant = (
+        state.for_tokens(int(a.shape[0])) if hasattr(state, "for_tokens") else state
+    )
+    if getattr(variant.scratch.caps, "prequantized_input", False):
+        m, k = int(a.shape[0]), int(a.shape[1])
+        bind_a = prequant_a_values.view(torch.float8_e4m3fn).view(m, k)
+        bind_scales = prequant_a_scales.view(m, k // 32)
+        bind_kwargs = dict(a=bind_a, a_scales=bind_scales)
+    else:
+        bind_kwargs = dict(
+            a=a,
+            prequant_a_values=prequant_a_values,
+            prequant_a_scales=prequant_a_scales,
+        )
     binding = state.bind(
-        a=a,
-        prequant_a_values=prequant_a_values,
-        prequant_a_scales=prequant_a_scales,
+        **bind_kwargs,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         output=output,
