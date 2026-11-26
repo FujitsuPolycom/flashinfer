@@ -19,6 +19,22 @@ from .._shared.mla.api import (
 from .._shared.mla.api import (
     clear_mla_caches as clear_caches,
 )
+from .._shared.mla.bitmask_union import (
+    BitmaskUnionMergeKernel,
+    allocate_bitmask_union_workspace,
+    bitmask_union_merge,
+    bitmask_union_merge_reference,
+    supports_bitmask_union_merge,
+)
+from .._shared.mla.bitmask_verify import (
+    BitmaskSplitMergeKernel,
+    BitmaskUnionVerifyMLAKernel,
+    BitmaskVerifySplitWorkspace,
+    allocate_bitmask_verify_workspace,
+    bitmask_union_verify_mla,
+    plan_bitmask_union_splits,
+    supports_bitmask_union_verify,
+)
 from .pooled_selection import (
     expand_pooled_topk_to_physical_slots,
     plan_pooled_selection,
@@ -206,4 +222,16 @@ __all__ = [
     "expand_pooled_topk_to_physical_slots",
     "is_supported",
     "clear_caches",
+    "BitmaskUnionMergeKernel",
+    "BitmaskUnionVerifyMLAKernel",
+    "BitmaskSplitMergeKernel",
+    "BitmaskVerifySplitWorkspace",
+    "allocate_bitmask_union_workspace",
+    "allocate_bitmask_verify_workspace",
+    "bitmask_union_merge",
+    "bitmask_union_merge_reference",
+    "bitmask_union_verify_mla",
+    "plan_bitmask_union_splits",
+    "supports_bitmask_union_merge",
+    "supports_bitmask_union_verify",
 ]
