@@ -137,6 +137,31 @@ def ld_global_v4_u32(
 
 
 @dsl_user_op
+def ld_global_cs_v4_u32(
+    base_ptr: Int64, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+    """Load 128 bits (4 x uint32) from global memory with streaming (.cs / evict-first) hint."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+        "ld.global.cs.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+    v0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    v1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    v2 = llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)
+    v3 = llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)
+
+    return Uint32(v0), Uint32(v1), Uint32(v2), Uint32(v3)
+
+
+@dsl_user_op
 def u32_as_f32(value: Uint32, *, loc=None, ip=None) -> Float32:
     """Bitcast a uint32 to float32 (mov.b32; no numeric conversion)."""
     return Float32(
@@ -543,6 +568,37 @@ def st_global_v4_u32(
             Uint32(v3).ir_value(loc=loc, ip=ip),
         ],
         "st.global.v4.u32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def st_global_cs_v4_u32(
+    base_ptr: Int64,
+    v0: Uint32,
+    v1: Uint32,
+    v2: Uint32,
+    v3: Uint32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Store 128 bits (4 x uint32) to global memory with streaming (.cs / evict-first) hint."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(base_ptr).ir_value(loc=loc, ip=ip),
+            Uint32(v0).ir_value(loc=loc, ip=ip),
+            Uint32(v1).ir_value(loc=loc, ip=ip),
+            Uint32(v2).ir_value(loc=loc, ip=ip),
+            Uint32(v3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.cs.v4.u32 [$0], {$1, $2, $3, $4};",
         "l,r,r,r,r",
         has_side_effects=True,
         is_align_stack=False,
