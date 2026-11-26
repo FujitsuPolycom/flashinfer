@@ -7,7 +7,7 @@ from types import MappingProxyType, SimpleNamespace
 
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float32, Int32, Int64, Uint8
+from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint16
 
 from b12x._lib.compile_plan import (
     DeferredCuTeKernel,
@@ -128,31 +128,133 @@ def _kernel(query, config, device):
     return DSAFusedIndexerKernel(**resolve_fused_mxfp4_kwargs(query, config, device))
 
 
+def _explicit_request_page_table(query) -> bool:
+    pt = query.operands.get("page_table")
+    if pt is None:
+        return False
+    pt_rows = int(pt["shape"][0])
+    return pt_rows not in (1, query.max_q_rows)
+
+
+def _multiquery_dense_spec(query, config, device):
+    """Return ``(q_tile, ctas)`` when request-grouped dense multi-query applies."""
+    if query.candidate_topk_blocks or query.max_candidates:
+        return None
+    if query.max_q_rows < 2:
+        return None
+    width = query.max_page_table_width * query.page_size
+    if width <= 512:
+        return None
+    fused = config.mxfp4
+    if config.fused_merge != "auto":
+        return None
+    explicit_req = _explicit_request_page_table(query)
+    if not explicit_req and query.max_q_rows < 16:
+        return None
+    from ._mxfp4_tuning import (
+        default_ctas,
+        default_fused_config,
+        multiquery_ctas,
+        multiquery_q_tile,
+    )
+
+    default_cfg = default_fused_config(
+        query, device.identity, ctas_per_row=fused.ctas_per_row
+    )
+    if fused != default_cfg:
+        return None
+    q_tile = multiquery_q_tile(query.max_q_rows, query.num_q_heads, width=width)
+    if fused.ctas_per_row == default_ctas(
+        query.max_q_rows, width, device.identity.sm_count
+    ):
+        ctas = multiquery_ctas(
+            query.max_q_rows, width, device.identity.sm_count, q_tile
+        )
+    else:
+        ctas = max(1, min((width + 255) // 256, fused.ctas_per_row))
+    return (q_tile, ctas)
+
+
+def _multiquery_hierarchical_spec(query, config, device):
+    """Return ``(q_tile, ctas, max_blocks)`` for direct multi-query Layer-20 path."""
+    if not query.candidate_topk_blocks or query.max_q_rows < 2:
+        return None
+    width = query.max_page_table_width * query.page_size
+    max_blocks = max(1, (width + 7) // 8)
+    # Keep direct uint16 block-max buffer bounded (<= 256K context / 32768 blocks);
+    # larger capacities use the bounded streaming HierarchicalFusedMXFP4 fallback.
+    if max_blocks > 32768:
+        return None
+    from ._mxfp4_tuning import default_ctas, multiquery_ctas, multiquery_q_tile
+
+    q_tile = multiquery_q_tile(
+        query.max_q_rows, query.num_q_heads, width=width, hierarchical=True
+    )
+    fused = config.mxfp4
+    if fused.ctas_per_row == default_ctas(
+        query.max_q_rows, width, device.identity.sm_count
+    ):
+        ctas = multiquery_ctas(
+            query.max_q_rows,
+            width,
+            device.identity.sm_count,
+            q_tile,
+            hierarchical=True,
+        )
+    else:
+        ctas = max(1, min((width + 255) // 256, fused.ctas_per_row))
+    return (q_tile, ctas, max_blocks)
+
+
 def workspace_layout(caps, query, config, device):
     """Lay out bounded carries and output temporaries in one aligned byte view."""
     rows = caps.max_q_rows
     if caps.candidate_topk_blocks:
-        from .hierarchical_fused import hierarchical_scratch_shapes
+        mq_hier = _multiquery_hierarchical_spec(query, config, device)
+        if mq_hier is not None:
+            from .hierarchical_fused import multiquery_hierarchical_scratch_shapes
 
-        shapes = {
-            name: (shape, dtype)
-            for name, (dtype, shape) in hierarchical_scratch_shapes(
-                rows, config.mxfp4.ctas_per_row
-            ).items()
-        }
+            _, ctas, max_blocks = mq_hier
+            shapes = {
+                name: (shape, dtype)
+                for name, (dtype, shape) in multiquery_hierarchical_scratch_shapes(
+                    rows, ctas, max_blocks
+                ).items()
+            }
+        else:
+            from .hierarchical_fused import hierarchical_scratch_shapes
+
+            shapes = {
+                name: (shape, dtype)
+                for name, (dtype, shape) in hierarchical_scratch_shapes(
+                    rows, config.mxfp4.ctas_per_row
+                ).items()
+            }
     else:
-        pack, state = _kernel(query, config, device).merge_scratch_elements(rows)
-        shapes = {
-            "selected_values": ((rows, 512), torch.float32),
-            "pack_values": ((pack,), torch.float32),
-            "pack_indices": ((pack,), torch.int32),
-            "merge_state": ((state,), torch.int32),
-        }
-        if not config.mxfp4.ordered_output:
-            shapes.update(
-                raw_indices=((rows, 512), torch.int32),
-                raw_values=((rows, 512), torch.float32),
-            )
+        mq_dense = _multiquery_dense_spec(query, config, device)
+        if mq_dense is not None:
+            from .mxfp4 import multiquery_scratch_shapes
+
+            _, ctas = mq_dense
+            shapes = {
+                name: (shape, dtype)
+                for name, (dtype, shape) in multiquery_scratch_shapes(
+                    rows, ctas
+                ).items()
+            }
+        else:
+            pack, state = _kernel(query, config, device).merge_scratch_elements(rows)
+            shapes = {
+                "selected_values": ((rows, 512), torch.float32),
+                "pack_values": ((pack,), torch.float32),
+                "pack_indices": ((pack,), torch.int32),
+                "merge_state": ((state,), torch.int32),
+            }
+            if not config.mxfp4.ordered_output:
+                shapes.update(
+                    raw_indices=((rows, 512), torch.int32),
+                    raw_values=((rows, 512), torch.float32),
+                )
     offset, views = 0, []
     for name, (shape, dtype) in shapes.items():
         offset = align_up(offset, 256)
@@ -315,6 +417,253 @@ class FusedMXFP4Programs:
         return program_keys(self.__b12x_dependencies__)
 
 
+def _request_meta_args(values):
+    request_ids = values.get("request_ids")
+    query_start_loc = values.get("query_start_loc")
+    page_table = values["page_table"]
+    if request_ids is not None:
+        return request_ids, Int32(1), Int32(page_table.shape[0])
+    if query_start_loc is not None:
+        return query_start_loc, Int32(2), Int32(query_start_loc.shape[0] - 1)
+    return values["cache_lengths"], Int32(0), Int32(page_table.shape[0])
+
+
+def _multiquery_dense_arguments(values, views, width, ctas):
+    from .mxfp4 import _ptr
+
+    rows = values["q_mxfp4"].shape[0]
+    page_table = values["page_table"]
+    stride = 0 if page_table.shape[0] == 1 else page_table.stride(0)
+    request_meta, request_mode, num_requests = _request_meta_args(values)
+    tensors = (
+        values["q_mxfp4"],
+        values["q_scales"],
+        values["query_weights"],
+        values["index_k_cache"],
+        page_table,
+        request_meta,
+        values["cache_lengths"],
+        values["active_width"],
+        values["output_indices"],
+        values["output_scores"],
+        views["partial_indices"],
+        views["partial_values"],
+        views["partial_counts"],
+        views["merge_state"],
+    )
+    dtypes = (
+        Uint8,
+        Uint8,
+        BFloat16,
+        Uint8,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Float32,
+        Int32,
+        Uint16,
+        Int32,
+        Int32,
+    )
+    local = tuple(_ptr(t, d) for t, d in zip(tensors, dtypes, strict=True))
+    local = (
+        *local,
+        Int32(rows),
+        Int32(width),
+        Int32(page_table.shape[1]),
+        Int64(stride),
+        Int64(values["index_k_cache"].stride(0)),
+        Int64(values["index_k_cache"].shape[0]),
+        request_mode,
+        num_requests,
+    )
+    merge = None
+    if ctas > 1:
+        merge = (*local[8:13], Int32(rows))
+    return local, merge
+
+
+def _multiquery_hierarchical_arguments(values, views, width, ctas):
+    from .mxfp4 import _ptr
+
+    rows = values["q_mxfp4"].shape[0]
+    page_table = values["page_table"]
+    stride = 0 if page_table.shape[0] == 1 else page_table.stride(0)
+    request_meta, request_mode, num_requests = _request_meta_args(values)
+    block_vals = views["block_values_u16"]
+    block_row_stride = Int64(block_vals.stride(0))
+    tensors = (
+        values["q_mxfp4"],
+        values["q_scales"],
+        values["query_weights"],
+        values["index_k_cache"],
+        page_table,
+        request_meta,
+        values["cache_lengths"],
+        values["active_width"],
+        values["output_indices"],
+        values["output_scores"],
+        views["partial_indices"],
+        views["partial_values"],
+        views["partial_counts"],
+        block_vals,
+        views["state"],
+    )
+    dtypes = (
+        Uint8,
+        Uint8,
+        BFloat16,
+        Uint8,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Float32,
+        Int32,
+        Uint16,
+        Int32,
+        Uint16,
+        Int32,
+    )
+    local = tuple(_ptr(t, d) for t, d in zip(tensors, dtypes, strict=True))
+    local = (
+        *local,
+        Int32(rows),
+        Int32(width),
+        Int32(page_table.shape[1]),
+        Int64(stride),
+        Int64(values["index_k_cache"].stride(0)),
+        Int64(values["index_k_cache"].shape[0]),
+        block_row_stride,
+        request_mode,
+        num_requests,
+    )
+    merge_expand = (
+        *local[6:14],
+        _ptr(values["candidate_output"], Int32),
+        _ptr(values["candidate_output_lengths"], Int32),
+        Int32(rows),
+        Int32(width),
+        block_row_stride,
+    )
+    return local, merge_expand
+
+
+def _compile_multiquery_dense(query, q_tile, ctas, facts):
+    from .mxfp4 import MultiQueryFusedMXFP4
+
+    obj = MultiQueryFusedMXFP4(query.num_q_heads, query.page_size, ctas, q_tile)
+    dtypes = (
+        Uint8,
+        Uint8,
+        BFloat16,
+        Uint8,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Float32,
+        Int32,
+        Uint16,
+        Int32,
+        Int32,
+    )
+    pointers = tuple(
+        make_ptr(d, 256, cute.AddressSpace.gmem, assumed_align=1) for d in dtypes
+    )
+    spec_key = (query.num_q_heads, query.page_size, ctas, q_tile)
+    local = b12x_compile(
+        obj.local,
+        *pointers,
+        Int32(query.max_q_rows),
+        Int32(1),
+        Int32(1),
+        Int64(1),
+        Int64(query.page_size * 68),
+        Int64(1),
+        Int32(0),
+        Int32(1),
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "attention.indexer.mxfp4_multiquery_local", 4, spec_key
+        ),
+    )
+    merge = None
+    if ctas > 1:
+        merge = b12x_compile(
+            obj.merge,
+            *pointers[8:13],
+            Int32(query.max_q_rows),
+            current_cuda_stream(),
+            compile_spec=KernelCompileSpec.from_key(
+                "attention.indexer.mxfp4_multiquery_merge", 4, spec_key
+            ),
+        )
+    return local, merge
+
+
+def _compile_multiquery_hierarchical(query, q_tile, ctas, facts):
+    from .hierarchical_fused import MultiQueryHierarchicalMXFP4
+
+    obj = MultiQueryHierarchicalMXFP4(query.num_q_heads, query.page_size, ctas, q_tile)
+    dtypes = (
+        Uint8,
+        Uint8,
+        BFloat16,
+        Uint8,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Float32,
+        Int32,
+        Uint16,
+        Int32,
+        Uint16,
+        Int32,
+    )
+    pointers = tuple(
+        make_ptr(d, 256, cute.AddressSpace.gmem, assumed_align=1) for d in dtypes
+    )
+    spec_key = (query.num_q_heads, query.page_size, ctas, q_tile)
+    local = b12x_compile(
+        obj.local,
+        *pointers,
+        Int32(query.max_q_rows),
+        Int32(1),
+        Int32(1),
+        Int64(1),
+        Int64(query.page_size * 68),
+        Int64(1),
+        Int64(1),
+        Int32(0),
+        Int32(1),
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "attention.indexer.mxfp4_mq_hier_local", 4, spec_key
+        ),
+    )
+    merge_expand = b12x_compile(
+        obj.merge_expand,
+        *pointers[6:14],
+        make_ptr(Int32, 256, cute.AddressSpace.gmem, assumed_align=1),
+        make_ptr(Int32, 256, cute.AddressSpace.gmem, assumed_align=1),
+        Int32(query.max_q_rows),
+        Int32(1),
+        Int64(1),
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "attention.indexer.mxfp4_mq_hier_merge_expand", 4, spec_key
+        ),
+    )
+    return local, merge_expand
+
+
 def _compile_hierarchical(query, config, facts):
     from .hierarchical_fused import HierarchicalFusedMXFP4
 
@@ -355,7 +704,7 @@ def _compile_hierarchical(query, config, facts):
         obj.local,
         *args,
         compile_spec=KernelCompileSpec.from_key(
-            "attention.indexer.mxfp4_hierarchical_local", 2, (facts.to_dict(),)
+            "attention.indexer.mxfp4_hierarchical_local", 3, (facts.to_dict(),)
         ),
     )
     merge = None
@@ -366,7 +715,7 @@ def _compile_hierarchical(query, config, facts):
             Int32(query.max_q_rows),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "attention.indexer.mxfp4_hierarchical_merge", 2, (facts.to_dict(),)
+                "attention.indexer.mxfp4_hierarchical_merge", 3, (facts.to_dict(),)
             ),
         )
     return local, merge
@@ -393,18 +742,31 @@ def compile_fused_mxfp4(query_payload, config_payload, ordinal):
         candidate_topk_blocks=query.candidate_topk_blocks,
     )
     kwargs = resolve_fused_mxfp4_kwargs(query, config, detected)
+    mq_dense = _multiquery_dense_spec(query, config, detected)
+    mq_hier = _multiquery_hierarchical_spec(query, config, detected)
     facts = FrozenMapping(
         {
             "constructor": FrozenMapping(kwargs),
             "max_rows": query.max_q_rows,
             "hierarchical": bool(query.candidate_topk_blocks),
+            "multiquery_dense": mq_dense,
+            "multiquery_hierarchical": mq_hier,
         }
     )
     fused = reset = local = merge = sort = None
     with torch.cuda.device(ordinal), FakeTensorMode(), compile_only_launches():
         if query.candidate_topk_blocks:
-            local, merge = _compile_hierarchical(query, config, facts)
-            sort = _compile("sort", (2048, True), ordinal)
+            if mq_hier is not None:
+                q_tile, ctas, _ = mq_hier
+                local, merge = _compile_multiquery_hierarchical(
+                    query, q_tile, ctas, facts
+                )
+            else:
+                local, merge = _compile_hierarchical(query, config, facts)
+                sort = _compile("sort", (2048, True), ordinal)
+        elif mq_dense is not None:
+            q_tile, ctas = mq_dense
+            local, merge = _compile_multiquery_dense(query, q_tile, ctas, facts)
         else:
             from .kernel import _to_kernel_tensor
 
@@ -498,9 +860,13 @@ class MXFP4PreparedState:
         self.caps, self.query, self.config = caps, query, config
         self.layout = workspace_layout(caps, query, config, device)
         self.programs = programs
+        self.multiquery_dense = _multiquery_dense_spec(query, config, device)
+        self.multiquery_hierarchical = _multiquery_hierarchical_spec(
+            query, config, device
+        )
         with torch.cuda.device(caps.device):
             load_programs(programs)
-            if not caps.candidate_topk_blocks:
+            if not caps.candidate_topk_blocks and self.multiquery_dense is None:
                 from .fused_indexer import _check_mxfp4_cooperative_residency
 
                 launcher = programs.fused
@@ -543,6 +909,8 @@ class MXFP4PreparedState:
         candidate_output=None,
         candidate_output_lengths=None,
         score_width=None,
+        request_ids=None,
+        query_start_loc=None,
         **_ignored,
     ):
         from .mxfp4 import bind_mxfp4
@@ -564,13 +932,17 @@ class MXFP4PreparedState:
             candidate_lengths=candidate_lengths,
             candidate_output=candidate_output,
             candidate_output_lengths=candidate_output_lengths,
+            request_ids=request_ids,
+            query_start_loc=query_start_loc,
         )
         runtime = bind_mxfp4(self, scratch=scratch, score_width=score_width, **values)
         if output_scores is None:
             values["output_scores"] = runtime.scratch["selected_values"][:rows]
         fused = self.config.mxfp4
-        if fused.mxfp4_aligned_q and (
-            q_mxfp4.data_ptr() % 4 or q_scales.data_ptr() % 4
+        if (
+            self.multiquery_dense is None
+            and fused.mxfp4_aligned_q
+            and (q_mxfp4.data_ptr() % 4 or q_scales.data_ptr() % 4)
         ):
             raise ValueError(
                 "aligned MXFP4 query loads require four-byte-aligned query and scales"
@@ -583,19 +955,38 @@ class MXFP4PreparedState:
             )
         merge_args = sort_tensors = None
         if self.caps.candidate_topk_blocks:
-            args, merge_args = _hierarchical_arguments(
-                values, runtime.scratch, runtime.score_width, fused.ctas_per_row
-            )
-            sort_tensors = (
-                runtime.scratch["block_indices"],
-                runtime.scratch["block_values"],
-                candidate_output,
-                runtime.scratch["block_values"],
-                cache_lengths,
-                active_width,
-                candidate_output_lengths,
+            if self.multiquery_hierarchical is not None:
+                _, ctas, _ = self.multiquery_hierarchical
+                args, merge_args = _multiquery_hierarchical_arguments(
+                    values, runtime.scratch, runtime.score_width, ctas
+                )
+            else:
+                if request_ids is not None or query_start_loc is not None:
+                    raise ValueError(
+                        "explicit request mapping requires the multi-query MXFP4 path"
+                    )
+                args, merge_args = _hierarchical_arguments(
+                    values, runtime.scratch, runtime.score_width, fused.ctas_per_row
+                )
+                sort_tensors = (
+                    runtime.scratch["block_indices"],
+                    runtime.scratch["block_values"],
+                    candidate_output,
+                    runtime.scratch["block_values"],
+                    cache_lengths,
+                    active_width,
+                    candidate_output_lengths,
+                )
+        elif self.multiquery_dense is not None:
+            _, ctas = self.multiquery_dense
+            args, merge_args = _multiquery_dense_arguments(
+                values, runtime.scratch, runtime.score_width, ctas
             )
         else:
+            if request_ids is not None or query_start_loc is not None:
+                raise ValueError(
+                    "explicit request mapping requires the multi-query MXFP4 path"
+                )
             args = _ordinary_arguments(
                 values, runtime.scratch, runtime.score_width, fused.ordered_output
             )
@@ -626,13 +1017,18 @@ class MXFP4PreparedState:
                 run_compiled(self.programs.local, (*binding.args, stream))
                 if self.programs.merge is not None:
                     run_compiled(self.programs.merge, (*binding.merge_args, stream))
-                _launch(
-                    "sort",
-                    (2048, True),
-                    binding.sort_tensors,
-                    (rows,),
-                    launcher=self.programs.sort,
-                )
+                if self.programs.sort is not None:
+                    _launch(
+                        "sort",
+                        (2048, True),
+                        binding.sort_tensors,
+                        (rows,),
+                        launcher=self.programs.sort,
+                    )
+            elif self.multiquery_dense is not None:
+                run_compiled(self.programs.local, (*binding.args, stream))
+                if self.programs.merge is not None:
+                    run_compiled(self.programs.merge, (*binding.merge_args, stream))
             else:
                 if self.programs.reset is not None:
                     run_compiled(
