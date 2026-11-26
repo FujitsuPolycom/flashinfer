@@ -20,8 +20,10 @@ from cutlass.cutlass_dsl import Int32, Int64, Uint8, Uint32
 from b12x._lib.intrinsics.memory import (
     cp_async4_shared_global,
     cp_async4_shared_global_zfill,
+    cp_async_bulk_g2s_mbar_l2hint,
     cp_async_u32_shared_global,
     cp_async_u32_shared_global_zfill,
+    create_l2_evict_first_policy,
     get_ptr_as_int64,
     ld_shared_v2_u32,
     ld_shared_v4_u32,
@@ -29,7 +31,11 @@ from b12x._lib.intrinsics.memory import (
     st_global_u32,
 )
 from b12x._lib.intrinsics.mma import e2m1x8_to_qmma_e2m1x8, mxfp8_mma_m16n8k32_f32_e2m1
-from b12x._lib.intrinsics.atomics import ld_shared_u32, scatter_add_bf16x2
+from b12x._lib.intrinsics.atomics import (
+    ld_shared_u32,
+    red_add_global_bf16x2,
+    scatter_add_bf16x2,
+)
 from b12x._lib.intrinsics.packed import pack_f32x2_to_bfloat2
 from b12x._lib.intrinsics.mma import mxfp8_mma_m16n8k32_f32_e4m3
 from b12x._lib.intrinsics.mma import mxfp8_mma_m16n8k32_f32_e2m1_e4m3
@@ -100,11 +106,29 @@ class W4A8MaterializedPhase2Kernel:
                 "materialized phase 2 source_tile_m must be 16, 64, or 128, "
                 f"got {source_tile_m}"
             )
-        self.tile_m = 16 if source_tile_m in (1, 16) else type(self).tile_m
+        if source_tile_m in (1, 16):
+            self.tile_m = 16
+            self.tile_k = type(self).tile_k
+            self.num_warps = 4
+            self.stages = 2
+            self.launch_cta_budget = 2
+        elif source_tile_m == 128 and trellis_bits is None and not self.direct_routes:
+            self.tile_m = 128
+            self.tile_k = 64
+            self.num_warps = 4
+            self.stages = 3
+            self.launch_cta_budget = 2
+        else:
+            self.tile_m = type(self).tile_m
+            self.tile_k = type(self).tile_k
+            self.num_warps = 4
+            self.stages = 2
+            self.launch_cta_budget = 2
+        self.threads_per_cta = self.num_warps * 32
         self.tile_n = type(self).tile_n
-        self.stages = 2
+        self.a_row_stride = 64 if self.tile_m == 128 else self.tile_k
         self.a_payload_bytes = (
-            self.tile_k if self.direct_routes else self.tile_m * self.tile_k
+            self.tile_k if self.direct_routes else self.tile_m * self.a_row_stride
         )
         self.a_scale_bytes = 128 if self.direct_routes else self.tile_m * 4
         self.a_stage_bytes = self.a_payload_bytes + self.a_scale_bytes
@@ -112,9 +136,18 @@ class W4A8MaterializedPhase2Kernel:
         self.b_storage_offset = ((self.a_storage_bytes + 1023) // 1024) * 1024
         self.b_stage_bytes = self.tile_n * self.tile_k // 2
         self.b_storage_bytes = self.stages * self.b_stage_bytes
+        self.use_tma_b = (
+            self.tile_m == 128
+            and self.n64_repacked
+            and trellis_bits is None
+            and not self.direct_routes
+        )
         self.sfb_storage_offset = self.b_storage_offset + self.b_storage_bytes
         self.sfb_stage_bytes = (self.tile_n // 8) * 8 * 4
         self.shared_bytes = self.sfb_storage_offset + self.stages * self.sfb_stage_bytes
+        self.mbar_offset = ((self.shared_bytes + 7) // 8) * 8
+        if self.use_tma_b:
+            self.shared_bytes = self.mbar_offset + self.stages * 8
         self.shared_words = (self.shared_bytes + 3) // 4
         self.source_tile_m = int(source_tile_m)
         self.source_halves = (
@@ -167,7 +200,7 @@ class W4A8MaterializedPhase2Kernel:
             or self.fused_topk == 0
             or (self.direct_routes and self.fused_groups == 2 and self.num_warps == 4)
         )
-        grid_z = max_active_clusters * Int32(2)
+        grid_z = max_active_clusters * Int32(self.launch_cta_budget)
         if cutlass.const_expr(self.direct_routes):
             grid_z = num_pairs * packed_output_tiles * Int32(256 // self.tile_n)
             grid_z = grid_z // Int32(self.fused_topk)
@@ -192,7 +225,7 @@ class W4A8MaterializedPhase2Kernel:
         ).launch(
             grid=(1, 1, grid_z),
             block=[self.threads_per_cta * self.fused_groups, 1, 1],
-            min_blocks_per_mp=2,
+            min_blocks_per_mp=self.launch_cta_budget,
             stream=stream,
         )
 
@@ -264,6 +297,9 @@ class W4A8MaterializedPhase2Kernel:
         total_output_tiles: Int32,
         total_k32: cutlass.Constexpr,
         tid: Int32,
+        bounds=None,
+        value_offset=None,
+        base_word=None,
     ):
         scales_u8 = cute.recast_tensor(scales, Uint8)
         total_output_n = total_output_tiles * Int32(128)
@@ -282,8 +318,31 @@ class W4A8MaterializedPhase2Kernel:
                     output_tile * Int32(self.csf_reader.plane.storage.column_groups)
                     + k128_slice
                 )
+                cached = None
+                coords = None
+                if cutlass.const_expr(bounds is not None):
+                    first, end = Uint32(0), Uint32(0)
+                    for chunk in cutlass.range_constexpr(cute.size(bounds, mode=[0])):
+                        selected_first = cute.arch.shuffle_sync(
+                            bounds[chunk, 0], k128_slice % Int32(32)
+                        )
+                        selected_end = cute.arch.shuffle_sync(
+                            bounds[chunk, 1], k128_slice % Int32(32)
+                        )
+                        if k128_slice // Int32(32) == Int32(chunk):
+                            first, end = selected_first, selected_end
+                    cached = (first, end)
+                    coords = (Int32(0), output_tile, k128_slice)
                 self.csf_reader.stage_compressed(
-                    scales.iterator, expert_idx, group, target, tid
+                    scales.iterator,
+                    expert_idx,
+                    group,
+                    target,
+                    tid,
+                    cached,
+                    value_offset,
+                    base_word,
+                    coords,
                 )
         if cutlass.const_expr(not self.csf_inline):
             source_base = (
@@ -992,6 +1051,511 @@ class W4A8MaterializedPhase2Kernel:
         cute.arch.cp_async_wait_group(0)
 
     @cute.jit
+    def _stage_slice_m128(
+        self,
+        intermediate_u32: cute.Tensor,
+        down_rp: cute.Tensor,
+        down_sfb_rp: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        source_m_tile: Int32,
+        expert_idx: Int32,
+        output_tile: Int32,
+        k64_slice: Int32,
+        stage: Int32,
+        rows_capacity: Int32,
+        intermediate_tiles: Int32,
+        packed_output_tiles: Int32,
+        stage_m: cutlass.Constexpr[int],
+        mbar_base=None,
+        l2_policy=None,
+        sfb_bounds=None,
+        csf_value_offset=None,
+        sfb_base_word=None,
+    ):
+        a_base = smem_base + stage * Int32(self.a_stage_bytes)
+        sfa_base = a_base + Int32(self.a_payload_bytes)
+        b_base = (
+            smem_base
+            + Int32(self.b_storage_offset)
+            + stage * Int32(self.b_stage_bytes)
+        )
+        sfb_base = (
+            smem_base
+            + Int32(self.sfb_storage_offset)
+            + stage * Int32(self.sfb_stage_bytes)
+        )
+        words_per_row = intermediate_tiles * Int32(32)
+        physical_row_base = Int64(source_m_tile) * Int64(self.source_tile_m)
+        k128_slice = k64_slice >> Int32(1)
+        k_half = k64_slice & Int32(1)
+
+        for i in cutlass.range_constexpr(
+            (stage_m * 4 + self.threads_per_cta - 1) // self.threads_per_cta
+        ):
+            idx = tid + Int32(i * self.threads_per_cta)
+            if idx < Int32(stage_m * 4):
+                row = idx >> Int32(2)
+                vec = idx & Int32(3)
+                physical_vec = vec ^ ((row >> Int32(1)) & Int32(3))
+                src_word = (
+                    (physical_row_base + Int64(row)) * Int64(words_per_row)
+                    + Int64(k64_slice * Int32(16))
+                    + Int64(vec << Int32(2))
+                )
+                cp_async4_shared_global(
+                    a_base
+                    + row * Int32(64)
+                    + (physical_vec << Int32(4)),
+                    get_ptr_as_int64(intermediate_u32, src_word),
+                )
+
+        if k_half == Int32(0) and tid < Int32(stage_m):
+            sf_src = (
+                Int64(rows_capacity) * Int64(words_per_row)
+                + Int64(k128_slice) * Int64(rows_capacity)
+                + physical_row_base
+                + Int64(tid)
+            )
+            cp_async_u32_shared_global(
+                sfa_base + (tid << Int32(2)),
+                get_ptr_as_int64(intermediate_u32, sf_src),
+            )
+
+        if cutlass.const_expr(self.n64_repacked):
+            total_output_tiles = packed_output_tiles * Int32(2)
+            total_k32 = intermediate_tiles * Int32(4)
+            if cutlass.const_expr(self.n64_tail):
+                total_k32 -= Int32(2)
+            total_output_n = total_output_tiles * Int32(128)
+            expert_words = total_output_n * Int32(total_k32 * 4)
+            output_base = output_tile * Int32(128 * total_k32 * 4)
+            if cutlass.const_expr(self.use_tma_b):
+                if tid == Int32(0):
+                    source_word = (
+                        Int64(expert_idx) * Int64(expert_words)
+                        + Int64(output_base)
+                        + Int64(k128_slice * Int32(2048))
+                        + Int64(k_half * Int32(1024))
+                    )
+                    mbar_u32 = smem_base + Int32(self.mbar_offset) + stage * Int32(8)
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        mbar_base + stage, Int32(4096)
+                    )
+                    cp_async_bulk_g2s_mbar_l2hint(
+                        b_base,
+                        get_ptr_as_int64(down_rp, source_word),
+                        Int32(4096),
+                        mbar_u32,
+                        l2_policy,
+                    )
+            else:
+                for i in cutlass.range_constexpr(
+                    (2 * 4 * 32 + self.threads_per_cta - 1) // self.threads_per_cta
+                ):
+                    idx = tid + Int32(i * self.threads_per_cta)
+                    if idx < Int32(2 * 4 * 32):
+                        lane = idx & Int32(31)
+                        tmp = idx >> Int32(5)
+                        n32 = tmp & Int32(3)
+                        kb = tmp >> Int32(2)
+                        source_kb = k_half * Int32(2) + kb
+                        dst_addr = b_base + (idx << Int32(4))
+                        source_word = (
+                            Int64(expert_idx) * Int64(expert_words)
+                            + Int64(output_base)
+                            + Int64(k128_slice * Int32(2048))
+                            + Int64(source_kb * Int32(512))
+                            + Int64(n32 * Int32(128))
+                            + Int64(lane * Int32(4))
+                        )
+                        cp_async4_shared_global(
+                            dst_addr,
+                            get_ptr_as_int64(down_rp, source_word),
+                        )
+            if k_half == Int32(0):
+                self._stage_n64_sfb(
+                    down_sfb_rp,
+                    sfb_base,
+                    expert_idx,
+                    output_tile,
+                    k128_slice,
+                    total_output_tiles,
+                    total_k32,
+                    tid,
+                    sfb_bounds,
+                    csf_value_offset,
+                    sfb_base_word,
+                )
+        else:
+            n32_chunks = self.tile_n // 32
+            packed_tile = output_tile // Int32(256 // self.tile_n)
+            packed_n32 = (output_tile % Int32(256 // self.tile_n)) * Int32(n32_chunks)
+            b_tile = (
+                expert_idx * packed_output_tiles + packed_tile
+            ) * intermediate_tiles + k128_slice
+            b_word_base = Int64(b_tile) * Int64(4096)
+            for i in cutlass.range_constexpr(
+                (2 * n32_chunks * 32 + self.threads_per_cta - 1) // self.threads_per_cta
+            ):
+                idx = tid + Int32(i * self.threads_per_cta)
+                if idx < Int32(2 * n32_chunks * 32):
+                    lane = idx & Int32(31)
+                    kc = idx >> Int32(5)
+                    chunk = kc % Int32(n32_chunks)
+                    kb = kc // Int32(n32_chunks)
+                    source_kb = k_half * Int32(2) + kb
+                    src_word = (
+                        b_word_base
+                        + Int64(source_kb * 8 * 32 * 4)
+                        + Int64((packed_n32 + chunk) * Int32(32 * 4))
+                        + Int64(lane * Int32(4))
+                    )
+                    cp_async4_shared_global(
+                        b_base + (idx << Int32(4)),
+                        get_ptr_as_int64(down_rp, src_word),
+                    )
+            if k_half == Int32(0):
+                sfb_word_base = Int64(b_tile) * Int64(256)
+                if tid < Int32(((self.tile_n // 8) * 8) // 4):
+                    src_word = sfb_word_base + Int64(packed_n32 * Int32(4 * 8) + tid * 4)
+                    cp_async4_shared_global(
+                        sfb_base + (tid << Int32(4)),
+                        get_ptr_as_int64(down_sfb_rp, src_word),
+                    )
+
+    @cute.jit
+    def _run_task_m128(
+        self,
+        intermediate_u32: cute.Tensor,
+        down_rp: cute.Tensor,
+        down_sfb_rp: cute.Tensor,
+        scatter_output: cute.Tensor,
+        token_map: cute.Tensor,
+        token_weights: cute.Tensor,
+        down_alpha: cute.Tensor,
+        global_scale: cute.Tensor,
+        trellis_lut: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        warp_idx: Int32,
+        source_m_tile: Int32,
+        m_half: Int32,
+        expert_idx: Int32,
+        output_tile: Int32,
+        valid_rows: Int32,
+        rows_capacity: Int32,
+        intermediate_tiles: Int32,
+        packed_output_tiles: Int32,
+        route_sum: cute.Tensor,
+        compute_m: cutlass.Constexpr[int],
+    ):
+        del m_half, trellis_lut, route_sum
+        lane = tid & Int32(31)
+        q = lane >> Int32(2)
+        c = lane & Int32(3)
+
+        total_k64 = intermediate_tiles * Int32(2)
+        if cutlass.const_expr(self.n64_repacked and self.n64_tail):
+            total_k64 -= Int32(1)
+
+        mbar_base = None
+        l2_policy = None
+        if cutlass.const_expr(self.use_tma_b):
+            mbar_base = cute.make_ptr(
+                cutlass.Int64,
+                smem_base + Int32(self.mbar_offset),
+                cute.AddressSpace.smem,
+                assumed_align=8,
+            )
+            l2_policy = create_l2_evict_first_policy()
+            if tid == Int32(0):
+                for s in cutlass.range_constexpr(self.stages):
+                    cute.arch.mbarrier_init(mbar_base + Int32(s), Int32(1))
+            cute.arch.sync_threads()
+
+        sfb_bounds = None
+        csf_value_offset = None
+        sfb_base_word = None
+        if cutlass.const_expr(self.csf_inline and self.n64_repacked):
+            csf_value_offset = self.csf_reader.plane.group_value_offset(
+                down_sfb_rp.iterator
+            )
+            sfb_bounds = self.csf_reader.prefetch_column_bounds(
+                down_sfb_rp.iterator, expert_idx, output_tile
+            )
+            sfb_base_word = self.csf_reader.prefetch_row_bases(
+                down_sfb_rp.iterator, expert_idx, output_tile, tid
+            )
+
+        no_tail_barrier = False
+        preload_slices = self.stages - 2 if no_tail_barrier else self.stages - 1
+        for preload_slice in cutlass.range_constexpr(preload_slices):
+            if Int32(preload_slice) < total_k64:
+                self._stage_slice_m128(
+                    intermediate_u32,
+                    down_rp,
+                    down_sfb_rp,
+                    smem_base,
+                    tid,
+                    source_m_tile,
+                    expert_idx,
+                    output_tile,
+                    Int32(preload_slice),
+                    Int32(preload_slice),
+                    rows_capacity,
+                    intermediate_tiles,
+                    packed_output_tiles,
+                    compute_m,
+                    mbar_base=mbar_base,
+                    l2_policy=l2_policy,
+                    sfb_bounds=sfb_bounds,
+                    csf_value_offset=csf_value_offset,
+                    sfb_base_word=sfb_base_word,
+                )
+            cute.arch.cp_async_commit_group()
+
+        m_blocks = compute_m // 16
+        n_fragments = 4
+        facc = tuple(
+            tuple(
+                cute.make_rmem_tensor((4,), cutlass.Float32)
+                for _nt in range(n_fragments)
+            )
+            for _blk in range(m_blocks)
+        )
+        for blk in cutlass.range_constexpr(m_blocks):
+            for nt in cutlass.range_constexpr(n_fragments):
+                facc[blk][nt].fill(0.0)
+        sfb_reg = cute.make_rmem_tensor((n_fragments,), Uint32)
+        sfb_reg.fill(Uint32(0))
+        asc = cute.make_rmem_tensor((m_blocks,), Uint32)
+        asc.fill(Uint32(0))
+
+        k64_slice = Int32(0)
+        stage = Int32(0)
+        next_stage = Int32(preload_slices)
+        stage_phase = Int32(0)
+        while k64_slice < total_k64:
+            a_base = smem_base + stage * Int32(self.a_stage_bytes)
+            sfa_base = a_base + Int32(self.a_payload_bytes)
+            b_base = (
+                smem_base
+                + Int32(self.b_storage_offset)
+                + stage * Int32(self.b_stage_bytes)
+            )
+            sfb_base = (
+                smem_base
+                + Int32(self.sfb_storage_offset)
+                + stage * Int32(self.sfb_stage_bytes)
+            )
+
+            next_slice = k64_slice + Int32(preload_slices)
+            if next_slice < total_k64:
+                self._stage_slice_m128(
+                    intermediate_u32,
+                    down_rp,
+                    down_sfb_rp,
+                    smem_base,
+                    tid,
+                    source_m_tile,
+                    expert_idx,
+                    output_tile,
+                    next_slice,
+                    next_stage,
+                    rows_capacity,
+                    intermediate_tiles,
+                    packed_output_tiles,
+                    compute_m,
+                    mbar_base=mbar_base,
+                    l2_policy=l2_policy,
+                    sfb_bounds=sfb_bounds,
+                    csf_value_offset=csf_value_offset,
+                    sfb_base_word=sfb_base_word,
+                )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(preload_slices)
+            if cutlass.const_expr(self.use_tma_b):
+                cute.arch.mbarrier_wait(mbar_base + stage, phase=stage_phase)
+            cute.arch.sync_threads()
+
+            k_half = k64_slice & Int32(1)
+            scale_shift = Uint32(k_half) * Uint32(16)
+            if k_half == Int32(0):
+                sfb_words = sfb_base
+                if cutlass.const_expr(self.csf_inline):
+                    sfb_words = smem_base + Int32(self.shared_words * 4)
+                    self.csf_reader.expand_warp_rows(
+                        down_sfb_rp.iterator,
+                        sfb_base,
+                        sfb_words,
+                        warp_idx,
+                        lane,
+                        csf_value_offset,
+                    )
+                for nt in cutlass.range_constexpr(n_fragments):
+                    n8 = warp_idx * Int32(4) + Int32(nt)
+                    sfb_reg[nt] = ld_shared_u32(
+                        sfb_words + ((n8 * Int32(8) + q) << Int32(2))
+                    )
+                for blk in cutlass.range_constexpr(m_blocks):
+                    sf_row = (
+                        Int32(blk * 16) + q + ((lane & Int32(1)) << Int32(3))
+                    )
+                    asc[blk] = ld_shared_u32(sfa_base + (sf_row << Int32(2)))
+
+            for kb in cutlass.range_constexpr(2):
+                w0, w1, w2, w3 = ld_shared_v4_u32(
+                    b_base
+                    + (((Int32(kb * 4) + warp_idx) * Int32(32) + lane) << Int32(4))
+                )
+                words = cute.make_rmem_tensor((4,), Uint32)
+                words[0] = w0
+                words[1] = w1
+                words[2] = w2
+                words[3] = w3
+                dn_b0 = cute.make_rmem_tensor((4,), Uint32)
+                dn_b1 = cute.make_rmem_tensor((4,), Uint32)
+                for nt in cutlass.range_constexpr(4):
+                    wb0, wb1 = e2m1x8_to_qmma_e2m1x8(words[nt])
+                    dn_b0[nt] = wb0
+                    dn_b1[nt] = wb1
+
+                u_phys = (Int32(kb * 2) + (c >> Int32(1))) ^ (q >> Int32(1))
+                for blk in cutlass.range_constexpr(m_blocks):
+                    a_lo = (
+                        a_base
+                        + Int32(blk * 16 * 64)
+                        + (q << Int32(6))
+                        + (u_phys << Int32(4))
+                        + ((c & Int32(1)) << Int32(3))
+                    )
+                    a0, a2 = ld_shared_v2_u32(a_lo)
+                    a1, a3 = ld_shared_v2_u32(a_lo + Int32(8 * 64))
+                    asc_val = asc[blk] >> scale_shift
+                    for nt in cutlass.range_constexpr(n_fragments):
+                        fragment = facc[blk][nt]
+                        d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
+                            fragment[0],
+                            fragment[1],
+                            fragment[2],
+                            fragment[3],
+                            a0,
+                            a1,
+                            a2,
+                            a3,
+                            dn_b0[nt],
+                            dn_b1[nt],
+                            asc_val,
+                            sfb_reg[nt] >> scale_shift,
+                            bid_a=kb,
+                            bid_b=kb,
+                        )
+                        fragment[0] = d0
+                        fragment[1] = d1
+                        fragment[2] = d2
+                        fragment[3] = d3
+
+            if cutlass.const_expr(not no_tail_barrier):
+                cute.arch.sync_threads()
+            k64_slice += Int32(1)
+            stage += Int32(1)
+            if stage == Int32(self.stages):
+                stage = Int32(0)
+                stage_phase = stage_phase ^ Int32(1)
+            next_stage += Int32(1)
+            if next_stage == Int32(self.stages):
+                next_stage = Int32(0)
+
+        # Drain any in-flight copies and synchronize before aliasing smem_base
+        # for the coalesced BF16x2 scatter-add epilogue.
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+
+        scatter_n = Int32(scatter_output.shape[1])
+        physical_row_base = source_m_tile * Int32(self.source_tile_m)
+        down_scale = down_alpha[expert_idx].to(cutlass.Float32) * global_scale[
+            0 if cutlass.const_expr(global_scale.shape[0] == 1) else expert_idx
+        ].to(cutlass.Float32)
+
+        # Pad each 256-byte row to 272 bytes (68 u32s) so 8-row writes and
+        # 32-lane row reads are both bank-conflict-free.
+        epi_row_bytes = Int32(272)
+        epi_tok_base = smem_base + Int32(compute_m * 272)
+        epi_scale_base = epi_tok_base + Int32(compute_m * 4)
+        epi_scales = cute.make_tensor(
+            cute.make_ptr(
+                cutlass.Float32,
+                epi_scale_base,
+                cute.AddressSpace.smem,
+                assumed_align=4,
+            ),
+            cute.make_layout(compute_m),
+        )
+        if tid < Int32(compute_m):
+            tok_e = Int32(0)
+            sc_e = cutlass.Float32(0.0)
+            if tid < valid_rows:
+                phys = physical_row_base + tid
+                tok_e = token_map[phys].to(Int32)
+                sc_e = down_scale * token_weights[phys].to(cutlass.Float32)
+            st_shared_u32(epi_tok_base + (tid << Int32(2)), Uint32(tok_e))
+            epi_scales[tid] = sc_e
+        cute.arch.sync_threads()
+
+        local_col_base = warp_idx * Int32(self.tile_n // 4) + (c << Int32(1))
+        for blk in cutlass.range_constexpr(m_blocks):
+            row_lo = Int32(blk * 16) + q
+            row_hi = row_lo + Int32(8)
+            if row_lo < valid_rows:
+                scale_lo = epi_scales[row_lo]
+                row_smem_lo = smem_base + row_lo * epi_row_bytes + (local_col_base << Int32(1))
+                for nt in cutlass.range_constexpr(n_fragments):
+                    fragment = facc[blk][nt]
+                    st_shared_u32(
+                        row_smem_lo + Int32(nt * 16),
+                        pack_f32x2_to_bfloat2(
+                            scale_lo * fragment[0], scale_lo * fragment[1]
+                        ),
+                    )
+            if row_hi < valid_rows:
+                scale_hi = epi_scales[row_hi]
+                row_smem_hi = smem_base + row_hi * epi_row_bytes + (local_col_base << Int32(1))
+                for nt in cutlass.range_constexpr(n_fragments):
+                    fragment = facc[blk][nt]
+                    st_shared_u32(
+                        row_smem_hi + Int32(nt * 16),
+                        pack_f32x2_to_bfloat2(
+                            scale_hi * fragment[2], scale_hi * fragment[3]
+                        ),
+                    )
+        cute.arch.sync_threads()
+
+        out_col_base = output_tile * Int32(self.tile_n)
+        rows_per_warp = compute_m // 4
+        for r in cutlass.range_constexpr(rows_per_warp):
+            row = warp_idx * Int32(rows_per_warp) + Int32(r)
+            if row < valid_rows:
+                tok = ld_shared_u32(epi_tok_base + (row << Int32(2))).to(Int32)
+                row_smem = smem_base + row * epi_row_bytes
+                v0 = ld_shared_u32(row_smem + (lane << Int32(2)))
+                v1 = ld_shared_u32(row_smem + Int32(128) + (lane << Int32(2)))
+                row_ptr_base = Int64(tok) * Int64(scatter_n) + Int64(out_col_base)
+                addr0 = get_ptr_as_int64(
+                    scatter_output, row_ptr_base + Int64(lane << Int32(1))
+                )
+                addr1 = get_ptr_as_int64(
+                    scatter_output, row_ptr_base + Int64(Int32(64) + (lane << Int32(1)))
+                )
+                if cutlass.const_expr(self.deterministic_output):
+                    st_global_u32(addr0, v0)
+                    st_global_u32(addr1, v1)
+                else:
+                    red_add_global_bf16x2(addr0, v0)
+                    red_add_global_bf16x2(addr1, v1)
+        cute.arch.sync_threads()
+
+    @cute.jit
     def _sum_route_partials(
         self,
         route_shared: cute.Tensor,
@@ -1197,11 +1761,33 @@ class W4A8MaterializedPhase2Kernel:
             return
         num_experts = Int32(expert_tile_base.shape[0] - 1)
         source_m_tiles = expert_tile_base[num_experts].to(Int32)
-        task_tail = source_m_tiles * Int32(self.source_halves) * output_tiles
+        total_source_halves = source_m_tiles * Int32(self.source_halves)
+        task_tail = total_source_halves * output_tiles
         task_slot = Int32(bidz)
         while task_slot < task_tail:
-            output_tile = task_slot % output_tiles
-            source_half = task_slot // output_tiles
+            output_tile = Int32(0)
+            source_half = Int32(0)
+            if cutlass.const_expr(self.tile_m == 128):
+                # Strip output_tiles in groups of 8 (1024 BF16 cols) so the
+                # active scatter_output slice stays L2-resident across all
+                # expert scatter-adds while w2 weights remain 1x streamed.
+                group_n = Int32(8)
+                full_strips = output_tiles // group_n
+                strip_tasks = total_source_halves * group_n
+                full_strip_tasks = full_strips * strip_tasks
+                if task_slot < full_strip_tasks:
+                    strip_idx = task_slot // strip_tasks
+                    rem = task_slot % strip_tasks
+                    output_tile = strip_idx * group_n + (rem % group_n)
+                    source_half = rem // group_n
+                else:
+                    rem_n = cutlass.max(output_tiles - full_strips * group_n, Int32(1))
+                    rem = task_slot - full_strip_tasks
+                    output_tile = full_strips * group_n + (rem % rem_n)
+                    source_half = rem // rem_n
+            else:
+                output_tile = task_slot % output_tiles
+                source_half = task_slot // output_tiles
             m_half = source_half % Int32(self.source_halves)
             source_m_tile = source_half // Int32(self.source_halves)
             phase1_meta = source_m_tile * intermediate_tiles
@@ -1244,6 +1830,13 @@ class W4A8MaterializedPhase2Kernel:
                         self._run_task(*task_args, transpose_grouped=True)
                     else:
                         self._run_task(*task_args)
+                elif cutlass.const_expr(self.tile_m == 128):
+                    if valid_rows <= Int32(32):
+                        self._run_task_m128(*task_args, 32)
+                    elif valid_rows <= Int32(64):
+                        self._run_task_m128(*task_args, 64)
+                    else:
+                        self._run_task_m128(*task_args, 128)
                 else:
                     self._run_task(*task_args)
             task_slot += Int32(gdimz)
