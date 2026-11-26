@@ -117,7 +117,9 @@ def validate_query(query):
     counts = (query.batch, query.max_rows, query.in_features, query.out_features)
     if any(type(value) is not int or value <= 0 for value in counts):
         raise ValueError("dense GEMM shape coordinates must be positive integers")
-    alignment = 256 if query.recipe == "mxfp4" else 128
+    alignment = (
+        256 if query.recipe == "mxfp4" else 64 if query.recipe == "mxfp8" else 128
+    )
     if query.in_features % alignment:
         raise ValueError("dense GEMM requires recipe-aligned K")
     fp6 = query.recipe.startswith(("mxfp6_", "w6a8_"))

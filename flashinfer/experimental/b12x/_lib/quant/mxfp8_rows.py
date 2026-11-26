@@ -6,7 +6,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cutlass_dsl import Int32, Uint8, Uint32
+from cutlass.cutlass_dsl import BFloat16, Float32, Int32, Int64, Uint8, Uint32, Uint64
 
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import program_cache
@@ -21,6 +21,8 @@ from b12x._lib.intrinsics.conversion import (
     ue8m0_to_output_scale,
 )
 from b12x._lib.intrinsics.math import fabs_f32, fmax_f32
+from b12x._lib.intrinsics.memory import ld_global_v4_u32, st_global_u64
+from b12x._lib.intrinsics.packed import bfloat2_to_float2_scaled
 from b12x._lib.intrinsics.quantization import max_abs_32, quantize_block_fp8_mx
 from b12x._lib.runtime_control import (
     raise_if_kernel_resolution_frozen,
@@ -509,3 +511,484 @@ def quantize_mxfp8_rows_cute(
         scale_rows,
         scale_mma,
     )
+
+
+class _SwiGLUMXFP8RowsQuantLaunch:
+    """Fused SwiGLU -> BF16 round -> MXFP8 E4M3 + UE8M0 (scale_rows & scale_mma)."""
+
+    def __init__(
+        self,
+        width: int,
+        physical_k: int,
+        subgroup_width: int,
+        threads: int,
+        limit: float,
+        round_silu: bool,
+        clamp_after_silu: bool,
+        swiglu_alpha: float,
+        swiglu_beta: float,
+        min_amax: float,
+        release_dependents: bool = False,
+    ) -> None:
+        self._width = int(width)
+        self._k = int(physical_k)
+        self._groups_k = self._k // 32
+        self._k_tiles = (self._groups_k + 3) // 4
+        self._subgroup_width = int(subgroup_width)
+        self._threads = int(threads)
+        self._warps_per_cta = self._threads // 32
+        self._limit = float(limit)
+        self._has_limit = self._limit != float("inf")
+        self._round_silu = bool(round_silu)
+        self._clamp_after_silu = bool(clamp_after_silu)
+        self._swiglu_alpha = float(swiglu_alpha)
+        self._swiglu_beta = float(swiglu_beta)
+        self._min_amax = float(min_amax)
+        self._release_dependents = bool(release_dependents)
+        self._vec_loads = (self._width % 8) == 0 and (self._k % 8) == 0
+
+    @cute.jit
+    def _swiglu_bf16(self, gate: Float32, up: Float32) -> Float32:
+        if cutlass.const_expr(self._has_limit):
+            if cutlass.const_expr(not self._clamp_after_silu):
+                if gate > Float32(self._limit):
+                    gate = Float32(self._limit)
+            if up > Float32(self._limit):
+                up = Float32(self._limit)
+            if up < Float32(-self._limit):
+                up = Float32(-self._limit)
+        sig = Float32(1.0) / (
+            Float32(1.0)
+            + cute.math.exp(-(Float32(self._swiglu_alpha) * gate), fastmath=True)
+        )
+        activated = gate * sig
+        if cutlass.const_expr(self._has_limit and self._clamp_after_silu):
+            if activated > Float32(self._limit):
+                activated = Float32(self._limit)
+        if cutlass.const_expr(self._round_silu):
+            activated = Float32(BFloat16(activated))
+        # Exact BF16 intermediate rounding matches standalone swiglu -> quantize.
+        return Float32(BFloat16(activated * (up + Float32(self._swiglu_beta))))
+
+    @cute.jit
+    def _store_scale(
+        self,
+        scale_rows: cute.Tensor,
+        scale_mma: cute.Tensor,
+        row: Int32,
+        group: Int32,
+        scale_byte: Uint32,
+    ) -> None:
+        scale_u8 = Uint8(scale_byte)
+        scale_rows[row, group] = scale_u8
+        row32 = row % Int32(32)
+        row4 = (row // Int32(32)) % Int32(4)
+        tile_m = row // Int32(128)
+        k4 = group % Int32(4)
+        tile_k = group // Int32(4)
+        scale_mma_offset = (
+            row32 * Int32(16)
+            + row4 * Int32(4)
+            + tile_m * Int32(self._k_tiles * 512)
+            + k4
+            + tile_k * Int32(512)
+        )
+        scale_mma[scale_mma_offset] = scale_u8
+        if cutlass.const_expr(self._groups_k % 4 != 0):
+            if group == Int32(self._groups_k - 1):
+                for pad_k4 in cutlass.range_constexpr(self._groups_k % 4, 4):
+                    pad_offset = (
+                        row32 * Int32(16)
+                        + row4 * Int32(4)
+                        + tile_m * Int32(self._k_tiles * 512)
+                        + Int32(pad_k4)
+                        + tile_k * Int32(512)
+                    )
+                    scale_mma[pad_offset] = Uint8(127)
+
+    @cute.jit
+    def __call__(
+        self,
+        gate_up_ptr: cute.Pointer,
+        values_ptr: cute.Pointer,
+        scale_rows_ptr: cute.Pointer,
+        scale_mma_ptr: cute.Pointer,
+        m: Int32,
+        grid_x: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        gate_up = cute.make_tensor(
+            gate_up_ptr,
+            cute.make_ordered_layout((m, self._width * 2), order=(1, 0)),
+        )
+        values_u32 = cute.make_tensor(
+            values_ptr,
+            cute.make_ordered_layout((m, self._k // 4), order=(1, 0)),
+        )
+        scale_rows = cute.make_tensor(
+            scale_rows_ptr,
+            cute.make_ordered_layout((m, self._groups_k), order=(1, 0)),
+        )
+        scale_mma = cute.make_tensor(
+            scale_mma_ptr,
+            cute.make_layout((max(512, self._k_tiles * 512),)),
+        )
+        self.kernel(
+            gate_up_ptr,
+            values_ptr,
+            gate_up,
+            values_u32,
+            scale_rows,
+            scale_mma,
+            m,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=[self._threads, 1, 1],
+            cluster=(1, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        gate_up_ptr: cute.Pointer,
+        values_ptr: cute.Pointer,
+        gate_up: cute.Tensor,
+        values_u32: cute.Tensor,
+        scale_rows: cute.Tensor,
+        scale_mma: cute.Tensor,
+        m: Int32,
+    ) -> None:
+        if cutlass.const_expr(self._release_dependents):
+            cute.arch.griddepcontrol_launch_dependents()
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
+        src_addr = Int64(gate_up_ptr.toint())
+        val_addr = Int64(values_ptr.toint())
+        if cutlass.const_expr(self._subgroup_width == 4):
+            warp = Int32(tidx) // Int32(32)
+            lane = Int32(tidx) % Int32(32)
+            subgroup = lane // Int32(4)
+            lane8 = lane % Int32(4)
+            total_blocks = m * Int32(self._groups_k)
+            block_idx = (Int32(bidx) * Int32(self._warps_per_cta) + warp) * Int32(
+                8
+            ) + subgroup
+            block_stride = Int32(gdim) * Int32(self._warps_per_cta * 8)
+            while block_idx < total_blocks:
+                row = block_idx // Int32(self._groups_k)
+                group = block_idx - row * Int32(self._groups_k)
+                values = cute.make_rmem_tensor((8,), Float32)
+                k0 = group * Int32(32) + lane8 * Int32(8)
+                if cutlass.const_expr(self._vec_loads):
+                    if k0 < Int32(self._width):
+                        row_bytes = (
+                            src_addr
+                            + Int64(row) * Int64(self._width * 4)
+                            + Int64(k0) * Int64(2)
+                        )
+                        g_words = ld_global_v4_u32(row_bytes)
+                        u_words = ld_global_v4_u32(row_bytes + Int64(self._width * 2))
+                        for word in cutlass.range_constexpr(4):
+                            g_lo, g_hi = bfloat2_to_float2_scaled(
+                                g_words[word], Float32(1.0)
+                            )
+                            u_lo, u_hi = bfloat2_to_float2_scaled(
+                                u_words[word], Float32(1.0)
+                            )
+                            values[word * 2] = self._swiglu_bf16(g_lo, u_lo)
+                            values[word * 2 + 1] = self._swiglu_bf16(g_hi, u_hi)
+                    else:
+                        for elem in cutlass.range_constexpr(8):
+                            values[elem] = Float32(0.0)
+                else:
+                    for elem in cutlass.range_constexpr(8):
+                        col = k0 + Int32(elem)
+                        if col < Int32(self._width):
+                            g_v = Float32(gate_up[row, col])
+                            u_v = Float32(gate_up[row, col + Int32(self._width)])
+                            values[elem] = self._swiglu_bf16(g_v, u_v)
+                        else:
+                            values[elem] = Float32(0.0)
+                max_abs = fabs_f32(values[0])
+                for elem in cutlass.range_constexpr(1, 8):
+                    max_abs = fmax_f32(max_abs, fabs_f32(values[elem]))
+                for shift in cutlass.range_constexpr(2):
+                    max_abs = fmax_f32(
+                        max_abs,
+                        cute.arch.shuffle_sync_bfly(max_abs, offset=1 << shift),
+                    )
+                if cutlass.const_expr(self._min_amax > 0.0):
+                    max_abs = fmax_f32(max_abs, Float32(self._min_amax))
+                if group * Int32(32) >= Int32(self._width):
+                    max_abs = Float32(0.0)
+                _, scale_byte = pow2_ceil_ue8m0(
+                    max_abs * Float32(1.0 / FLOAT8_E4M3_MAX)
+                )
+                if max_abs == Float32(0.0):
+                    scale_byte = Uint32(127)
+                inv_scale = ue8m0_to_output_scale(scale_byte)
+                lo = cvt_f32x4_to_e4m3x4(
+                    values[0] * inv_scale,
+                    values[1] * inv_scale,
+                    values[2] * inv_scale,
+                    values[3] * inv_scale,
+                )
+                hi = cvt_f32x4_to_e4m3x4(
+                    values[4] * inv_scale,
+                    values[5] * inv_scale,
+                    values[6] * inv_scale,
+                    values[7] * inv_scale,
+                )
+                st_global_u64(
+                    val_addr + Int64(row) * Int64(self._k) + Int64(k0),
+                    (Uint64(hi) << Uint64(32)) | Uint64(lo),
+                )
+                if lane8 == Int32(0):
+                    self._store_scale(scale_rows, scale_mma, row, group, scale_byte)
+                block_idx += block_stride
+        else:
+            warp = Int32(tidx) // Int32(32)
+            lane = Int32(tidx) % Int32(32)
+            subgroup = lane // Int32(8)
+            lane4 = lane % Int32(8)
+            group_tiles = Int32((self._groups_k + 3) // 4)
+            task = Int32(bidx) * Int32(self._warps_per_cta) + warp
+            total_tasks = m * group_tiles
+            while task < total_tasks:
+                row = task // group_tiles
+                group = (task % group_tiles) * Int32(4) + subgroup
+                if group < Int32(self._groups_k):
+                    values = cute.make_rmem_tensor((4,), Float32)
+                    k0 = group * Int32(32) + lane4 * Int32(4)
+                    for elem in cutlass.range_constexpr(4):
+                        col = k0 + Int32(elem)
+                        if col < Int32(self._width):
+                            g_v = Float32(gate_up[row, col])
+                            u_v = Float32(gate_up[row, col + Int32(self._width)])
+                            values[elem] = self._swiglu_bf16(g_v, u_v)
+                        else:
+                            values[elem] = Float32(0.0)
+                    max_abs = fabs_f32(values[0])
+                    for elem in cutlass.range_constexpr(1, 4):
+                        max_abs = fmax_f32(max_abs, fabs_f32(values[elem]))
+                    for shift in cutlass.range_constexpr(3):
+                        max_abs = fmax_f32(
+                            max_abs,
+                            cute.arch.shuffle_sync_bfly(max_abs, offset=1 << shift),
+                        )
+                    if cutlass.const_expr(self._min_amax > 0.0):
+                        max_abs = fmax_f32(max_abs, Float32(self._min_amax))
+                    if group * Int32(32) >= Int32(self._width):
+                        max_abs = Float32(0.0)
+                    _, scale_byte = pow2_ceil_ue8m0(
+                        max_abs * Float32(1.0 / FLOAT8_E4M3_MAX)
+                    )
+                    inv_scale = ue8m0_to_output_scale(scale_byte)
+                    values_u32[row, group * Int32(8) + lane4] = cvt_f32x4_to_e4m3x4(
+                        values[0] * inv_scale,
+                        values[1] * inv_scale,
+                        values[2] * inv_scale,
+                        values[3] * inv_scale,
+                    )
+                    if lane4 == Int32(0):
+                        self._store_scale(scale_rows, scale_mma, row, group, scale_byte)
+                task += Int32(gdim) * Int32(self._warps_per_cta)
+
+
+@program_cache
+def _get_compiled_swiglu_mxfp8_rows_quant(
+    width: int,
+    physical_k: int,
+    subgroup_width: int,
+    threads: int,
+    limit: float,
+    round_silu: bool,
+    clamp_after_silu: bool,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    min_amax: float = 0.0,
+    release_dependents: bool = False,
+    *,
+    device_ordinal: int | None = None,
+    sm_count: int | None = None,
+) -> Callable:
+    width = int(width)
+    physical_k = int(physical_k)
+    device_ordinal = (
+        torch.cuda.current_device() if device_ordinal is None else device_ordinal
+    )
+    sm_count = (
+        torch.cuda.get_device_properties(device_ordinal).multi_processor_count
+        if sm_count is None
+        else sm_count
+    )
+    if width <= 0 or physical_k < width or physical_k % 32 != 0:
+        raise ValueError(
+            "SwiGLU MXFP8 quantizer requires positive width and physical_k >= width "
+            f"divisible by 32, got width={width}, physical_k={physical_k}"
+        )
+    if subgroup_width not in (4, 8):
+        raise ValueError(
+            f"SwiGLU MXFP8 quantizer subgroup_width must be 4 or 8, got {subgroup_width}"
+        )
+    if min_amax not in (0.0, 1e-4):
+        raise ValueError("MXFP8 min_amax must be 0.0 or 1e-4")
+    launch = _SwiGLUMXFP8RowsQuantLaunch(
+        width,
+        physical_k,
+        subgroup_width,
+        threads,
+        limit,
+        round_silu,
+        clamp_after_silu,
+        swiglu_alpha,
+        swiglu_beta,
+        min_amax,
+        release_dependents,
+    )
+    cache_key = (
+        width,
+        physical_k,
+        int(subgroup_width),
+        int(threads),
+        None if limit == float("inf") else float(limit),
+        bool(round_silu),
+        bool(clamp_after_silu),
+        float(swiglu_alpha),
+        float(swiglu_beta),
+        float(min_amax),
+        bool(release_dependents),
+    )
+    raise_if_kernel_resolution_frozen(
+        "cute.compile",
+        target=launch,
+        cache_key=cache_key,
+    )
+    with torch.cuda.device(device_ordinal):
+        raw = b12x_compile(
+            launch,
+            make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
+            1,
+            1,
+            current_cuda_stream(),
+            compile_spec=KernelCompileSpec.from_key(
+                "gemm.swiglu_mxfp8_quant_cute",
+                2,
+                cache_key,
+            ),
+        )
+
+    def launch_tensors(
+        gate_up: torch.Tensor,
+        values: torch.Tensor,
+        scale_rows: torch.Tensor,
+        scale_mma: torch.Tensor,
+    ) -> None:
+        if subgroup_width == 4:
+            total_blocks = int(gate_up.shape[0]) * (physical_k // 32)
+            blocks_per_cta = (threads // 32) * 8
+            natural_grid = max(1, (total_blocks + blocks_per_cta - 1) // blocks_per_cta)
+            grid_x = min(natural_grid, sm_count * _GRID_CTAS_PER_SM)
+        else:
+            groups_per_warp = 32 // subgroup_width
+            total_tasks = int(gate_up.shape[0]) * (
+                (physical_k // 32 + groups_per_warp - 1) // groups_per_warp
+            )
+            warps_per_cta = threads // 32
+            natural_grid = max(1, (total_tasks + warps_per_cta - 1) // warps_per_cta)
+            grid_x = min(natural_grid, sm_count * _GRID_CTAS_PER_SM)
+        raw(
+            make_ptr(
+                cutlass.BFloat16,
+                gate_up.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.Uint32,
+                values.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.Uint8,
+                scale_rows.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.Uint8,
+                scale_mma.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            int(gate_up.shape[0]),
+            grid_x,
+            current_cuda_stream(),
+        )
+
+    return attach_programs(launch_tensors, raw)
+
+
+def swiglu_quantize_mxfp8_rows_cute(
+    gate_up: torch.Tensor,
+    values: torch.Tensor,
+    scale_rows: torch.Tensor,
+    scale_mma: torch.Tensor,
+    *,
+    limit: float = float("inf"),
+    round_silu: bool = False,
+    clamp_after_silu: bool = False,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
+    expected_m: int | None = None,
+    min_amax: float = 0.0,
+    release_dependents: bool = False,
+) -> None:
+    """Fused SwiGLU -> BF16 round -> MXFP8 E4M3 + UE8M0 quantization."""
+    if gate_up.dtype != torch.bfloat16:
+        raise TypeError(
+            f"SwiGLU MXFP8 quantizer requires BF16 gate_up input, got {gate_up.dtype}"
+        )
+    if gate_up.ndim != 2 or not gate_up.is_contiguous() or gate_up.shape[1] % 2 != 0:
+        raise ValueError(
+            "SwiGLU MXFP8 quantizer requires contiguous BF16 [M, 2*N] input"
+        )
+    if gate_up.data_ptr() % 16 != 0:
+        raise ValueError("SwiGLU MXFP8 gate_up must be 16-byte aligned")
+    rows = int(gate_up.shape[0])
+    width = int(gate_up.shape[1]) // 2
+    if (
+        values.ndim != 2
+        or int(values.shape[0]) != rows
+        or values.dtype != torch.float8_e4m3fn
+        or not values.is_contiguous()
+        or values.data_ptr() % 16 != 0
+    ):
+        raise ValueError("SwiGLU MXFP8 values must be aligned contiguous [M, K] E4M3")
+    physical_k = int(values.shape[1])
+    if physical_k < width or physical_k % 32 != 0:
+        raise ValueError(
+            f"SwiGLU MXFP8 values K={physical_k} must be >= {width} and divisible by 32"
+        )
+    planned_rows = rows if expected_m is None else int(expected_m)
+    subgroup_width, threads = mxfp8_rows_quant_launch_options(planned_rows, "linear")
+    _get_compiled_swiglu_mxfp8_rows_quant(
+        width,
+        physical_k,
+        subgroup_width,
+        threads,
+        limit,
+        round_silu,
+        clamp_after_silu,
+        swiglu_alpha,
+        swiglu_beta,
+        min_amax,
+        release_dependents,
+        device_ordinal=gate_up.device.index,
+    )(gate_up, values, scale_rows, scale_mma)
