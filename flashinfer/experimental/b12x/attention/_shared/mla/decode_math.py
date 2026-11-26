@@ -1092,14 +1092,15 @@ def s1_qk_dsv41_source_decode(
     row_addr = kv_base_addr + kv_gid_row * Int32(kv_row_stride)
 
     valid = ld_shared_u32(row_addr + Int32(tag_off)) == expected_tag
-    all_valid = cute.arch.vote_all_sync(valid)
     none_valid = cute.arch.vote_all_sync(not valid)
 
     q0, q1, q2, q3 = qk[0], qk[1], qk[2], qk[3]
 
-    if all_valid:
+    if not none_valid:
         if cutlass.const_expr(swa):
-            sw0, sw1, sw2, sw3 = ld_shared_v4_u32(row_addr + Int32(512))
+            sw0, sw1, sw2, sw3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+            if valid:
+                sw0, sw1, sw2, sw3 = ld_shared_v4_u32(row_addr + Int32(512))
             sc_words = (sw0, sw1, sw2, sw3)
             lane_data_base = row_addr + tid * Int32(2)
             for blk in cutlass.range_constexpr(num_scales):
@@ -1110,54 +1111,9 @@ def s1_qk_dsv41_source_decode(
                     p0 = ld_shared_u16_offset(lane_data_base, ko_imm)
                     p1 = ld_shared_u16_offset(lane_data_base, ko_imm + 8)
                     b0, b1 = _mixed_pairs_to_bf16x2_sm120(p0, p1, scale_byte, swa=True)
-                    a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (
-                        Int32(ko_imm) + a_col
-                    ) * Int32(2)
-                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(q_nope_bf16_base_addr + a_byte)
-                    q0, q1, q2, q3 = mma_m16n8k16_f32_bf16(
-                        q0, q1, q2, q3, a0, a1, a2, a3, b0, b1
-                    )
-        else:
-            sw0, sw1, sw2, sw3 = ld_shared_v4_u32(row_addr + Int32(256))
-            sw4, sw5, sw6, sw7 = ld_shared_v4_u32(row_addr + Int32(272))
-            sc_words = (sw0, sw1, sw2, sw3, sw4, sw5, sw6, sw7)
-            lane_data_base = row_addr + tid
-            for blk in cutlass.range_constexpr(num_scales):
-                for ks in cutlass.range_constexpr(quant_tile // 16):
-                    ko_imm = blk * quant_tile + ks * 16
-                    byte_imm = blk * 32 + ks * 8
-                    scale_byte = _extract_u8(sc_words[blk], ks)
-                    p0 = ld_shared_u8_offset(lane_data_base, byte_imm)
-                    p1 = ld_shared_u8_offset(lane_data_base, byte_imm + 4)
-                    b0, b1 = _mixed_pairs_to_bf16x2_sm120(p0, p1, scale_byte, swa=False)
-                    a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (
-                        Int32(ko_imm) + a_col
-                    ) * Int32(2)
-                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(q_nope_bf16_base_addr + a_byte)
-                    q0, q1, q2, q3 = mma_m16n8k16_f32_bf16(
-                        q0, q1, q2, q3, a0, a1, a2, a3, b0, b1
-                    )
-    elif not none_valid:
-        if cutlass.const_expr(swa):
-            sw0, sw1, sw2, sw3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-            if valid:
-                sw0, sw1, sw2, sw3 = ld_shared_v4_u32(row_addr + Int32(512))
-            sc_words = (sw0, sw1, sw2, sw3)
-            lane_data_base = row_addr + tid * Int32(2)
-            for blk in cutlass.range_constexpr(num_scales):
-                for ks in cutlass.range_constexpr(quant_tile // 16):
-                    ko_imm = blk * quant_tile + ks * 16
-                    b0, b1 = Uint32(0), Uint32(0)
-                    if valid:
-                        scale_idx = blk * 2 + (ks // 2)
-                        scale_byte = _extract_u8(
-                            sc_words[scale_idx // 4], scale_idx % 4
-                        )
-                        p0 = ld_shared_u16_offset(lane_data_base, ko_imm)
-                        p1 = ld_shared_u16_offset(lane_data_base, ko_imm + 8)
-                        b0, b1 = _mixed_pairs_to_bf16x2_sm120(
-                            p0, p1, scale_byte, swa=True
-                        )
+                    if not valid:
+                        b0 = Uint32(0)
+                        b1 = Uint32(0)
                     a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (
                         Int32(ko_imm) + a_col
                     ) * Int32(2)
@@ -1177,14 +1133,13 @@ def s1_qk_dsv41_source_decode(
                 for ks in cutlass.range_constexpr(quant_tile // 16):
                     ko_imm = blk * quant_tile + ks * 16
                     byte_imm = blk * 32 + ks * 8
-                    b0, b1 = Uint32(0), Uint32(0)
-                    if valid:
-                        scale_byte = _extract_u8(sc_words[blk], ks)
-                        p0 = ld_shared_u8_offset(lane_data_base, byte_imm)
-                        p1 = ld_shared_u8_offset(lane_data_base, byte_imm + 4)
-                        b0, b1 = _mixed_pairs_to_bf16x2_sm120(
-                            p0, p1, scale_byte, swa=False
-                        )
+                    scale_byte = _extract_u8(sc_words[blk], ks)
+                    p0 = ld_shared_u8_offset(lane_data_base, byte_imm)
+                    p1 = ld_shared_u8_offset(lane_data_base, byte_imm + 4)
+                    b0, b1 = _mixed_pairs_to_bf16x2_sm120(p0, p1, scale_byte, swa=False)
+                    if not valid:
+                        b0 = Uint32(0)
+                        b1 = Uint32(0)
                     a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (
                         Int32(ko_imm) + a_col
                     ) * Int32(2)
@@ -3136,7 +3091,6 @@ def s6_xv_dsv41_source_decode(
         if t8 == expected_tag:
             valid_mask = valid_mask | Uint32(1 << (ks_t * 2 + 1))
 
-    all_valid = cute.arch.vote_all_sync(valid_mask == Uint32(0xFF))
     none_valid = cute.arch.vote_all_sync(valid_mask == Uint32(0))
 
     if cutlass.const_expr(swa):
@@ -3146,14 +3100,14 @@ def s6_xv_dsv41_source_decode(
         data_row_base = row0_base + warp_id * Int32(4) + (gid >> Int32(1))
         scale_row_base = row0_base + (warp_id >> Int32(1))
 
-    for vc in cutlass.range_constexpr(n_v_chunks):
-        for nt in cutlass.range_constexpr(nt_per_warp_xv):
-            xv0 = Float32(0.0)
-            xv1 = Float32(0.0)
-            xv2 = Float32(0.0)
-            xv3 = Float32(0.0)
+    if not none_valid:
+        for vc in cutlass.range_constexpr(n_v_chunks):
+            for nt in cutlass.range_constexpr(nt_per_warp_xv):
+                xv0 = Float32(0.0)
+                xv1 = Float32(0.0)
+                xv2 = Float32(0.0)
+                xv3 = Float32(0.0)
 
-            if all_valid:
                 for ks in cutlass.range_constexpr(bi // 16):
                     r0_imm = ks * 16 * kv_row_stride
                     r8_imm = (ks * 16 + 8) * kv_row_stride
@@ -3175,46 +3129,10 @@ def s6_xv_dsv41_source_decode(
                         p8 = ld_shared_u8_offset(data_row_base, r8_imm + d_imm)
                         sc8 = ld_shared_u8_offset(scale_row_base, r8_imm + s_imm)
                         pair8 = nvfp4_pair_to_bf16x2_sm120(p8, sc8)
-                    peer0 = cute.arch.shuffle_sync_bfly(pair0, offset=4)
-                    peer8 = cute.arch.shuffle_sync_bfly(pair8, offset=4)
-                    b0 = byte_perm(pair0, peer0, pair_selector)
-                    b1 = byte_perm(pair8, peer8, pair_selector)
-
-                    a_byte = (
-                        a_row * Int32(p_stride) + (Int32(ks * 16) + a_col)
-                    ) * Int32(2)
-                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sm_p_full_addr + a_byte)
-                    xv0, xv1, xv2, xv3 = mma_m16n8k16_f32_bf16(
-                        xv0, xv1, xv2, xv3, a0, a1, a2, a3, b0, b1
-                    )
-            elif not none_valid:
-                for ks in cutlass.range_constexpr(bi // 16):
-                    r0_imm = ks * 16 * kv_row_stride
-                    r8_imm = (ks * 16 + 8) * kv_row_stride
-                    pair0 = Uint32(0)
-                    pair8 = Uint32(0)
-                    if cutlass.const_expr(swa):
-                        d_imm = vc * v_chunk + nt * n_warps * 8
-                        s_imm = 512 + (vc * v_chunk + nt * n_warps * 8) // 32
-                        if (valid_mask & Uint32(1 << (ks * 2))) != Uint32(0):
-                            p0 = ld_shared_u16_offset(data_row_base, r0_imm + d_imm)
-                            sc0 = ld_shared_u8_offset(scale_row_base, r0_imm + s_imm)
-                            pair0 = mxfp8_pair_to_bf16x2_sm120(p0, sc0)
-                        if (valid_mask & Uint32(1 << (ks * 2 + 1))) != Uint32(0):
-                            p8 = ld_shared_u16_offset(data_row_base, r8_imm + d_imm)
-                            sc8 = ld_shared_u8_offset(scale_row_base, r8_imm + s_imm)
-                            pair8 = mxfp8_pair_to_bf16x2_sm120(p8, sc8)
-                    else:
-                        d_imm = (vc * v_chunk + nt * n_warps * 8) // 2
-                        s_imm = 256 + (vc * v_chunk + nt * n_warps * 8) // 16
-                        if (valid_mask & Uint32(1 << (ks * 2))) != Uint32(0):
-                            p0 = ld_shared_u8_offset(data_row_base, r0_imm + d_imm)
-                            sc0 = ld_shared_u8_offset(scale_row_base, r0_imm + s_imm)
-                            pair0 = nvfp4_pair_to_bf16x2_sm120(p0, sc0)
-                        if (valid_mask & Uint32(1 << (ks * 2 + 1))) != Uint32(0):
-                            p8 = ld_shared_u8_offset(data_row_base, r8_imm + d_imm)
-                            sc8 = ld_shared_u8_offset(scale_row_base, r8_imm + s_imm)
-                            pair8 = nvfp4_pair_to_bf16x2_sm120(p8, sc8)
+                    if (valid_mask & Uint32(1 << (ks * 2))) == Uint32(0):
+                        pair0 = Uint32(0)
+                    if (valid_mask & Uint32(1 << (ks * 2 + 1))) == Uint32(0):
+                        pair8 = Uint32(0)
                     peer0 = cute.arch.shuffle_sync_bfly(pair0, offset=4)
                     peer8 = cute.arch.shuffle_sync_bfly(pair8, offset=4)
                     b0 = byte_perm(pair0, peer0, pair_selector)
@@ -3228,11 +3146,11 @@ def s6_xv_dsv41_source_decode(
                         xv0, xv1, xv2, xv3, a0, a1, a2, a3, b0, b1
                     )
 
-            at = vc * nt_per_warp_xv + nt
-            acc_nope[at][0] = acc_nope[at][0] + xv0
-            acc_nope[at][1] = acc_nope[at][1] + xv1
-            acc_nope[at][2] = acc_nope[at][2] + xv2
-            acc_nope[at][3] = acc_nope[at][3] + xv3
+                at = vc * nt_per_warp_xv + nt
+                acc_nope[at][0] = acc_nope[at][0] + xv0
+                acc_nope[at][1] = acc_nope[at][1] + xv1
+                acc_nope[at][2] = acc_nope[at][2] + xv2
+                acc_nope[at][3] = acc_nope[at][3] + xv3
     return acc_nope
 
 
