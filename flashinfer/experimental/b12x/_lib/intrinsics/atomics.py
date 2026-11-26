@@ -632,6 +632,28 @@ def st_shared_bf16_from_f32(addr: Int32, val: Float32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def st_shared_bf16x2_from_f32(
+    addr: Int32, v0: Float32, v1: Float32, *, loc=None, ip=None
+):
+    """Convert two float32 values to BF16x2 and store 32 bits to shared memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(addr).ir_value(loc=loc, ip=ip),
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b32 tmp; cvt.rn.bf16x2.f32 tmp, $2, $1; st.shared.b32 [$0], tmp; }",
+        "r,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def st_shared_f16_from_f32(addr: Int32, val: Float32, *, loc=None, ip=None):
     """Convert float32 to FP16 and store one 16-bit value to shared memory."""
     llvm.inline_asm(
