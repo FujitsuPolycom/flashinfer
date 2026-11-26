@@ -1,4 +1,4 @@
-"""SM120 cluster-parallel split-lagged mHC kernels for decode, verify, and draft (M <= 8).
+"""SM120 cluster-parallel split-lagged mHC kernels for decode, verify, and draft (M <= 128).
 
 In lagged hyperconnections, the branch input ``y = RMSNorm(contract(pre_mix, residual_out))``
 depends only on ``residual_out`` and ``pre_mix`` — not on ``fn @ residual_out`` or the
@@ -6,12 +6,13 @@ Sinkhorn projection (``pre_out, post_out, comb_out``), which are not consumed un
 the sublayer's tensor-parallel AllReduce.
 
 Splitting mHC into two stages separates the critical path from the coefficient projection:
-1. ``ClusterMhcPostYNorm`` (main stream): SM120 cluster-parallel post-update, lagged
-   contraction, and distributed-shared-memory-reduced RMSNorm, with optional bit-exact
-   MXFP8 quantization matching ``quantize_mxfp8_rows_cute``.
-2. ``ReadOnlyFnPartialM8`` + ``_SplitFinalize`` (auxiliary stream): reads the finalized
-   residual stream and computes ``fn @ residual_out`` plus Sinkhorn normalization
-   concurrently with the sublayer's tensor-parallel AllReduce.
+1. ``ClusterMhcPostYNorm`` (main stream): SM120 cluster-parallel (or single-CTA for wide
+   batches) post-update, lagged contraction, and RMSNorm, with optional bit-exact MXFP8
+   quantization matching ``quantize_mxfp8_rows_cute``.
+2. ``ReadOnlyFnPartialM8`` (M <= 8) or ``ReadOnlyFnPartial`` (9 <= M <= 128) followed by
+   ``_SplitFinalize`` (auxiliary stream): reads the finalized residual stream and computes
+   ``fn @ residual_out`` plus Sinkhorn normalization concurrently with the sublayer's
+   tensor-parallel AllReduce.
 """
 
 from __future__ import annotations
@@ -61,9 +62,24 @@ from ._kernels import (
     _warp_quad_allreduce_sum,
 )
 
-SPLIT_LAGGED_MAX_TOKENS = 8
+SPLIT_LAGGED_MAX_TOKENS = 128
 SPLIT_LAGGED_HIDDEN_SIZES = (4096, 5120, 7168)
 _PARTIAL_STRIDE = 32
+
+
+def split_lagged_cluster_size(tokens: int) -> int:
+    """Return the SM120 CTA-per-row cluster size for ``ClusterMhcPostYNorm``.
+
+    Smaller batches split each hidden row across an 8-CTA or 4-CTA DSM cluster to
+    minimize per-row latency; wider batches (M > 48) already saturate SM120 SMs
+    with one CTA per row and avoid hardware cluster-slot serialization.
+    """
+    tokens = int(tokens)
+    if tokens <= 16:
+        return 8
+    if tokens <= 48:
+        return 4
+    return 1
 
 
 def supports_split_lagged(
@@ -149,6 +165,10 @@ class ClusterMhcPostYNorm:
             )
         self.threads = ((self.packs_per_cta + 31) // 32) * 32
         self.num_warps = self.threads // 32
+        if self.threads > 1024 or self.num_warps > 32:
+            raise ValueError(
+                f"ClusterMhcPostYNorm requires threads <= 1024, got {self.threads}"
+            )
         self.emit_mxfp8 = bool(emit_mxfp8)
 
     @cute.jit
@@ -167,7 +187,7 @@ class ClusterMhcPostYNorm:
         tokens: Int32,
         stream: cuda.CUstream,
     ):
-        self.kernel(
+        launch_call = self.kernel(
             x_ptr,
             res_ptr,
             cute.make_tensor(prev_post_ptr, cute.make_layout((Int64(1) << Int64(30),))),
@@ -181,12 +201,20 @@ class ClusterMhcPostYNorm:
                 a_values_u32_ptr, cute.make_layout((Int64(1) << Int64(30),))
             ),
             cute.make_tensor(a_scales_ptr, cute.make_layout((Int64(1) << Int64(30),))),
-        ).launch(
-            grid=(self.cluster_size, tokens, 1),
-            block=(self.threads, 1, 1),
-            cluster=(self.cluster_size, 1, 1),
-            stream=stream,
         )
+        if const_expr(self.cluster_size > 1):
+            launch_call.launch(
+                grid=(self.cluster_size, tokens, 1),
+                block=(self.threads, 1, 1),
+                cluster=(self.cluster_size, 1, 1),
+                stream=stream,
+            )
+        else:
+            launch_call.launch(
+                grid=(1, tokens, 1),
+                block=(self.threads, 1, 1),
+                stream=stream,
+            )
 
     @cute.kernel
     def kernel(
@@ -208,7 +236,7 @@ class ClusterMhcPostYNorm:
         lane, warp = tid % 32, tid // 32
 
         smem = utils.SmemAllocator()
-        warp_sq = smem.allocate_tensor(Float32, cute.make_layout((16,)), 16)
+        warp_sq = smem.allocate_tensor(Float32, cute.make_layout((32,)), 16)
         cta_sq = smem.allocate_tensor(Float32, cute.make_layout((1,)), 16)
         cta_sq_u32 = shared_ptr_to_u32(cta_sq.iterator)
 
@@ -399,12 +427,16 @@ class ClusterMhcPostYNorm:
             ct = _warp_allreduce_sum(ct)
             if lane == 0:
                 cta_sq[0] = ct
-        # Cluster-wide DSM reduction (~25ns)
-        cute.arch.cluster_arrive()
-        cute.arch.cluster_wait()
-        tot = Float32(0.0)
-        for cr in cutlass.range_constexpr(self.cluster_size):
-            tot += _ld_dsm_f32(cta_sq_u32, Int32(cr))
+        if const_expr(self.cluster_size > 1):
+            # Cluster-wide DSM reduction (~25ns)
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+            tot = Float32(0.0)
+            for cr in cutlass.range_constexpr(self.cluster_size):
+                tot += _ld_dsm_f32(cta_sq_u32, Int32(cr))
+        else:
+            cute.arch.sync_threads()
+            tot = cta_sq[0]
         inv = cute.math.rsqrt(
             tot / Float32(self.hidden) + Float32(self.norm_eps), fastmath=True
         )
@@ -503,9 +535,10 @@ class ClusterMhcPostYNorm:
                         Int64(row) * Int64(self.hidden // 32) + Int64(pack >> Int32(2))
                     ] = scale_byte.to(Uint8)
 
-        # Hold shared memory until every CTA in the cluster has read cta_sq
-        cute.arch.cluster_arrive()
-        cute.arch.cluster_wait()
+        if const_expr(self.cluster_size > 1):
+            # Hold shared memory until every CTA in the cluster has read cta_sq
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
 
 
 class ReadOnlyFnPartialM8:
@@ -652,6 +685,175 @@ class ReadOnlyFnPartialM8:
             partials[pbase] = sq_r
 
 
+class ReadOnlyFnPartial:
+    """Read-only ``residual_out @ fn.T`` partial projection for M <= 128 (tile_m=32, 6 TF32 warps).
+
+    Uses a 2D ``(ceil(tokens / 32), hidden // 32, 1)`` grid with 20.6 KiB SMEM per CTA
+    (``a[32, 128]`` BF16 + ``b[24, 128]`` FP32, stride 132) and compensated TF32
+    ``m16n8k8`` MMAs matching ``_FusedPartial`` bit-for-bit.
+    """
+
+    def __init__(self, hidden: int):
+        self.hidden = int(hidden)
+        self.splits = self.hidden // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        res_ptr: cute.Pointer,
+        fn_ptr: cute.Pointer,
+        partials_ptr: cute.Pointer,
+        tokens: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            cute.make_tensor(res_ptr, cute.make_layout((Int64(1) << Int64(30),))),
+            fn_ptr,
+            cute.make_tensor(partials_ptr, cute.make_layout((Int64(1) << Int64(30),))),
+            tokens,
+        ).launch(
+            grid=((tokens + Int32(31)) // Int32(32), self.splits, 1),
+            block=(256, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        residual_out: cute.Tensor,
+        fn_ptr: cute.Pointer,
+        partials: cute.Tensor,
+        tokens: Int32,
+    ):
+        tile, split, _ = cute.arch.block_idx()
+        tid, _, _ = cute.arch.thread_idx()
+        lane, warp = tid % 32, tid // 32
+        smem = utils.SmemAllocator()
+        a = smem.allocate_tensor(
+            BFloat16, cute.make_layout((32, 128), stride=(132, 1)), 16
+        )
+        b = smem.allocate_tensor(
+            Float32, cute.make_layout((24, 128), stride=(132, 1)), 16
+        )
+        bbase = shared_ptr_to_u32(b.iterator)
+        fn_base = Int64(fn_ptr.toint())
+        hbase = split * 32
+        for i in cutlass.range_constexpr(3):
+            linear = i * 1024 + tid * 4
+            n, k = linear // 128, linear % 128
+            src = (
+                Int64(n) * Int64(4 * self.hidden)
+                + Int64(k // 32) * Int64(self.hidden)
+                + Int64(hbase + k % 32)
+            )
+            dst = bbase + (n * 132 + k) * 4
+            address = fn_base + src * Int64(4)
+            if (address & Int64(15)) == Int64(0):
+                cp_async4_shared_global(dst, address)
+            else:
+                for part in cutlass.range_constexpr(4):
+                    cp_async_u32_shared_global(
+                        dst + part * 4, address + Int64(part * 4)
+                    )
+        cute.arch.cp_async_commit_group()
+
+        m_base = tile * Int32(32)
+        h = hbase + lane
+        for mi in cutlass.range_constexpr(4):
+            localrow = warp + mi * 8
+            row = m_base + localrow
+            r0, r1, r2, r3 = Float32(0), Float32(0), Float32(0), Float32(0)
+            sq_r_acc = Float32(0.0)
+            if row < tokens:
+                rbase = Int64(row) * Int64(4 * self.hidden) + Int64(h)
+                r0 = Float32(residual_out[rbase + Int64(0 * self.hidden)])
+                r1 = Float32(residual_out[rbase + Int64(1 * self.hidden)])
+                r2 = Float32(residual_out[rbase + Int64(2 * self.hidden)])
+                r3 = Float32(residual_out[rbase + Int64(3 * self.hidden)])
+                sq_r_acc = r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3
+            a[localrow, 0 + lane] = r0.to(BFloat16)
+            a[localrow, 32 + lane] = r1.to(BFloat16)
+            a[localrow, 64 + lane] = r2.to(BFloat16)
+            a[localrow, 96 + lane] = r3.to(BFloat16)
+            sq_r = _warp_allreduce_sum(sq_r_acc)
+            if lane == 0 and row < tokens:
+                pbase = (Int64(row) * Int64(self.splits) + Int64(split)) * Int64(
+                    _PARTIAL_STRIDE
+                )
+                partials[pbase] = sq_r
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+
+        group, sub = lane // 4, lane % 4
+        row0 = (warp // 3) * 16 + group
+        row1 = row0 + 8
+        mix = (warp % 3) * 8 + group
+        n0 = (warp % 3) * 8 + sub * 2
+        if warp < 6 and m_base + (warp // 3) * 16 < tokens:
+            total0, total1, total2, total3 = (
+                Float32(0),
+                Float32(0),
+                Float32(0),
+                Float32(0),
+            )
+            hi0, hi1, hi2, hi3 = Float32(0), Float32(0), Float32(0), Float32(0)
+            lo0, lo1, lo2, lo3 = Float32(0), Float32(0), Float32(0), Float32(0)
+            for kk in cutlass.range_constexpr(16):
+                k0 = kk * 8 + sub
+                k1 = k0 + 4
+                a0 = f32_to_raw_bits(Float32(a[row0, k0]))
+                a1 = f32_to_raw_bits(Float32(a[row1, k0]))
+                a2 = f32_to_raw_bits(Float32(a[row0, k1]))
+                a3 = f32_to_raw_bits(Float32(a[row1, k1]))
+                b0 = Float32(b[mix, k0])
+                b1 = Float32(b[mix, k1])
+                h0, h1 = f32_to_tf32_bits(b0), f32_to_tf32_bits(b1)
+                hi0, hi1, hi2, hi3 = tf32_mma_m16n8k8_f32(
+                    hi0, hi1, hi2, hi3, a0, a1, a2, a3, h0, h1
+                )
+                lo0, lo1, lo2, lo3 = tf32_mma_m16n8k8_f32(
+                    lo0,
+                    lo1,
+                    lo2,
+                    lo3,
+                    a0,
+                    a1,
+                    a2,
+                    a3,
+                    _tf32_residual_bits(b0, h0),
+                    _tf32_residual_bits(b1, h1),
+                )
+                if const_expr(kk % 4 == 3):
+                    total0 += hi0 + lo0
+                    total1 += hi1 + lo1
+                    total2 += hi2 + lo2
+                    total3 += hi3 + lo3
+                    hi0, hi1, hi2, hi3 = (
+                        Float32(0),
+                        Float32(0),
+                        Float32(0),
+                        Float32(0),
+                    )
+                    lo0, lo1, lo2, lo3 = (
+                        Float32(0),
+                        Float32(0),
+                        Float32(0),
+                        Float32(0),
+                    )
+            if m_base + row0 < tokens:
+                p0 = (Int64(m_base + row0) * Int64(self.splits) + Int64(split)) * Int64(
+                    _PARTIAL_STRIDE
+                )
+                partials[p0 + Int64(n0 + 1)] = total0
+                partials[p0 + Int64(n0 + 2)] = total1
+            if m_base + row1 < tokens:
+                p1 = (Int64(m_base + row1) * Int64(self.splits) + Int64(split)) * Int64(
+                    _PARTIAL_STRIDE
+                )
+                partials[p1 + Int64(n0 + 1)] = total2
+                partials[p1 + Int64(n0 + 2)] = total3
+
+
 class _SplitFinalize:
     """Reduce split-K partials and run Sinkhorn to produce (pre_out, post_out, comb_out)."""
 
@@ -776,33 +978,17 @@ def compile_cluster_post_y_norm(
     norm_eps: float,
     norm_dtype: torch.dtype,
     *,
-    cluster_size: int = 8,
+    cluster_size: int | None = None,
     emit_mxfp8: bool = False,
 ):
     hidden = int(hidden)
     pre_only = bool(pre_only)
     norm_eps = float(norm_eps)
     norm_is_bf16 = norm_dtype == torch.bfloat16
-    cluster_size = int(cluster_size)
     emit_mxfp8 = bool(emit_mxfp8)
     norm_cute_dt = BFloat16 if norm_is_bf16 else Float32
+    cluster_sizes = (8, 4, 1) if cluster_size is None else (int(cluster_size),)
 
-    kernel = ClusterMhcPostYNorm(
-        hidden,
-        pre_only,
-        norm_eps,
-        norm_is_bf16,
-        cluster_size=cluster_size,
-        emit_mxfp8=emit_mxfp8,
-    )
-    key = (
-        hidden,
-        pre_only,
-        norm_eps,
-        "bf16" if norm_is_bf16 else "fp32",
-        cluster_size,
-        emit_mxfp8,
-    )
     fake = (
         make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -815,16 +1001,37 @@ def compile_cluster_post_y_norm(
         make_ptr(Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
     )
+    compiled_by_cluster: dict[int, object] = {}
     with torch.cuda.device(ordinal):
-        raw = b12x_compile(
-            kernel,
-            *fake,
-            Int32(1),
-            current_cuda_stream(),
-            compile_spec=KernelCompileSpec.from_key(
-                "norm.mhc.cluster_post_y_norm", 1, key
-            ),
-        )
+        for cs in cluster_sizes:
+            kernel = ClusterMhcPostYNorm(
+                hidden,
+                pre_only,
+                norm_eps,
+                norm_is_bf16,
+                cluster_size=cs,
+                emit_mxfp8=emit_mxfp8,
+            )
+            key = (
+                hidden,
+                pre_only,
+                norm_eps,
+                "bf16" if norm_is_bf16 else "fp32",
+                cs,
+                emit_mxfp8,
+            )
+            compiled_by_cluster[cs] = b12x_compile(
+                kernel,
+                *fake,
+                Int32(1),
+                current_cuda_stream(),
+                compile_spec=KernelCompileSpec.from_key(
+                    "norm.mhc.cluster_post_y_norm", 2, key
+                ),
+            )
+    fixed_raw = (
+        compiled_by_cluster[cluster_sizes[0]] if len(cluster_sizes) == 1 else None
+    )
 
     def run(
         x,
@@ -842,6 +1049,11 @@ def compile_cluster_post_y_norm(
         tokens = int(residual.shape[0])
         if tokens == 0:
             return
+        raw = (
+            fixed_raw
+            if fixed_raw is not None
+            else compiled_by_cluster[split_lagged_cluster_size(tokens)]
+        )
         x_t = residual if pre_only else x
         pp_t = incoming if pre_only else prev_post
         pc_t = incoming if pre_only else prev_comb
@@ -895,7 +1107,7 @@ def compile_cluster_post_y_norm(
             ),
         )
 
-    return attach_programs(run, raw)
+    return attach_programs(run, *compiled_by_cluster.values())
 
 
 @program_cache
@@ -905,13 +1117,25 @@ def compile_readonly_fn_sinkhorn(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    *,
+    max_tokens: int | None = None,
 ):
     hidden = int(hidden)
     rms_eps = float(rms_eps)
     hc_eps = float(hc_eps)
     sinkhorn_iters = int(sinkhorn_iters)
+    if max_tokens is not None:
+        max_tokens = int(max_tokens)
+        if not 1 <= max_tokens <= SPLIT_LAGGED_MAX_TOKENS:
+            raise ValueError(
+                f"max_tokens must be in [1, {SPLIT_LAGGED_MAX_TOKENS}], got {max_tokens}"
+            )
+        need_m8 = max_tokens <= 8
+        need_wide = max_tokens > 8
+    else:
+        need_m8 = True
+        need_wide = True
 
-    k_partial = ReadOnlyFnPartialM8(hidden)
     k_finalize = _SplitFinalize(hidden, rms_eps, hc_eps, sinkhorn_iters)
 
     fake_p = (
@@ -927,16 +1151,32 @@ def compile_readonly_fn_sinkhorn(
         make_ptr(Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
     )
+    raw_partial_m8 = None
+    raw_partial_wide = None
+    programs = []
     with torch.cuda.device(ordinal):
-        raw_partial = b12x_compile(
-            k_partial,
-            *fake_p,
-            Int32(1),
-            current_cuda_stream(),
-            compile_spec=KernelCompileSpec.from_key(
-                "norm.mhc.readonly_fn_partial_m8", 1, (hidden,)
-            ),
-        )
+        if need_m8:
+            raw_partial_m8 = b12x_compile(
+                ReadOnlyFnPartialM8(hidden),
+                *fake_p,
+                Int32(1),
+                current_cuda_stream(),
+                compile_spec=KernelCompileSpec.from_key(
+                    "norm.mhc.readonly_fn_partial_m8", 1, (hidden,)
+                ),
+            )
+            programs.append(raw_partial_m8)
+        if need_wide:
+            raw_partial_wide = b12x_compile(
+                ReadOnlyFnPartial(hidden),
+                *fake_p,
+                Int32(1),
+                current_cuda_stream(),
+                compile_spec=KernelCompileSpec.from_key(
+                    "norm.mhc.readonly_fn_partial", 1, (hidden,)
+                ),
+            )
+            programs.append(raw_partial_wide)
         raw_finalize = b12x_compile(
             k_finalize,
             *fake_f,
@@ -948,6 +1188,7 @@ def compile_readonly_fn_sinkhorn(
                 (hidden, rms_eps, hc_eps, sinkhorn_iters),
             ),
         )
+        programs.append(raw_finalize)
 
     def run(
         residual_out,
@@ -963,6 +1204,18 @@ def compile_readonly_fn_sinkhorn(
         tokens = int(residual_out.shape[0])
         if tokens == 0:
             return
+        if tokens > SPLIT_LAGGED_MAX_TOKENS:
+            raise ValueError(
+                f"split-lagged mHC supports at most {SPLIT_LAGGED_MAX_TOKENS} tokens, got {tokens}"
+            )
+        if tokens <= 8 and raw_partial_m8 is not None:
+            raw_partial = raw_partial_m8
+        elif raw_partial_wide is not None:
+            raw_partial = raw_partial_wide
+        else:
+            raise ValueError(
+                f"split-lagged mHC runner was compiled for tokens <= 8, got {tokens}"
+            )
         stream_int = stream.cuda_stream if hasattr(stream, "cuda_stream") else stream
         cs = cuda_stream_from_int_or_current(stream_int)
         p_ptr = make_ptr(
@@ -1015,7 +1268,7 @@ def compile_readonly_fn_sinkhorn(
             ),
         )
 
-    return attach_programs(run, raw_partial, raw_finalize)
+    return attach_programs(run, *programs)
 
 
 __all__ = [
@@ -1023,6 +1276,7 @@ __all__ = [
     "SPLIT_LAGGED_MAX_TOKENS",
     "compile_cluster_post_y_norm",
     "compile_readonly_fn_sinkhorn",
+    "split_lagged_cluster_size",
     "split_lagged_partials_shape",
     "supports_split_lagged",
 ]
