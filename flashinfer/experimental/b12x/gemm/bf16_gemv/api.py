@@ -13,6 +13,16 @@ from ._kernel import SMALL_M_MAX
 from ._preparation import bf16_gemv_small_n, bf16_gemv_small_n_out  # noqa: F401
 from ._preparation import plan, query_from_call
 from ._tuning import GemvConfig, GemvQuery
+from ._vocab_summary import (
+    VocabSummaryBuffers,
+    VocabSummaryResult,
+    allocate_vocab_summary_outputs,
+    bf16_gemv_vocab_summary,
+    bf16_gemv_vocab_summary_stage1,
+    reduce_vocab_tile_summaries,
+    vocab_summary_num_tiles,
+    vocab_summary_tile_n,
+)
 
 # Routing thresholds for integrations (canonical home; formerly the vLLM
 # plugin's constants). Unquantized bf16 linears with N <= MAX_OUT and
@@ -75,4 +85,12 @@ __all__ = [
     "SMALL_M_MAX",
     "SMALL_N_GEMV_MAX_OUT",
     "SMALL_N_GEMV_MIN_IN",
+    "VocabSummaryBuffers",
+    "VocabSummaryResult",
+    "vocab_summary_tile_n",
+    "vocab_summary_num_tiles",
+    "allocate_vocab_summary_outputs",
+    "bf16_gemv_vocab_summary_stage1",
+    "reduce_vocab_tile_summaries",
+    "bf16_gemv_vocab_summary",
 ]
