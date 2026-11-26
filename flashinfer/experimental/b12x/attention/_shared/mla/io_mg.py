@@ -264,6 +264,44 @@ def io_issue_gather_glm_mg(
             eo += Int32(io_threads)
         cute.arch.fence_acq_rel_cta()
 
+    if cutlass.const_expr(dsv41 and not dsv41_fp8):
+        tile_valid = g_end - g_start
+        if tile_valid < Int32(0):
+            tile_valid = Int32(0)
+        if tile_valid > Int32(bi):
+            tile_valid = Int32(bi)
+        # Every tag-writer lane arrives directly on full_mbar_ptr after its
+        # source_tag store + CTA fence so math's mbarrier_wait observes all
+        # BI tags even when out-of-range tail bulk gathers (entry >= tile_valid)
+        # are skipped, without a blocking IO bar.sync.
+        arrive_lanes = min(int(bi), int(io_threads))
+        if io_lane == Int32(0):
+            cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, tile_valid * _nope)
+        elif io_lane < Int32(arrive_lanes):
+            cute.arch.mbarrier_arrive(full_mbar_ptr)
+
+        full_mbar_u32 = shared_ptr_to_u32(full_mbar_ptr)
+        eo = Int32(0)
+        for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
+            entry = eo + io_lane
+            if entry < tile_valid:
+                idx = Int32(topk_indices[g_start + entry])
+                if idx < Int32(0):
+                    idx = Int32(0)
+                block_idx = idx // page_block_size
+                local_idx = idx - block_idx * page_block_size
+                data_base_off = (
+                    Int64(block_idx) * stride_kv_block + Int64(local_idx) * _ios
+                )
+                cp_async_bulk_g2s_mbar(
+                    kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
+                    get_ptr_as_int64(kv_cache_u8, data_base_off),
+                    _nope,
+                    full_mbar_u32,
+                )
+            eo += Int32(io_threads)
+        return
+
     if io_lane == Int32(0):
         cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, Int32(bi) * _nope)
 
