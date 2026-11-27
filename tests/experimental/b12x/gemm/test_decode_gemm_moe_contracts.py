@@ -273,20 +273,38 @@ def test_dense_gemm_ready_small_mxfp8_disables_evict_first():
 
 
 def test_compact_w4a8_defaults_enable_inline_csf_and_bound_micro_tokens():
+    from b12x.moe.fused_moe._impl import (
+        _COMPACT_W4A8_MAX_TOKENS,
+        _COMPACT_W4A8_MAX_TOKENS_SM121,
+    )
     from b12x.moe.fused_moe._tuning import TUNING as MOE_TUNING
     from tests.experimental.b12x.moe.test_compact_w4a8_backend_race import _query
 
-    # SM120: micro through T=8, dynamic M16 at T=14..16; inline CSF enabled by default.
-    for tokens in (1, 4, 7, 8):
-        cfg = MOE_TUNING.default_config(_query(tokens), RTX)
-        assert cfg.backend == "micro"
-        assert cfg.csf_inline_scales is True
+    assert 8 <= _COMPACT_W4A8_MAX_TOKENS <= 16
+    assert _COMPACT_W4A8_MAX_TOKENS_SM121 == 4
 
-    for tokens in (14, 16, 64, 128):
+    # SM120: micro through _COMPACT_W4A8_MAX_TOKENS, dynamic M16 above the
+    # threshold; inline CSF enabled by default.
+    sm120_tokens = (
+        1,
+        4,
+        7,
+        8,
+        14,
+        16,
+        _COMPACT_W4A8_MAX_TOKENS,
+        _COMPACT_W4A8_MAX_TOKENS + 1,
+        64,
+        128,
+    )
+    for tokens in sm120_tokens:
         cfg = MOE_TUNING.default_config(_query(tokens), RTX)
-        assert cfg.backend == "dynamic"
-        assert cfg.dynamic_tile_m == 16
-        assert cfg.dynamic_route_mode == "grouped"
+        if tokens <= _COMPACT_W4A8_MAX_TOKENS:
+            assert cfg.backend == "micro"
+        else:
+            assert cfg.backend == "dynamic"
+            assert cfg.dynamic_tile_m == 16
+            assert cfg.dynamic_route_mode == "grouped"
         assert cfg.csf_inline_scales is True
 
     # High-density prefill amortizes expansion (routed_rows > 16 * 384).
@@ -294,11 +312,12 @@ def test_compact_w4a8_defaults_enable_inline_csf_and_bound_micro_tokens():
     assert cfg_prefill.backend == "dynamic"
     assert cfg_prefill.csf_inline_scales is False
 
-    # SM121 (GB10 Spark): micro through T=4, dynamic M16 from T=5..16.
-    assert MOE_TUNING.default_config(_query(4), GB10).backend == "micro"
-    assert MOE_TUNING.default_config(_query(7), GB10).backend == "dynamic"
-    assert MOE_TUNING.default_config(_query(8), GB10).backend == "dynamic"
-    assert MOE_TUNING.default_config(_query(16), GB10).backend == "dynamic"
+    # SM121 (GB10 Spark): micro through _COMPACT_W4A8_MAX_TOKENS_SM121,
+    # dynamic M16 above the threshold.
+    for tokens in (4, 7, 8, 16):
+        cfg = MOE_TUNING.default_config(_query(tokens), GB10)
+        expected = "micro" if tokens <= _COMPACT_W4A8_MAX_TOKENS_SM121 else "dynamic"
+        assert cfg.backend == expected
 
 
 def test_w4a8_compact_kernels_gate_negative_expert_ids_cleanly():
