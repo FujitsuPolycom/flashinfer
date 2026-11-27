@@ -162,9 +162,13 @@ def test_dependent_mxfp8_launch_requires_ready_rhs_and_single_slice():
         large_m_unroll=True,
         target_occupancy=None,
         programmatic_serialization=True,
-        evict_first=True,
+        evict_first=False,
     )
     TUNING.parameter_space(query, DEVICE).validate(asdict(candidate))
+    with pytest.raises(ValueError):
+        TUNING.parameter_space(query, DEVICE).validate(
+            asdict(replace(candidate, evict_first=True))
+        )
     with pytest.raises(ValueError):
         TUNING.parameter_space(
             replace(query, rhs_prefetch_ready=False), DEVICE

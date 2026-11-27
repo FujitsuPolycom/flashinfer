@@ -1664,68 +1664,94 @@ class W4A8MaterializedPhase2Kernel:
                             + (route + group) * Int32(self.tile_n),
                             cute.make_layout(self.tile_n),
                         )
-                    pair = token * Int32(self.fused_topk) + route + group
-                    safe_pair = cutlass.min(pair, num_pairs - Int32(1))
-                    expert_idx = local_expert_id(
-                        task_expert[safe_pair], Int32(down_alpha.shape[0])
+                    pair0 = token * Int32(self.fused_topk) + route
+                    safe_pair0 = cutlass.min(pair0, num_pairs - Int32(1))
+                    exp0 = local_expert_id(
+                        task_expert[safe_pair0], Int32(down_alpha.shape[0])
                     )
-                    valid_rows = Int32(1)
-                    if (
-                        route + group >= Int32(self.fused_topk)
-                        or expert_idx < Int32(0)
-                        or expert_idx >= Int32(down_alpha.shape[0])
-                    ):
-                        valid_rows = Int32(0)
-                        expert_idx = Int32(0)
-                    if local_tid < Int32(self.tile_n):
-                        local_shared[local_tid] = cutlass.BFloat16(0.0)
-                    self._run_task(
-                        intermediate_u32,
-                        down_rp,
-                        down_sfb_rp,
-                        scatter_output,
-                        token_map,
-                        token_weights,
-                        down_alpha,
-                        global_scale,
-                        trellis_lut,
-                        smem_base + group * Int32(self._region_words * 4),
-                        local_tid,
-                        local_warp,
-                        safe_pair,
-                        Int32(0),
-                        expert_idx,
-                        output_tile,
-                        valid_rows,
-                        rows_capacity,
-                        intermediate_tiles,
-                        packed_output_tiles,
-                        local_shared,
+                    valid0 = (
+                        route < Int32(self.fused_topk)
+                        and exp0 >= Int32(0)
+                        and exp0 < Int32(down_alpha.shape[0])
                     )
-                    if cutlass.const_expr(
-                        self._route_buffer_slots == self.fused_groups
+                    pair1 = pair0 + Int32(1)
+                    safe_pair1 = cutlass.min(pair1, num_pairs - Int32(1))
+                    exp1 = local_expert_id(
+                        task_expert[safe_pair1], Int32(down_alpha.shape[0])
+                    )
+                    valid1 = (
+                        route + Int32(1) < Int32(self.fused_topk)
+                        and exp1 >= Int32(0)
+                        and exp1 < Int32(down_alpha.shape[0])
+                    )
+                    if valid0 or valid1:
+                        safe_pair = safe_pair0 if group == Int32(0) else safe_pair1
+                        expert_idx = exp0 if group == Int32(0) else exp1
+                        is_valid = valid0 if group == Int32(0) else valid1
+                        valid_rows = Int32(1)
+                        if not is_valid:
+                            valid_rows = Int32(0)
+                            expert_idx = Int32(0)
+                        if local_tid < Int32(self.tile_n):
+                            local_shared[local_tid] = cutlass.BFloat16(0.0)
+                        self._run_task(
+                            intermediate_u32,
+                            down_rp,
+                            down_sfb_rp,
+                            scatter_output,
+                            token_map,
+                            token_weights,
+                            down_alpha,
+                            global_scale,
+                            trellis_lut,
+                            smem_base + group * Int32(self._region_words * 4),
+                            local_tid,
+                            local_warp,
+                            safe_pair,
+                            Int32(0),
+                            expert_idx,
+                            output_tile,
+                            valid_rows,
+                            rows_capacity,
+                            intermediate_tiles,
+                            packed_output_tiles,
+                            local_shared,
+                        )
+                        if cutlass.const_expr(
+                            self._route_buffer_slots == self.fused_groups
+                        ):
+                            cute.arch.sync_threads()
+                            lane = local_tid & Int32(31)
+                            if group == Int32(0) and lane < Int32(4):
+                                for route_group in cutlass.range_constexpr(
+                                    self.fused_groups
+                                ):
+                                    for nt in cutlass.range_constexpr(
+                                        self.tile_n // 32
+                                    ):
+                                        col = (
+                                            local_warp * Int32(self.tile_n // 4)
+                                            + lane * Int32(2)
+                                            + Int32(nt * 8)
+                                        )
+                                        route_sum[nt, 0] = route_sum[
+                                            nt, 0
+                                        ] + route_shared[
+                                            Int32(route_group * self.tile_n) + col
+                                        ].to(cutlass.Float32)
+                                        route_sum[nt, 1] = route_sum[
+                                            nt, 1
+                                        ] + route_shared[
+                                            Int32(route_group * self.tile_n)
+                                            + col
+                                            + Int32(1)
+                                        ].to(cutlass.Float32)
+                            cute.arch.sync_threads()
+                    elif cutlass.const_expr(
+                        self._route_buffer_slots > self.fused_groups
                     ):
-                        cute.arch.sync_threads()
-                        lane = local_tid & Int32(31)
-                        if group == Int32(0) and lane < Int32(4):
-                            for route_group in cutlass.range_constexpr(
-                                self.fused_groups
-                            ):
-                                for nt in cutlass.range_constexpr(self.tile_n // 32):
-                                    col = (
-                                        local_warp * Int32(self.tile_n // 4)
-                                        + lane * Int32(2)
-                                        + Int32(nt * 8)
-                                    )
-                                    route_sum[nt, 0] = route_sum[nt, 0] + route_shared[
-                                        Int32(route_group * self.tile_n) + col
-                                    ].to(cutlass.Float32)
-                                    route_sum[nt, 1] = route_sum[nt, 1] + route_shared[
-                                        Int32(route_group * self.tile_n)
-                                        + col
-                                        + Int32(1)
-                                    ].to(cutlass.Float32)
-                        cute.arch.sync_threads()
+                        if local_tid < Int32(self.tile_n):
+                            local_shared[local_tid] = cutlass.BFloat16(0.0)
                     route += Int32(self.fused_groups)
                 if cutlass.const_expr(self._route_buffer_slots > self.fused_groups):
                     cute.arch.sync_threads()

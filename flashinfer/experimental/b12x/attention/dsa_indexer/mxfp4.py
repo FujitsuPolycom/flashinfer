@@ -25,15 +25,23 @@ from b12x._lib.intrinsics.conversion import (
     ue8m0_to_output_scale,
 )
 from b12x._lib.intrinsics.math import fabs_f32, fmax_f32
+from b12x._lib.intrinsics.packed import f32_to_raw_bits
 from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     ld_global_nc_u32,
+    ld_shared_v4_u32,
     ldmatrix_m8n8x4_b16,
     shared_ptr_to_u32,
     st_global_v4_u32,
     u32_as_f32,
 )
-from b12x._lib.intrinsics.atomics import ld_shared_u32
+from b12x._lib.intrinsics.atomics import (
+    atomic_add_shared_i32,
+    ld_shared_i32,
+    ld_shared_u32,
+    red_add_shared_i32,
+    st_shared_i32,
+)
 from ..._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
@@ -1236,6 +1244,8 @@ def bind_mxfp4(
     candidate_output,
     candidate_output_lengths,
     score_width=None,
+    request_ids=None,
+    query_start_loc=None,
 ):
     caps = plan.caps
     width_capacity = caps.max_candidates or caps.max_page_table_width * caps.page_size
@@ -1275,7 +1285,25 @@ def bind_mxfp4(
         raise ValueError(
             "page_table must be int32 with unit inner stride on plan device"
         )
-    if page_table.shape[0] not in (1, rows):
+    if request_ids is not None and query_start_loc is not None:
+        raise ValueError("specify at most one of request_ids or query_start_loc")
+    if request_ids is not None:
+        _check(request_ids, "request_ids", (rows,), torch.int32, caps.device)
+        if page_table.shape[0] < 1:
+            raise ValueError("page_table must have at least one request row")
+    elif query_start_loc is not None:
+        if query_start_loc.ndim != 1 or query_start_loc.shape[0] < 2:
+            raise ValueError("query_start_loc must have shape (batch + 1,)")
+        _check(
+            query_start_loc,
+            "query_start_loc",
+            query_start_loc.shape,
+            torch.int32,
+            caps.device,
+        )
+        if page_table.shape[0] < query_start_loc.shape[0] - 1:
+            raise ValueError("page_table rows must cover query_start_loc batch size")
+    elif page_table.shape[0] not in (1, rows):
         raise ValueError("page_table must have one shared row or one row per query")
     _check(cache_lengths, "cache_lengths", (rows,), torch.int32, caps.device)
     _check(active_width, "active_width", (1,), torch.int32, caps.device)
@@ -1460,3 +1488,1098 @@ def _fused_bf16_pack_weights(w0, w1, *, loc=None, ip=None):
         ip=ip,
     )
     return Uint32(result)
+
+
+@cute.jit
+def _bf16_bits_to_ordered(bits: Uint32) -> Uint32:
+    """Bijection from raw 16-bit BF16 pattern to monotonically ordered uint16."""
+    neg = (bits & Uint32(0x8000)) != Uint32(0)
+    return (
+        ((bits ^ Uint32(0xFFFF)) & Uint32(0xFFFF)) if neg else (bits ^ Uint32(0x8000))
+    )
+
+
+@cute.jit
+def _smem_red_i32(base: Int32, idx: Int32, val: Int32):
+    red_add_shared_i32(base + idx * Int32(4), val)
+
+
+@cute.jit
+def _smem_xadd_i32(base: Int32, idx: Int32, val: Int32) -> Int32:
+    return atomic_add_shared_i32(base + idx * Int32(4), val)
+
+
+@cute.jit
+def _smem_st_i32(base: Int32, idx: Int32, val: Int32):
+    st_shared_i32(base + idx * Int32(4), val)
+
+
+@cute.jit
+def _smem_ld_i32(base: Int32, idx: Int32) -> Int32:
+    return ld_shared_i32(base + idx * Int32(4))
+
+
+@cute.jit
+def _warp_suffix_pivot_256(
+    hist_addr: Int32,
+    tx: Int32,
+    target_k: Int32,
+    scalars_addr: Int32,
+    record_total: cutlass.Constexpr[bool] = False,
+):
+    """Single-warp suffix sum over 256 int32 histogram bins to locate pivot & remainder."""
+    if tx < Int32(32):
+        base = hist_addr + tx * Int32(32)
+        c0, c1, c2, c3 = ld_shared_v4_u32(base)
+        c4, c5, c6, c7 = ld_shared_v4_u32(base + Int32(16))
+        s7 = Int32(c7)
+        s6 = s7 + Int32(c6)
+        s5 = s6 + Int32(c5)
+        s4 = s5 + Int32(c4)
+        s3 = s4 + Int32(c3)
+        s2 = s3 + Int32(c2)
+        s1 = s2 + Int32(c1)
+        s0 = s1 + Int32(c0)
+        above = s0
+        for distance in cutlass.range_constexpr(5):
+            other = cute.arch.shuffle_sync_down(above, 1 << distance)
+            if tx + Int32(1 << distance) < Int32(32):
+                above += other
+        above -= s0
+        suffix = [
+            s0 + above,
+            s1 + above,
+            s2 + above,
+            s3 + above,
+            s4 + above,
+            s5 + above,
+            s6 + above,
+            s7 + above,
+            above,
+        ]
+        if cutlass.const_expr(record_total):
+            if tx == Int32(0):
+                _smem_st_i32(scalars_addr, Int32(3), suffix[0])
+        for digit in cutlass.range_constexpr(8):
+            if (suffix[digit] >= target_k) & (suffix[digit + 1] < target_k):
+                _smem_st_i32(scalars_addr, Int32(1), tx * Int32(8) + Int32(digit))
+                _smem_st_i32(scalars_addr, Int32(2), target_k - suffix[digit + 1])
+
+
+@cute.jit
+def _radix_select_u16_to_slots(
+    vals_u16,
+    base_offset: Int64,
+    n_total: Int32,
+    topk: cutlass.Constexpr[int],
+    tx: Int32,
+    hist,
+    out_slots,
+    scalars,
+    threads: cutlass.Constexpr[int] = 512,
+    priority_index: Int32 | None = None,
+    ids_for_priority=None,
+    ids_base: Int64 = Int64(0),
+):
+    """Select exact top-k valid (> -inf) slots from BF16 raw uint16 values.
+
+    Uses a 4-bank replicated 256-bin histogram (``hist`` needs 1025 int32s) and
+    warp-aggregated emits to eliminate SMEM atomic serialization.
+    Returns ``(selected_count, cutoff_ordered_u16)``.
+    """
+    hist_addr = shared_ptr_to_u32(hist.iterator)
+    scalars_addr = shared_ptr_to_u32(scalars.iterator)
+    lane = tx % Int32(32)
+    bank = (tx // Int32(32)) & Int32(3)
+    bank_addr = hist_addr + bank * Int32(1024)
+    lt_mask = (Uint32(1) << Uint32(lane)) - Uint32(1)
+
+    for z in cutlass.range_constexpr(1024 // threads):
+        hist[tx + Int32(z * threads)] = Int32(0)
+    if tx == Int32(0):
+        hist[Int32(1024)] = Int32(0)
+        _smem_st_i32(scalars_addr, Int32(0), Int32(0))
+        _smem_st_i32(scalars_addr, Int32(3), Int32(0))
+    cute.arch.sync_threads()
+
+    # Round 1: 4-bank histogram on high byte of valid ordered keys (> 0x007F).
+    base = Int32(0)
+    while base < n_total:
+        i = base + tx
+        if i < n_total:
+            key = _bf16_bits_to_ordered(Uint32(vals_u16[base_offset + Int64(i)]))
+            if cutlass.const_expr(priority_index is not None):
+                if cutlass.const_expr(ids_for_priority is not None):
+                    if Int32(ids_for_priority[ids_base + Int64(i)]) == priority_index:
+                        key = Uint32(0xFFFF)
+                elif i == priority_index:
+                    key = Uint32(0xFFFF)
+            if key > Uint32(0x007F):
+                _smem_red_i32(bank_addr, Int32(key >> Uint32(8)), Int32(1))
+        base += Int32(threads)
+    cute.arch.sync_threads()
+
+    if tx < Int32(256):
+        hist[tx] = (
+            Int32(hist[tx])
+            + Int32(hist[Int32(256) + tx])
+            + Int32(hist[Int32(512) + tx])
+            + Int32(hist[Int32(768) + tx])
+        )
+    cute.arch.sync_threads()
+
+    _warp_suffix_pivot_256(hist_addr, tx, Int32(topk), scalars_addr, record_total=True)
+    cute.arch.sync_threads()
+
+    valid_total = _smem_ld_i32(scalars_addr, Int32(3))
+    out_count = Int32(topk)
+    cutoff_key = Uint32(0x007F)
+    if valid_total <= Int32(topk):
+        base = Int32(0)
+        while base < n_total:
+            i = base + tx
+            acc = False
+            if i < n_total:
+                key = _bf16_bits_to_ordered(Uint32(vals_u16[base_offset + Int64(i)]))
+                if cutlass.const_expr(priority_index is not None):
+                    if cutlass.const_expr(ids_for_priority is not None):
+                        if (
+                            Int32(ids_for_priority[ids_base + Int64(i)])
+                            == priority_index
+                        ):
+                            key = Uint32(0xFFFF)
+                    elif i == priority_index:
+                        key = Uint32(0xFFFF)
+                acc = key > Uint32(0x007F)
+            mask = cute.arch.vote_ballot_sync(acc)
+            wn = Int32(cute.arch.popc(mask))
+            wbase = Int32(0)
+            if (lane == Int32(0)) & (wn > Int32(0)):
+                wbase = _smem_xadd_i32(scalars_addr, Int32(0), wn)
+            wbase = cute.arch.shuffle_sync(wbase, Int32(0))
+            if acc:
+                pos = wbase + Int32(cute.arch.popc(mask & lt_mask))
+                if pos < Int32(topk):
+                    out_slots[pos] = i
+            base += Int32(threads)
+        cute.arch.sync_threads()
+        out_count = valid_total
+    else:
+        pivot_hi = _smem_ld_i32(scalars_addr, Int32(1))
+        rem_hi = _smem_ld_i32(scalars_addr, Int32(2))
+        for z in cutlass.range_constexpr(1024 // threads):
+            hist[tx + Int32(z * threads)] = Int32(0)
+        cute.arch.sync_threads()
+
+        # Fused Round 1 warp-aggregated emit (hi > pivot_hi) + Round 2 4-bank hist.
+        base = Int32(0)
+        while base < n_total:
+            i = base + tx
+            acc_gt = False
+            if i < n_total:
+                key = _bf16_bits_to_ordered(Uint32(vals_u16[base_offset + Int64(i)]))
+                if cutlass.const_expr(priority_index is not None):
+                    if cutlass.const_expr(ids_for_priority is not None):
+                        if (
+                            Int32(ids_for_priority[ids_base + Int64(i)])
+                            == priority_index
+                        ):
+                            key = Uint32(0xFFFF)
+                    elif i == priority_index:
+                        key = Uint32(0xFFFF)
+                if key > Uint32(0x007F):
+                    hi = Int32(key >> Uint32(8))
+                    if hi > pivot_hi:
+                        acc_gt = True
+                    elif hi == pivot_hi:
+                        _smem_red_i32(bank_addr, Int32(key & Uint32(0xFF)), Int32(1))
+            mask = cute.arch.vote_ballot_sync(acc_gt)
+            wn = Int32(cute.arch.popc(mask))
+            wbase = Int32(0)
+            if (lane == Int32(0)) & (wn > Int32(0)):
+                wbase = _smem_xadd_i32(scalars_addr, Int32(0), wn)
+            wbase = cute.arch.shuffle_sync(wbase, Int32(0))
+            if acc_gt:
+                pos = wbase + Int32(cute.arch.popc(mask & lt_mask))
+                if pos < Int32(topk):
+                    out_slots[pos] = i
+            base += Int32(threads)
+        cute.arch.sync_threads()
+
+        if tx < Int32(256):
+            hist[tx] = (
+                Int32(hist[tx])
+                + Int32(hist[Int32(256) + tx])
+                + Int32(hist[Int32(512) + tx])
+                + Int32(hist[Int32(768) + tx])
+            )
+        cute.arch.sync_threads()
+
+        _warp_suffix_pivot_256(hist_addr, tx, rem_hi, scalars_addr, record_total=False)
+        cute.arch.sync_threads()
+
+        pivot_lo = _smem_ld_i32(scalars_addr, Int32(1))
+        cutoff_key = (Uint32(pivot_hi) << Uint32(8)) | Uint32(pivot_lo)
+        # Round 2 warp-aggregated emit (lo > pivot_lo and exact tie count).
+        base = Int32(0)
+        while base < n_total:
+            i = base + tx
+            acc_gt = False
+            acc_eq = False
+            if i < n_total:
+                key = _bf16_bits_to_ordered(Uint32(vals_u16[base_offset + Int64(i)]))
+                if cutlass.const_expr(priority_index is not None):
+                    if cutlass.const_expr(ids_for_priority is not None):
+                        if (
+                            Int32(ids_for_priority[ids_base + Int64(i)])
+                            == priority_index
+                        ):
+                            key = Uint32(0xFFFF)
+                    elif i == priority_index:
+                        key = Uint32(0xFFFF)
+                if (key > Uint32(0x007F)) & (Int32(key >> Uint32(8)) == pivot_hi):
+                    lo = Int32(key & Uint32(0xFF))
+                    acc_gt = lo > pivot_lo
+                    acc_eq = lo == pivot_lo
+            m_gt = cute.arch.vote_ballot_sync(acc_gt)
+            n_gt = Int32(cute.arch.popc(m_gt))
+            b_gt = Int32(0)
+            if (lane == Int32(0)) & (n_gt > Int32(0)):
+                b_gt = _smem_xadd_i32(scalars_addr, Int32(0), n_gt)
+            b_gt = cute.arch.shuffle_sync(b_gt, Int32(0))
+            if acc_gt:
+                pos = b_gt + Int32(cute.arch.popc(m_gt & lt_mask))
+                if pos < Int32(topk):
+                    out_slots[pos] = i
+            m_eq = cute.arch.vote_ballot_sync(acc_eq)
+            n_eq = Int32(cute.arch.popc(m_eq))
+            old_rem = Int32(0)
+            if (lane == Int32(0)) & (n_eq > Int32(0)):
+                old_rem = _smem_xadd_i32(scalars_addr, Int32(2), -n_eq)
+            old_rem = cute.arch.shuffle_sync(old_rem, Int32(0))
+            if acc_eq:
+                rem_slot = old_rem - Int32(cute.arch.popc(m_eq & lt_mask))
+                if rem_slot > Int32(0):
+                    out_slots[Int32(topk) - rem_slot] = i
+            base += Int32(threads)
+        cute.arch.sync_threads()
+    return out_count, cutoff_key
+
+
+@cute.jit
+def _trim_smem_u16_512(
+    carry_val,
+    carry_idx,
+    base: Int32,
+    count: Int32,
+    tx: Int32,
+    hist,
+    out_slots,
+    scalars,
+    threads: cutlass.Constexpr[int] = 512,
+):
+    """Trim an SMEM BF16 carry buffer in-place to top-512 and return (new_count, cutoff)."""
+    selected_count, cutoff_key = _radix_select_u16_to_slots(
+        carry_val,
+        Int64(base),
+        count,
+        512,
+        tx,
+        hist,
+        out_slots,
+        scalars,
+        threads=threads,
+    )
+    rv = Uint16(0xFF80)
+    ri = Int32(-1)
+    if tx < selected_count:
+        src = Int32(out_slots[tx])
+        rv = Uint16(carry_val[base + src])
+        ri = Int32(carry_idx[base + src])
+    cute.arch.sync_threads()
+    if tx < selected_count:
+        carry_val[base + tx] = rv
+        carry_idx[base + tx] = ri
+    cute.arch.sync_threads()
+    return selected_count, cutoff_key
+
+
+@cute.jit
+def _bitonic_sort_512_u16_to_out(
+    out_indices,
+    out_values,
+    row: Int32,
+    ids,
+    vals_u16,
+    base: Int32,
+    count: Int32,
+    tx: Int32,
+):
+    """Sort up to 512 (int32 pos, uint16 bf16) pairs ascending by pos and write outputs."""
+    if tx < Int32(512):
+        pos = Int32(2147483647)
+        val = Uint32(0xFF80)
+        if tx < count:
+            raw_pos = Int32(ids[base + tx])
+            raw_val = Uint32(vals_u16[base + tx])
+            if (raw_pos >= Int32(0)) & (raw_val != Uint32(0xFF80)):
+                pos = raw_pos
+                val = raw_val
+        cute.arch.barrier(barrier_id=1, number_of_threads=512)
+        for level in cutlass.range_constexpr(1, 10):
+            for stage in cutlass.range_constexpr(level):
+                stride = 1 << (level - 1 - stage)
+                other_pos = Int32(2147483647)
+                other_val = Uint32(0xFF80)
+                if cutlass.const_expr(stride < 32):
+                    other_pos = cute.arch.shuffle_sync_bfly(pos, offset=stride)
+                    other_val = cute.arch.shuffle_sync_bfly(val, offset=stride)
+                else:
+                    ids[base + tx] = pos
+                    vals_u16[base + tx] = Uint16(val)
+                    cute.arch.barrier(barrier_id=1, number_of_threads=512)
+                    partner = tx ^ Int32(stride)
+                    other_pos = Int32(ids[base + partner])
+                    other_val = Uint32(vals_u16[base + partner])
+                    cute.arch.barrier(barrier_id=1, number_of_threads=512)
+                ascending = (tx & Int32(1 << level)) == Int32(0)
+                lower = (tx & Int32(stride)) == Int32(0)
+                take_min = ascending == lower
+                if ((pos > other_pos) & take_min) | (
+                    (pos < other_pos) & (not take_min)
+                ):
+                    pos = other_pos
+                    val = other_val
+        valid = pos != Int32(2147483647)
+        out_off = Int64(row) * Int64(512) + Int64(tx)
+        out_indices[out_off] = pos if valid else Int32(-1)
+        out_values[out_off] = (
+            u32_as_f32(val << Uint32(16)) if valid else Float32(-float("inf"))
+        )
+
+
+@cute.jit
+def _resolve_request_row(
+    row: Int32,
+    request_meta,
+    request_mode: Int32,
+    num_requests: Int32,
+) -> Int32:
+    """Map query row to page-table row (0=identity, 1=request_ids, 2=query_start_loc)."""
+    res = row
+    if request_mode == Int32(1):
+        res = Int32(request_meta[row])
+    elif request_mode == Int32(2):
+        lo = Int32(0)
+        hi = num_requests
+        while lo + Int32(1) < hi:
+            mid = (lo + hi) // Int32(2)
+            if Int32(request_meta[mid]) <= row:
+                lo = mid
+            else:
+                hi = mid
+        res = lo
+    return res
+
+
+def multiquery_scratch_shapes(rows: int, ctas: int) -> dict:
+    """Return dtype/shape pairs for bounded multi-query dense MXFP4 scratch."""
+    if rows < 1 or ctas < 1:
+        raise ValueError("multiquery rows and CTA count must be positive")
+    partial_shape = (rows, ctas, 512) if ctas > 1 else (1,)
+    count_shape = (rows, ctas) if ctas > 1 else (1,)
+    return {
+        "selected_values": (torch.float32, (rows, 512)),
+        "partial_indices": (torch.int32, partial_shape),
+        "partial_values": (torch.int16, partial_shape),
+        "partial_counts": (torch.int32, count_shape),
+        "merge_state": (torch.int32, (2,)),
+    }
+
+
+class MultiQueryFusedMXFP4:
+    """Request-grouped multi-query MXFP4 dense scorer and exact top-512 selector.
+
+    Groups up to ``q_tile`` queries in one 512-thread CTA so queries sharing
+    physical pages load each 68-byte MXFP4 key once into registers and multiply
+    against all grouped queries' staged SMEM heads via ``m16n8k64``.
+    """
+
+    def __init__(
+        self,
+        heads: int,
+        page_size: int,
+        ctas: int = 1,
+        q_tile: int = 8,
+    ):
+        if heads < 1 or heads > 64 or 64 % heads:
+            raise ValueError("MXFP4 heads must divide 64")
+        if page_size < 8 or page_size % 8:
+            raise ValueError("MXFP4 page_size must be a positive multiple of eight")
+        if not 1 <= ctas < 2**31:
+            raise ValueError("invalid multiquery CTA count")
+        if q_tile not in (2, 4, 8):
+            raise ValueError("multiquery q_tile must be 2, 4, or 8")
+        self.heads = int(heads)
+        self.page_size = int(page_size)
+        self.ctas = int(ctas)
+        self.q_tile = int(q_tile)
+
+    @cute.jit
+    def local(
+        self,
+        q: cute.Pointer,
+        qs: cute.Pointer,
+        weights: cute.Pointer,
+        pool: cute.Pointer,
+        pages: cute.Pointer,
+        request_meta: cute.Pointer,
+        lengths: cute.Pointer,
+        active: cute.Pointer,
+        out_indices: cute.Pointer,
+        out_values: cute.Pointer,
+        partial_indices: cute.Pointer,
+        partial_values: cute.Pointer,
+        partial_counts: cute.Pointer,
+        merge_state: cute.Pointer,
+        rows: Int32,
+        width: Int32,
+        page_width: Int32,
+        page_row_stride: Int64,
+        pool_stride: Int64,
+        pool_pages: Int64,
+        request_mode: Int32,
+        num_requests: Int32,
+        stream: cuda.CUstream,
+    ):
+        num_groups = (Int64(rows) + Int64(self.q_tile - 1)) // Int64(self.q_tile)
+        self.local_kernel(
+            _flat(q),
+            _flat(qs),
+            _flat(weights),
+            _flat(pool),
+            _flat(pages),
+            _flat(request_meta),
+            _flat(lengths),
+            _flat(active),
+            _flat(out_indices),
+            _flat(out_values),
+            _flat(partial_indices),
+            _flat(partial_values),
+            _flat(partial_counts),
+            _flat(merge_state),
+            rows,
+            width,
+            page_width,
+            page_row_stride,
+            pool_stride,
+            pool_pages,
+            request_mode,
+            num_requests,
+        ).launch(
+            grid=(num_groups * Int64(self.ctas), 1, 1),
+            block=(1024, 1, 1),
+            stream=stream,
+        )
+
+    @cute.jit
+    def merge(
+        self,
+        out_indices: cute.Pointer,
+        out_values: cute.Pointer,
+        partial_indices: cute.Pointer,
+        partial_values: cute.Pointer,
+        partial_counts: cute.Pointer,
+        rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.merge_kernel(
+            _flat(out_indices),
+            _flat(out_values),
+            _flat(partial_indices),
+            _flat(partial_values),
+            _flat(partial_counts),
+            rows,
+        ).launch(
+            grid=(Int64(rows), 1, 1),
+            block=(512, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def local_kernel(
+        self,
+        q,
+        qs,
+        weights,
+        pool,
+        pages,
+        request_meta,
+        lengths,
+        active,
+        out_indices,
+        out_values,
+        partial_indices,
+        partial_values,
+        partial_counts,
+        merge_state,
+        rows: Int32,
+        width: Int32,
+        page_width: Int32,
+        page_row_stride: Int64,
+        pool_stride: Int64,
+        pool_pages: Int64,
+        request_mode: Int32,
+        num_requests: Int32,
+    ):
+        tx_u, _, _ = cute.arch.thread_idx()
+        bx_u, _, _ = cute.arch.block_idx()
+        tx = Int32(tx_u)
+        block = Int32(bx_u)
+        warp = tx // Int32(32)
+        lane = tx % Int32(32)
+        group = block // Int32(self.ctas)
+        partition = block % Int32(self.ctas)
+        row_base = group * Int32(self.q_tile)
+
+        if (block == Int32(0)) & (tx < Int32(2)):
+            merge_state[tx] = Int32(0)
+
+        smem = cutlass.utils.SmemAllocator()
+        num_ht = (self.heads + 7) // 8
+        weight_pairs_per_row = (self.heads + 1) // 2
+        carry_cap = 1280
+        # Vectorized 128-bit Q layout: [q_tile, num_ht, 32_lanes, 4_kchunks].
+        q_smem = smem.allocate_tensor(
+            Uint32, cute.make_layout((self.q_tile * num_ht * 128,)), byte_alignment=16
+        )
+        qs_smem = smem.allocate_tensor(
+            Uint32, cute.make_layout((self.q_tile * num_ht * 8,)), byte_alignment=16
+        )
+        w_smem = smem.allocate_tensor(
+            Uint32,
+            cute.make_layout((self.q_tile * weight_pairs_per_row,)),
+            byte_alignment=16,
+        )
+        carry_val = smem.allocate_tensor(
+            Uint16, cute.make_layout((self.q_tile * carry_cap,)), byte_alignment=16
+        )
+        carry_idx = smem.allocate_tensor(
+            Int32, cute.make_layout((self.q_tile * carry_cap,)), byte_alignment=16
+        )
+        hist = smem.allocate_tensor(Int32, cute.make_layout((1025,)), byte_alignment=16)
+        out_slots = smem.allocate_tensor(
+            Int32, cute.make_layout((512,)), byte_alignment=16
+        )
+        scalars = smem.allocate_tensor(
+            Int32, cute.make_layout((4 + 2 * self.q_tile,)), byte_alignment=16
+        )
+        q_extents = smem.allocate_tensor(
+            Int32, cute.make_layout((self.q_tile,)), byte_alignment=16
+        )
+        q_page_rows = smem.allocate_tensor(
+            Int32, cute.make_layout((self.q_tile,)), byte_alignment=16
+        )
+        scalars_addr = shared_ptr_to_u32(scalars.iterator)
+        q_smem_addr = shared_ptr_to_u32(q_smem.iterator)
+
+        active_val = cutlass.max(Int32(active[0]), Int32(0))
+        if tx < Int32(self.q_tile):
+            r = row_base + tx
+            ext = Int32(0)
+            prow = Int32(0)
+            if r < rows:
+                vis = cutlass.min(cutlass.max(Int32(lengths[r]), Int32(0)), active_val)
+                ext = cutlass.min(vis, width)
+                prow = _resolve_request_row(r, request_meta, request_mode, num_requests)
+            q_extents[tx] = ext
+            q_page_rows[tx] = prow
+            scalars[Int32(4) + tx] = Int32(0)
+            scalars[Int32(4 + self.q_tile) + tx] = Int32(0x007F)
+
+        total_q_words = Int32(self.q_tile * num_ht * 128)
+        idx = tx
+        while idx < total_q_words:
+            ql = idx // Int32(num_ht * 128)
+            rem = idx - ql * Int32(num_ht * 128)
+            ht = rem // Int32(128)
+            rem2 = rem - ht * Int32(128)
+            l_idx = rem2 // Int32(4)
+            kchunk = rem2 - l_idx * Int32(4)
+            h = ht * Int32(8) + (l_idx // Int32(4))
+            w_in_h = kchunk * Int32(4) + (l_idx % Int32(4))
+            r = row_base + ql
+            word = Uint32(0)
+            if (r < rows) & (h < Int32(self.heads)):
+                bbase = (Int64(r) * Int64(self.heads) + Int64(h)) * Int64(64) + Int64(
+                    w_in_h
+                ) * Int64(4)
+                word = (
+                    Uint32(q[bbase])
+                    | (Uint32(q[bbase + Int64(1)]) << Uint32(8))
+                    | (Uint32(q[bbase + Int64(2)]) << Uint32(16))
+                    | (Uint32(q[bbase + Int64(3)]) << Uint32(24))
+                )
+            q_smem[idx] = word
+            idx += Int32(1024)
+
+        total_qs_words = Int32(self.q_tile * num_ht * 8)
+        idx = tx
+        while idx < total_qs_words:
+            ql = idx // Int32(num_ht * 8)
+            h = idx - ql * Int32(num_ht * 8)
+            r = row_base + ql
+            word = Uint32(0x7F7F7F7F)
+            if (r < rows) & (h < Int32(self.heads)):
+                sbase = (Int64(r) * Int64(self.heads) + Int64(h)) * Int64(4)
+                word = (
+                    Uint32(qs[sbase])
+                    | (Uint32(qs[sbase + Int64(1)]) << Uint32(8))
+                    | (Uint32(qs[sbase + Int64(2)]) << Uint32(16))
+                    | (Uint32(qs[sbase + Int64(3)]) << Uint32(24))
+                )
+            qs_smem[idx] = word
+            idx += Int32(1024)
+
+        total_w_words = Int32(self.q_tile * weight_pairs_per_row)
+        idx = tx
+        while idx < total_w_words:
+            ql = idx // Int32(weight_pairs_per_row)
+            pair = idx - ql * Int32(weight_pairs_per_row)
+            r = row_base + ql
+            word = Uint32(0)
+            if r < rows:
+                w0 = weights[Int64(r) * Int64(self.heads) + Int64(pair * Int32(2))]
+                w1 = BFloat16(0)
+                if cutlass.const_expr(self.heads != 1):
+                    w1 = weights[
+                        Int64(r) * Int64(self.heads) + Int64(pair * Int32(2) + Int32(1))
+                    ]
+                word = _fused_bf16_pack_weights(w0, w1)
+            w_smem[idx] = word
+            idx += Int32(1024)
+
+        cute.arch.sync_threads()
+
+        max_extent = Int32(0)
+        for ql in cutlass.range_constexpr(self.q_tile):
+            max_extent = cutlass.max(max_extent, Int32(q_extents[ql]))
+        total_tiles16 = (max_extent + Int32(15)) // Int32(16)
+        begin = Int32(
+            (Int64(total_tiles16) * Int64(partition) // Int64(self.ctas)) * Int64(16)
+        )
+        end = Int32(
+            cutlass.min(
+                Int64(max_extent),
+                (Int64(total_tiles16) * Int64(partition + Int32(1)) // Int64(self.ctas))
+                * Int64(16),
+            )
+        )
+
+        byte_off = Int64(lane & Int32(3)) * Int64(4)
+        lt_mask = (Uint32(1) << Uint32(lane)) - Uint32(1)
+        lane_is_out = (lane & Int32(3)) == Int32(0)
+        lane_is_even = (lane & Int32(1)) == Int32(0)
+        lane_row = lane >> Int32(2)
+        lane_w_off = lane & Int32(3)
+
+        tile = begin
+        while tile < end:
+            base_col = tile + (warp << Int32(4))
+            col0 = base_col + lane_row
+            col1 = col0 + Int32(8)
+            in_tile0 = col0 < end
+            in_tile1 = col1 < end
+            pcol0 = base_col // Int32(self.page_size)
+            tok0 = col0 % Int32(self.page_size)
+            pcol1 = (base_col + Int32(8)) // Int32(self.page_size)
+            tok1 = col1 % Int32(self.page_size)
+
+            loaded_p0 = Int32(-2)
+            loaded_p1 = Int32(-2)
+            last_prow = Int32(-1)
+            p0 = Int32(-1)
+            p1 = Int32(-1)
+            a0_0 = Uint32(0)
+            a2_0 = Uint32(0)
+            a0_1 = Uint32(0)
+            a2_1 = Uint32(0)
+            a1_0 = Uint32(0)
+            a3_0 = Uint32(0)
+            a1_1 = Uint32(0)
+            a3_1 = Uint32(0)
+            sfa = Uint32(0x7F7F7F7F)
+
+            for ql in cutlass.range(self.q_tile, unroll=1):
+                ext_q = Int32(q_extents[ql])
+                if (base_col < ext_q) & (base_col < end):
+                    prow_idx = Int32(q_page_rows[ql])
+                    if (last_prow < Int32(0)) | (
+                        (prow_idx != last_prow) & (page_row_stride != Int64(0))
+                    ):
+                        prow = Int64(prow_idx) * page_row_stride
+                        p0 = Int32(-1)
+                        if pcol0 < page_width:
+                            raw_p0 = Int32(pages[prow + Int64(pcol0)])
+                            if (raw_p0 >= Int32(0)) & (Int64(raw_p0) < pool_pages):
+                                p0 = raw_p0
+                        if cutlass.const_expr(self.page_size % 16 != 0):
+                            p1 = p0
+                            if cutlass.const_expr(self.page_size == 8):
+                                p1 = Int32(-1)
+                                if pcol1 < page_width:
+                                    raw_p1 = Int32(pages[prow + Int64(pcol1)])
+                                    if (raw_p1 >= Int32(0)) & (
+                                        Int64(raw_p1) < pool_pages
+                                    ):
+                                        p1 = raw_p1
+                            elif pcol1 != pcol0:
+                                p1 = Int32(-1)
+                                if pcol1 < page_width:
+                                    raw_p1 = Int32(pages[prow + Int64(pcol1)])
+                                    if (raw_p1 >= Int32(0)) & (
+                                        Int64(raw_p1) < pool_pages
+                                    ):
+                                        p1 = raw_p1
+                        last_prow = prow_idx
+
+                    if cutlass.const_expr(self.page_size % 16 == 0):
+                        p0_valid = p0 >= Int32(0)
+                        p1_valid = p0_valid
+                        if p0 != loaded_p0:
+                            if p0_valid:
+                                p0_base = Int64(p0) * pool_stride
+                                kb0 = p0_base + Int64(tok0) * Int64(64) + byte_off
+                                a0_0 = _packed_word(pool, kb0)
+                                a2_0 = _packed_word(pool, kb0 + Int64(16))
+                                a0_1 = _packed_word(pool, kb0 + Int64(32))
+                                a2_1 = _packed_word(pool, kb0 + Int64(48))
+                                a1_0 = _packed_word(pool, kb0 + Int64(512))
+                                a3_0 = _packed_word(pool, kb0 + Int64(528))
+                                a1_1 = _packed_word(pool, kb0 + Int64(544))
+                                a3_1 = _packed_word(pool, kb0 + Int64(560))
+                                s_tok = tok0 + ((lane & Int32(1)) << Int32(3))
+                                sfa = _packed_word(
+                                    pool,
+                                    p0_base
+                                    + Int64(self.page_size * 64)
+                                    + Int64(s_tok) * Int64(4),
+                                )
+                            else:
+                                a0_0 = Uint32(0)
+                                a2_0 = Uint32(0)
+                                a0_1 = Uint32(0)
+                                a2_1 = Uint32(0)
+                                a1_0 = Uint32(0)
+                                a3_0 = Uint32(0)
+                                a1_1 = Uint32(0)
+                                a3_1 = Uint32(0)
+                                sfa = Uint32(0x7F7F7F7F)
+                            loaded_p0 = p0
+                    else:
+                        p0_valid = p0 >= Int32(0)
+                        p1_valid = p1 >= Int32(0)
+                        if p0 != loaded_p0:
+                            if p0_valid:
+                                p0_base = Int64(p0) * pool_stride
+                                kb0 = p0_base + Int64(tok0) * Int64(64) + byte_off
+                                a0_0 = _packed_word(pool, kb0)
+                                a2_0 = _packed_word(pool, kb0 + Int64(16))
+                                a0_1 = _packed_word(pool, kb0 + Int64(32))
+                                a2_1 = _packed_word(pool, kb0 + Int64(48))
+                                if lane_is_even:
+                                    sfa = _packed_word(
+                                        pool,
+                                        p0_base
+                                        + Int64(self.page_size * 64)
+                                        + Int64(tok0) * Int64(4),
+                                    )
+                            else:
+                                a0_0 = Uint32(0)
+                                a2_0 = Uint32(0)
+                                a0_1 = Uint32(0)
+                                a2_1 = Uint32(0)
+                                if lane_is_even:
+                                    sfa = Uint32(0x7F7F7F7F)
+                            loaded_p0 = p0
+                        if p1 != loaded_p1:
+                            if p1_valid:
+                                p1_base = Int64(p1) * pool_stride
+                                kb1 = p1_base + Int64(tok1) * Int64(64) + byte_off
+                                a1_0 = _packed_word(pool, kb1)
+                                a3_0 = _packed_word(pool, kb1 + Int64(16))
+                                a1_1 = _packed_word(pool, kb1 + Int64(32))
+                                a3_1 = _packed_word(pool, kb1 + Int64(48))
+                                if not lane_is_even:
+                                    sfa = _packed_word(
+                                        pool,
+                                        p1_base
+                                        + Int64(self.page_size * 64)
+                                        + Int64(tok1) * Int64(4),
+                                    )
+                            else:
+                                a1_0 = Uint32(0)
+                                a3_0 = Uint32(0)
+                                a1_1 = Uint32(0)
+                                a3_1 = Uint32(0)
+                                if not lane_is_even:
+                                    sfa = Uint32(0x7F7F7F7F)
+                            loaded_p1 = p1
+
+                    tot0 = Float32(0.0)
+                    tot1 = Float32(0.0)
+                    q_row_ht = ql * Int32(num_ht)
+                    for head_tile in cutlass.range(num_ht, unroll=1):
+                        ht_idx = q_row_ht + head_tile
+                        q_addr = q_smem_addr + Uint32(
+                            ((ht_idx << Int32(5)) + lane) << Int32(4)
+                        )
+                        b0_0, b1_0, b0_1, b1_1 = ld_shared_v4_u32(q_addr)
+                        sfb = Uint32(qs_smem[(ht_idx << Int32(3)) + lane_row])
+                        d0, d1, d2, d3 = _mxfp4_mma(
+                            Float32(0.0),
+                            Float32(0.0),
+                            Float32(0.0),
+                            Float32(0.0),
+                            a0_0,
+                            a1_0,
+                            a2_0,
+                            a3_0,
+                            b0_0,
+                            b1_0,
+                            sfa,
+                            sfb,
+                            scale_byte_id=0,
+                        )
+                        d0, d1, d2, d3 = _mxfp4_mma(
+                            d0,
+                            d1,
+                            d2,
+                            d3,
+                            a0_1,
+                            a1_1,
+                            a2_1,
+                            a3_1,
+                            b0_1,
+                            b1_1,
+                            sfa,
+                            sfb,
+                            scale_byte_id=2,
+                        )
+                        w_idx = (head_tile << Int32(2)) + lane_w_off
+                        w_word = Uint32(0)
+                        if cutlass.const_expr(self.heads >= 8):
+                            w_word = Uint32(
+                                w_smem[ql * Int32(weight_pairs_per_row) + w_idx]
+                            )
+                        elif w_idx < Int32(weight_pairs_per_row):
+                            w_word = Uint32(
+                                w_smem[ql * Int32(weight_pairs_per_row) + w_idx]
+                            )
+                        p_lo = _fused_bf16_products_word(
+                            d0, d1, w_word, fused_relu=True
+                        )
+                        p_hi = _fused_bf16_products_word(
+                            d2, d3, w_word, fused_relu=True
+                        )
+                        for hp in cutlass.range_constexpr(min(4, weight_pairs_per_row)):
+                            if cutlass.const_expr(hp == 0):
+                                pk0, pk1 = p_lo, p_hi
+                            else:
+                                pk0 = cute.arch.shuffle_sync_down(p_lo, offset=hp)
+                                pk1 = cute.arch.shuffle_sync_down(p_hi, offset=hp)
+                            if cutlass.const_expr(self.heads == 1):
+                                tot0 += u32_as_f32(pk0 << Uint32(16))
+                                tot1 += u32_as_f32(pk1 << Uint32(16))
+                            else:
+                                tot0 = _fused_bf16_pair_accumulate(tot0, pk0)
+                                tot1 = _fused_bf16_pair_accumulate(tot1, pk1)
+
+                    v0_ok = lane_is_out & p0_valid & (col0 < ext_q) & in_tile0
+                    v1_ok = lane_is_out & p1_valid & (col1 < ext_q) & in_tile1
+                    f0 = Float32(BFloat16(tot0)) if v0_ok else Float32(-float("inf"))
+                    f1 = Float32(BFloat16(tot1)) if v1_ok else Float32(-float("inf"))
+                    u0 = f32_to_raw_bits(f0) >> Uint32(16)
+                    u1 = f32_to_raw_bits(f1) >> Uint32(16)
+                    k0 = _bf16_bits_to_ordered(u0)
+                    k1 = _bf16_bits_to_ordered(u1)
+                    cut_q = Uint32(scalars[Int32(4 + self.q_tile) + ql])
+                    acc0 = v0_ok & (k0 > cut_q)
+                    acc1 = v1_ok & (k1 > cut_q)
+                    m0 = cute.arch.vote_ballot_sync(acc0)
+                    m1 = cute.arch.vote_ballot_sync(acc1)
+                    n0 = Int32(cute.arch.popc(m0))
+                    n1 = Int32(cute.arch.popc(m1))
+                    wn = n0 + n1
+                    if wn > Int32(0):
+                        wbase = Int32(0)
+                        if lane == Int32(0):
+                            wbase = _smem_xadd_i32(scalars_addr, Int32(4) + ql, wn)
+                        wbase = cute.arch.shuffle_sync(wbase, Int32(0))
+                        cbase = ql * Int32(carry_cap)
+                        if acc0:
+                            slot = wbase + Int32(cute.arch.popc(m0 & lt_mask))
+                            carry_val[cbase + slot] = Uint16(u0)
+                            carry_idx[cbase + slot] = col0
+                        if acc1:
+                            slot = wbase + n0 + Int32(cute.arch.popc(m1 & lt_mask))
+                            carry_val[cbase + slot] = Uint16(u1)
+                            carry_idx[cbase + slot] = col1
+
+            cute.arch.sync_threads()
+            for ql in cutlass.range(self.q_tile, unroll=1):
+                cnt = Int32(scalars[Int32(4) + ql])
+                if cnt > Int32(carry_cap - 512):
+                    new_cnt, new_cut = _trim_smem_u16_512(
+                        carry_val,
+                        carry_idx,
+                        ql * Int32(carry_cap),
+                        cnt,
+                        tx,
+                        hist,
+                        out_slots,
+                        scalars,
+                        threads=1024,
+                    )
+                    if tx == Int32(0):
+                        scalars[Int32(4) + ql] = new_cnt
+                        scalars[Int32(4 + self.q_tile) + ql] = Int32(new_cut)
+                    cute.arch.sync_threads()
+            cute.arch.sync_threads()
+            tile += Int32(512)
+
+        for ql in cutlass.range(self.q_tile, unroll=1):
+            r = row_base + ql
+            if r < rows:
+                cnt = Int32(scalars[Int32(4) + ql])
+                if cnt > Int32(512):
+                    cnt, _ = _trim_smem_u16_512(
+                        carry_val,
+                        carry_idx,
+                        ql * Int32(carry_cap),
+                        cnt,
+                        tx,
+                        hist,
+                        out_slots,
+                        scalars,
+                        threads=1024,
+                    )
+                if cutlass.const_expr(self.ctas > 1):
+                    pbase = (Int64(r) * Int64(self.ctas) + Int64(partition)) * Int64(
+                        512
+                    )
+                    if tx < cnt:
+                        partial_values[pbase + Int64(tx)] = Uint16(
+                            carry_val[ql * Int32(carry_cap) + tx]
+                        )
+                        partial_indices[pbase + Int64(tx)] = Int32(
+                            carry_idx[ql * Int32(carry_cap) + tx]
+                        )
+                    if tx == Int32(0):
+                        partial_counts[
+                            Int64(r) * Int64(self.ctas) + Int64(partition)
+                        ] = cnt
+                else:
+                    _bitonic_sort_512_u16_to_out(
+                        out_indices,
+                        out_values,
+                        r,
+                        carry_idx,
+                        carry_val,
+                        ql * Int32(carry_cap),
+                        cnt,
+                        tx,
+                    )
+                    cute.arch.sync_threads()
+
+    @cute.kernel
+    def merge_kernel(
+        self,
+        out_indices,
+        out_values,
+        partial_indices,
+        partial_values,
+        partial_counts,
+        rows: Int32,
+    ):
+        tx_u, _, _ = cute.arch.thread_idx()
+        bx_u, _, _ = cute.arch.block_idx()
+        tx = Int32(tx_u)
+        row = Int32(bx_u)
+        lane = tx % Int32(32)
+        lt_mask = (Uint32(1) << Uint32(lane)) - Uint32(1)
+
+        smem = cutlass.utils.SmemAllocator()
+        carry_val = smem.allocate_tensor(
+            Uint16, cute.make_layout((2048,)), byte_alignment=16
+        )
+        carry_idx = smem.allocate_tensor(
+            Int32, cute.make_layout((2048,)), byte_alignment=16
+        )
+        hist = smem.allocate_tensor(Int32, cute.make_layout((1025,)), byte_alignment=16)
+        out_slots = smem.allocate_tensor(
+            Int32, cute.make_layout((512,)), byte_alignment=16
+        )
+        scalars = smem.allocate_tensor(Int32, cute.make_layout((8,)), byte_alignment=16)
+        scalars_addr = shared_ptr_to_u32(scalars.iterator)
+
+        if tx == Int32(0):
+            scalars[4] = Int32(0)
+        cute.arch.sync_threads()
+        cutoff = Uint32(0x007F)
+
+        for part in cutlass.range(self.ctas):
+            pbase = (Int64(row) * Int64(self.ctas) + Int64(part)) * Int64(512)
+            cnt = Int32(partial_counts[Int64(row) * Int64(self.ctas) + Int64(part)])
+            on = Int32(scalars[4])
+            if on + cnt > Int32(2048):
+                on, cutoff = _trim_smem_u16_512(
+                    carry_val,
+                    carry_idx,
+                    Int32(0),
+                    on,
+                    tx,
+                    hist,
+                    out_slots,
+                    scalars,
+                    threads=512,
+                )
+                if tx == Int32(0):
+                    scalars[4] = on
+                cute.arch.sync_threads()
+            if cnt > Int32(0):
+                u = Uint32(0xFF80)
+                idx_v = Int32(-1)
+                acc = False
+                if tx < cnt:
+                    u = Uint32(partial_values[pbase + Int64(tx)])
+                    idx_v = Int32(partial_indices[pbase + Int64(tx)])
+                    acc = _bf16_bits_to_ordered(u) > cutoff
+                mask = cute.arch.vote_ballot_sync(acc)
+                wn = Int32(cute.arch.popc(mask))
+                wbase = Int32(0)
+                if (lane == Int32(0)) & (wn > Int32(0)):
+                    wbase = _smem_xadd_i32(scalars_addr, Int32(4), wn)
+                wbase = cute.arch.shuffle_sync(wbase, Int32(0))
+                if acc:
+                    slot = wbase + Int32(cute.arch.popc(mask & lt_mask))
+                    carry_val[slot] = Uint16(u)
+                    carry_idx[slot] = idx_v
+                cute.arch.sync_threads()
+
+        on = Int32(scalars[4])
+        if on > Int32(512):
+            on, _ = _trim_smem_u16_512(
+                carry_val,
+                carry_idx,
+                Int32(0),
+                on,
+                tx,
+                hist,
+                out_slots,
+                scalars,
+                threads=512,
+            )
+        _bitonic_sort_512_u16_to_out(
+            out_indices, out_values, row, carry_idx, carry_val, Int32(0), on, tx
+        )

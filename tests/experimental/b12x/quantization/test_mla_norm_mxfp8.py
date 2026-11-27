@@ -63,6 +63,20 @@ def test_launch_policy_is_boolean():
         TUNING.validate_config(query(affine=True), Config(1), None)
 
 
+def test_kv_rope_dim_query_contract():
+    default_q = query()
+    assert default_q.kv_rope_dim == 0
+    TUNING.validate_query(default_q, None)
+
+    fused_q = replace(default_q, kv_rope_dim=64)
+    TUNING.validate_query(fused_q, None)
+    assert TUNING.encode_query(default_q) != TUNING.encode_query(fused_q)
+
+    for bad_dim in (-1, 32, 128, True):
+        with pytest.raises(ValueError, match="kv_rope_dim"):
+            TUNING.validate_query(replace(default_q, kv_rope_dim=bad_dim), None)
+
+
 def reference_quantize(source):
     import torch
 
