@@ -6,7 +6,7 @@ import triton.language as tl
 from b12x.gemm.blockscaled._quantize import _scale_offset
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["COS_STRIDE", "SIN_STRIDE"])
 def mla_norm_mxfp8_kernel(
     X,
     QW,
@@ -22,6 +22,11 @@ def mla_norm_mxfp8_kernel(
     MIN_AMAX: tl.constexpr,
     INCOMING_PDL: tl.constexpr,
     RELEASE_DEPENDENTS: tl.constexpr,
+    COS=None,
+    SIN=None,
+    COS_STRIDE=0,
+    SIN_STRIDE=0,
+    KV_ROPE_DIM: tl.constexpr = 0,
 ):
     row = tl.program_id(0).to(tl.int64)
     task = tl.program_id(1)
@@ -66,5 +71,41 @@ def mla_norm_mxfp8_kernel(
         kx = tl.load(X + row * (Q_FEATURES + KV_FEATURES) + Q_FEATURES + kc).to(
             tl.float32
         )
-        ky = kx * tl.rsqrt(tl.sum(kx * kx, 0) / KV_FEATURES + EPSILON) * kw
-        tl.store(KV + row * KV_FEATURES + kc, ky)
+        kinv = tl.rsqrt(tl.sum(kx * kx, 0) / KV_FEATURES + EPSILON)
+        if KV_ROPE_DIM > 0:
+            NOPE_DIM: tl.constexpr = KV_FEATURES - KV_ROPE_DIM
+            HALF_ROPE: tl.constexpr = KV_ROPE_DIM // 2
+            tl.store(
+                KV + row * KV_FEATURES + kc,
+                (kx * kinv * kw).to(KV.dtype.element_ty),
+                kc < NOPE_DIM,
+            )
+            pair = tl.arange(0, HALF_ROPE)
+            xa = tl.load(
+                X + row * (Q_FEATURES + KV_FEATURES) + Q_FEATURES + NOPE_DIM + 2 * pair
+            ).to(tl.float32)
+            xb = tl.load(
+                X
+                + row * (Q_FEATURES + KV_FEATURES)
+                + Q_FEATURES
+                + NOPE_DIM
+                + 2 * pair
+                + 1
+            ).to(tl.float32)
+            wa = tl.load(KW + NOPE_DIM + 2 * pair).to(tl.float32)
+            wb = tl.load(KW + NOPE_DIM + 2 * pair + 1).to(tl.float32)
+            a = (xa * kinv * wa).to(KV.dtype.element_ty).to(tl.float32)
+            b = (xb * kinv * wb).to(KV.dtype.element_ty).to(tl.float32)
+            cos = tl.load(COS + row * COS_STRIDE + pair).to(tl.float32)
+            sin = tl.load(SIN + row * SIN_STRIDE + pair).to(tl.float32)
+            tl.store(
+                KV + row * KV_FEATURES + NOPE_DIM + 2 * pair,
+                (a * cos - b * sin).to(KV.dtype.element_ty),
+            )
+            tl.store(
+                KV + row * KV_FEATURES + NOPE_DIM + 2 * pair + 1,
+                (a * sin + b * cos).to(KV.dtype.element_ty),
+            )
+        else:
+            ky = kx * kinv * kw
+            tl.store(KV + row * KV_FEATURES + kc, ky)

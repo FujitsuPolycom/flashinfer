@@ -57,14 +57,26 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
         raise ValueError(
             "DMA preparation crossover metadata differs from its runtime channel"
         )
+    world = int(runtime.world_size)
+    if world == 16:
+        steps = 16
+        slab_nbytes = int(runtime._slab_nbytes)
+        local_accum_nbytes = int(runtime._local_accum.nbytes)
+        counter_bytes = 0
+    else:
+        steps = 2 * (world - 1)
+        slab_nbytes = 256 * 128 + steps * int(runtime.shard_capacity)
+        local_accum_nbytes = 0
+        counter_bytes = 3 * 256 * 4
     setup = FrozenMapping(
         {
             "shard_capacity": int(runtime.shard_capacity),
             "flag_slots": 256,
             "flag_stride": 128,
-            "steps": 2 * (int(runtime.world_size) - 1),
-            "slab_nbytes": 256 * 128
-            + 2 * (int(runtime.world_size) - 1) * int(runtime.shard_capacity),
+            "steps": steps,
+            "slab_nbytes": slab_nbytes,
+            "local_accum_nbytes": local_accum_nbytes,
+            "counter_bytes": counter_bytes,
             "stage_nbytes": 0
             if runtime._fp8_stage is None
             else int(runtime._fp8_stage.numel()),
@@ -163,6 +175,9 @@ class _DmaExecutionState:
     def run_reduce_scatter(self, inp, *, out=None):
         return self.runtime._run_prepared_reduce_scatter(inp, out=out, state=self)
 
+    def run_all_to_all(self, inp, *, out=None):
+        return self.runtime._run_prepared_all_to_all(inp, out=out, state=self)
+
     def prime(self, inp, *, out) -> None:
         """Prime the actual caller-owned collective transport after loading code."""
         if self.runtime._fp8 and (
@@ -218,8 +233,9 @@ def plan(
 
     required = (
         int(query.setup["slab_nbytes"])
+        + int(query.setup.get("local_accum_nbytes", 0))
         + int(query.setup["stage_nbytes"])
-        + 3 * int(query.setup["flag_slots"]) * 4
+        + int(query.setup.get("counter_bytes", 3 * int(query.setup["flag_slots"]) * 4))
     )
     memory = FixedMemoryRequirements(
         MemoryRequirements(

@@ -84,6 +84,15 @@ def cached_mxfp8_tc_gemv_flags(
     return flags
 
 
+def mxfp8_tc_gemv_active_k(in_features: int, padded_k: int) -> int:
+    """Return the 64-aligned active K width needed by MXFP8 TC-GEMV.
+
+    Physical weights stay padded to K128 for CUTLASS TMA DenseGemm callers,
+    but TC-GEMV only needs 64-element K chunks covering ``in_features``.
+    """
+    return min(int(padded_k), ((int(in_features) + 63) // 64) * 64)
+
+
 def effective_mxfp8_tc_gemv_warps(padded_k: int, split_k: int, mma_warps: int) -> int:
     chunks_per_split = (int(padded_k) // 64) // int(split_k)
     w = min(int(mma_warps), chunks_per_split)
@@ -306,16 +315,17 @@ class MXFP8MultiRowTCGemvKernel:
         self.nope_dim = self.rope_head_dim - self.rope_dim
         self.n_tiles = self.n_per_cta // 16
         self.k_blocks4 = (self.k // 32 + 3) // 4
-        if self.k % (64 * self.split_k) != 0:
-            raise ValueError(
-                f"MXFP8 TC-GEMV requires padded_k={self.k} divisible by 64*split_k"
-            )
         if self.in_features % 16 != 0 or self.in_features > self.k:
             raise ValueError(
                 "MXFP8 TC-GEMV requires 16-aligned in_features <= padded_k"
             )
-        self.chunks_per_split = (self.k // 64) // self.split_k
-        self.warps = effective_mxfp8_tc_gemv_warps(self.k, self.split_k, warps)
+        self.active_k = mxfp8_tc_gemv_active_k(self.in_features, self.k)
+        if self.active_k % (64 * self.split_k) != 0:
+            raise ValueError(
+                f"MXFP8 TC-GEMV requires active_k={self.active_k} divisible by 64*split_k"
+            )
+        self.chunks_per_split = (self.active_k // 64) // self.split_k
+        self.warps = effective_mxfp8_tc_gemv_warps(self.active_k, self.split_k, warps)
         self.chunks_per_warp = self.chunks_per_split // self.warps
 
     def _shared_storage_cls(self):
@@ -502,7 +512,7 @@ class MXFP8MultiRowTCGemvKernel:
                         x2 = Uint32(0)
                         x3 = Uint32(0)
                         if cutlass.const_expr(
-                            self.in_features == self.k
+                            self.in_features == self.active_k
                         ) or k_col < Int32(self.in_features):
                             x0, x1, x2, x3 = ld_global_nc_v4_u32(px)
                         a0, a1, a2, a3 = bf16_mma_m16n8k16_f32(
@@ -589,7 +599,7 @@ class MXFP8MultiRowTCGemvKernel:
                         x2 = Uint32(0)
                         x3 = Uint32(0)
                         if cutlass.const_expr(
-                            self.in_features == self.k
+                            self.in_features == self.active_k
                         ) or k_col < Int32(self.in_features):
                             x0, x1, x2, x3 = ld_global_nc_v4_u32(px)
                         x_buf[mt, 0], x_buf[mt, 1], x_buf[mt, 2], x_buf[mt, 3] = (
@@ -859,7 +869,8 @@ def compile_mxfp8_tc_gemv(
     n_per_cta: int = 16,
 ):
     max_m_tiles = (int(max_rows) + 7) // 8
-    eff_warps = effective_mxfp8_tc_gemv_warps(padded_k, split_k, warps)
+    active_k = mxfp8_tc_gemv_active_k(in_features, padded_k)
+    eff_warps = effective_mxfp8_tc_gemv_warps(active_k, split_k, warps)
     n_per_cta = int(n_per_cta)
     kernel = MXFP8MultiRowTCGemvKernel(
         n,
@@ -895,7 +906,7 @@ def compile_mxfp8_tc_gemv(
             Int64(in_features),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.blockscaled.mxfp8_tc_gemv", 5, key
+                "gemm.blockscaled.mxfp8_tc_gemv", 6, key
             ),
         )
 
@@ -965,7 +976,8 @@ def compile_mxfp8_tc_gemv_rope(
     rope_dim: int = 64,
 ):
     max_m_tiles = (int(max_rows) + 7) // 8
-    eff_warps = effective_mxfp8_tc_gemv_warps(padded_k, split_k, warps)
+    active_k = mxfp8_tc_gemv_active_k(in_features, padded_k)
+    eff_warps = effective_mxfp8_tc_gemv_warps(active_k, split_k, warps)
     n_per_cta = int(n_per_cta)
     head_dim = int(head_dim)
     rope_dim = int(rope_dim)
@@ -1008,7 +1020,7 @@ def compile_mxfp8_tc_gemv_rope(
             Int64(in_features),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.blockscaled.mxfp8_tc_gemv_rope", 1, key
+                "gemm.blockscaled.mxfp8_tc_gemv_rope", 2, key
             ),
         )
 

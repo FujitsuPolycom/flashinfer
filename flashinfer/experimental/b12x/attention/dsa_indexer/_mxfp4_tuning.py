@@ -199,6 +199,38 @@ def default_fused_config(query, device, *, ctas_per_row=None):
     )
 
 
+def multiquery_q_tile(
+    rows: int, heads: int, *, width: int = 0, hierarchical: bool = False
+) -> int:
+    """Choose grouped-query tile width balancing K reuse and SM utilization."""
+    if hierarchical and rows < 16 and width < 131072:
+        return 2
+    return 4
+
+
+def multiquery_ctas(
+    rows: int,
+    width: int,
+    sms: int,
+    q_tile: int,
+    *,
+    hierarchical: bool = False,
+) -> int:
+    """Choose K-split CTA count per query group for 1024-thread multi-query scoring."""
+    groups = (rows + q_tile - 1) // q_tile
+    tiles512 = max(1, (width + 511) // 512)
+    wave = max(1, sms // max(1, groups))
+    if hierarchical:
+        if groups <= 4:
+            cap = 48 if width >= 131072 else 32
+            return max(1, min(tiles512, min(wave, cap)))
+        return max(1, min(tiles512, wave))
+    if groups * 2 >= sms and width <= 2048:
+        return 1
+    cap = 32 if groups <= 4 else wave
+    return max(1, min(tiles512, min(wave, cap)))
+
+
 def small_output_config(
     width: int, *, aligned_q: bool = False, ordered_output: bool = True
 ):

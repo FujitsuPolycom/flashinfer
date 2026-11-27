@@ -300,6 +300,12 @@ def dense_gemm(
     _target_occupancy_override: Optional[int] = None,
     _split_k_workspace: Optional[torch.Tensor] = None,
     allow_bf16_atomic_reduction: bool = True,
+    residual: Optional[torch.Tensor] = None,
+    rope_cos_sin: Optional[torch.Tensor] = None,
+    rope_head_dim: int = 0,
+    rope_dim: int = 0,
+    rope_split: bool = False,
+    rope_inverse: bool = False,
 ) -> torch.Tensor:
     """Execute dense block-scaled GEMM for one expert-major batch stack.
 
@@ -645,7 +651,12 @@ def dense_gemm(
             f"C row stride, but N={n} and c_dtype={c_dtype!r} produce "
             f"{c_row_stride_bytes} bytes; {remedy}"
         )
-    if is_mxfp8 and _tile_k_override is None and mma_tiler_mn[0] != 128:
+    if (
+        is_mxfp8
+        and _tile_k_override is None
+        and mma_tiler_mn[0] != 128
+        and k % 128 == 0
+    ):
         # A caller's explicit M tile can differ from the default tile that
         # justified automatic BK64 selection. Keep its native BK128 path;
         # an explicitly forced incompatible BK64 still fails validation below.
@@ -699,7 +710,9 @@ def dense_gemm(
             )
         b_launch_torch = rhs_values_tiled
     if is_mxfp8:
-        _validate_mxfp8_bk64_plan(tile_k, mma_tiler_mn, swap_ab)
+        _validate_mxfp8_bk64_plan(
+            tile_k, mma_tiler_mn, swap_ab, allow_short_m=(k % 128 != 0)
+        )
     # k-reuse relies on SFB being the 128x128-block weight operand; with
     # swap_ab the smem B slot holds activations, so force it off there.
     sfb_k_reuse = bool(sfb_k_replicated) and not swap_ab and is_mxfp8
@@ -916,7 +929,7 @@ def dense_gemm(
         expected_scale_mma_shape = (
             32,
             4,
-            1,
+            (m + 127) // 128,
             4,
             quant_c_width // 128,
             1,
@@ -926,10 +939,9 @@ def dense_gemm(
             or swap_ab
             or c_dtype != "bfloat16"
             or m < 1
-            or m > 16
             or n % 32 != 0
             or quant_c_width % 128 != 0
-            or mma_tiler_mn[1] != 64
+            or mma_tiler_mn[1] % 32 != 0
             or quant_c_values.shape != (m, quant_c_width)
             or not quant_c_values.is_contiguous()
             or quant_c_values.dtype != torch.float8_e4m3fn
@@ -939,7 +951,7 @@ def dense_gemm(
             or quant_c_scale_mma.shape != expected_scale_mma_shape
             or quant_c_scale_mma.dtype != torch.float8_e8m0fnu
         ):
-            raise ValueError("quantized C is restricted to the BF16 WO-A decode layout")
+            raise ValueError("quantized C requires aligned BF16 MXFP8 output layout")
         if out is None:
             out = _empty_dense_gemm_output(
                 m,
@@ -1001,6 +1013,105 @@ def dense_gemm(
             quant_c_values_gpu=quant_c_values,
             quant_c_scale_rows_gpu=quant_c_scale_rows,
             quant_c_scale_mma_gpu=quant_c_scale_mma,
+        )
+    if residual is not None or rope_cos_sin is not None or rope_dim > 0:
+        has_residual = residual is not None
+        if has_residual:
+            if (
+                split_k_output
+                or swap_ab
+                or c_dtype != "bfloat16"
+                or n % 8 != 0
+                or residual.dtype != torch.bfloat16
+                or residual.device != a_torch.device
+                or residual.shape != (m, n, l)
+                or residual.data_ptr() % 16 != 0
+                or any(
+                    size > 1 and actual != expected
+                    for size, actual, expected in zip(
+                        (m, n, l), residual.stride(), (n, 1, m * n)
+                    )
+                )
+            ):
+                raise ValueError(
+                    "residual addend requires single-slice unswapped BF16 [M,N,L] "
+                    "matching the dense GEMM output layout"
+                )
+        if rope_cos_sin is not None or rope_dim > 0:
+            if (
+                rope_cos_sin is None
+                or split_k_output
+                or swap_ab
+                or c_dtype != "bfloat16"
+                or rope_dim != 64
+                or rope_head_dim < rope_dim
+                or rope_head_dim % rope_dim != 0
+                or n % rope_head_dim != 0
+                or rope_cos_sin.dtype != torch.float32
+                or rope_cos_sin.device != a_torch.device
+                or not rope_cos_sin.is_contiguous()
+                or rope_cos_sin.data_ptr() % 16 != 0
+                or (
+                    rope_cos_sin.shape != (m, rope_dim)
+                    and rope_cos_sin.shape != (m, rope_dim // 2, 2)
+                )
+            ):
+                raise ValueError(
+                    "Q-RoPE epilogue requires single-slice unswapped BF16 output, "
+                    "rope_dim=64, aligned rope_head_dim dividing N, and contiguous "
+                    "FP32 [M, 64] or [M, 32, 2] cos/sin table"
+                )
+        if out is None:
+            out = _empty_dense_gemm_output(
+                m,
+                n,
+                l,
+                dtype=torch.bfloat16,
+                device=a_torch.device,
+            )
+        compiled_ext = _get_compiled_dense_gemm(
+            n=n,
+            k=k,
+            l=l,
+            c_l=kernel_c_l,
+            a_major="k",
+            b_major="k",
+            c_major="n",
+            ab_dtype=ab_cutlass_dtype,
+            sf_dtype=get_cutlass_dtype(sf_dtype),
+            c_dtype=c_cutlass_dtype,
+            alpha_dtype=get_cutlass_dtype(alpha_dtype),
+            sf_vec_size=sf_vec_size,
+            mma_k=mma_k,
+            tile_k=tile_k,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            policy=policy,
+            sm_count=sm_count,
+            sm_version="sm_120",
+            load_path=load_path,
+            swap_ab=swap_ab,
+            sfb_k_reuse=sfb_k_reuse,
+            b_tile_major=rhs_values_tiled is not None,
+            alpha_is_one=alpha_is_one,
+            plain_fp8=plain_fp8,
+            block_fp8=block_fp8,
+            has_residual=has_residual,
+            rope_head_dim=int(rope_head_dim),
+            rope_dim=int(rope_dim),
+            rope_split=bool(rope_split),
+            rope_inverse=bool(rope_inverse),
+        )
+        return compiled_ext(
+            a_tensor_gpu=a_torch,
+            b_tensor_gpu=b_launch_torch,
+            sfa_tensor_gpu=sfa_torch,
+            sfb_tensor_gpu=sfb_torch,
+            c_tensor_gpu=out,
+            alpha_tensor_gpu=alpha,
+            stream_int=stream_int,
+            residual_gpu=residual,
+            rope_cos_sin_gpu=rope_cos_sin,
         )
     if out is None and not plain_fp8:
         # No caller-owned output buffer: functional launch (allocate + return

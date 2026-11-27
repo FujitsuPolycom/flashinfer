@@ -125,6 +125,23 @@ def _prefill_eligible(query):
 
 
 def default_config(query, device):
+    if (
+        device is not None
+        and device.sm_count >= 128
+        and _tc_eligible(query)
+        and query.max_rows <= 16
+        and query.out_features <= 4096
+    ):
+        n_blocks = (query.out_features + 15) // 16
+        if n_blocks < device.sm_count // 2:
+            tc_splits = _tc_split_k_candidates(query)
+            if any(sk > 1 for sk in tc_splits):
+                target_ctas = min(96, device.sm_count // 2)
+                best_sk = next(
+                    (sk for sk in tc_splits if n_blocks * sk >= target_ctas),
+                    tc_splits[-1],
+                )
+                return GemvConfig(backend="tc", split_k=best_sk)
     if _torch_eligible(query) and query.max_rows > 8:
         return GemvConfig(backend="torch")
     n_tiles = (query.out_features + 63) // 64
@@ -158,11 +175,12 @@ def _tc_split_k_candidates(query):
     cands = []
     if n_blocks >= 32:
         cands.append(1)
+    min_ctas = 16 if n_blocks < 8 else 32
     if n_blocks < 256:
         for sk in TC_SPLIT_K_VALUES:
             if sk == 1:
                 continue
-            if chunks % sk == 0 and 32 <= n_blocks * sk <= 1024:
+            if chunks % sk == 0 and min_ctas <= n_blocks * sk <= 1024:
                 cands.append(sk)
     if not cands:
         cands.append(1)

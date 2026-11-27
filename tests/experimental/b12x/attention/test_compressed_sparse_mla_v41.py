@@ -887,6 +887,339 @@ def test_v41_bf16_extend_mg2_matches_mg1_and_reference_across_boundaries(
     )
 
 
+@pytest.mark.parametrize("indexed_width", [0, 512])
+@torch.inference_mode()
+def test_v41_bf16_extend_causal_tile_skip_edge_lengths_and_graph_replay(
+    indexed_width: int, mla_session
+) -> None:
+    """Verify streaming Q/O, fused S4/S5 barriers, and exact causal/short-row
+    tile skipping across all edge lengths, mixed 0/512 rows, and zero-alloc
+    CUDA-graph replay."""
+    from b12x.attention._shared.mla.compressed_reference import (
+        pack_deepseek_v41_cache_reference,
+    )
+
+    device = require_sm120()
+    heads = 64
+    swa_width = 128
+    # Cover every tile boundary: 0, 1, 17, 63, 64, 65, 127, 128, 255, 512,
+    # including swa=0 + indexed>0, swa>0 + indexed=0, and all-empty rows.
+    edge_pairs = [
+        (0, 0),
+        (0, 1),
+        (0, 64),
+        (0, 512),
+        (1, 0),
+        (17, 1),
+        (63, 17),
+        (64, 63),
+        (65, 64),
+        (127, 65),
+        (128, 128),
+        (128, 255),
+        (128, 512),
+        (64, 512),
+        (1, 512),
+        (0, 255),
+    ]
+    rows = len(edge_pairs)
+    gen = torch.Generator(device=device).manual_seed(4201 + indexed_width)
+    q = (
+        torch.randn((rows, heads, 512), device=device, generator=gen) * 0.25
+    ).bfloat16()
+    sink = torch.linspace(-0.5, 0.4, heads, device=device, dtype=torch.float32)
+
+    swa_vals = (torch.randn((256, 512), device=device, generator=gen) * 0.25).bfloat16()
+    swa = pack_deepseek_v41_cache_reference(swa_vals, page_size=256, cache_kind="swa")
+    swa_indices = (
+        torch.arange(swa_width, device=device, dtype=torch.int32)
+        .unsqueeze(0)
+        .repeat(rows, 1)
+    )
+    swa_indices[5, 3::11] = -1
+    swa_lengths = torch.tensor(
+        [p[0] for p in edge_pairs], device=device, dtype=torch.int32
+    )
+
+    indexed = None
+    indexed_indices = None
+    indexed_lengths = None
+    if indexed_width > 0:
+        idx_vals = (
+            torch.randn((16 * 64, 512), device=device, generator=gen) * 0.25
+        ).bfloat16()
+        indexed = pack_deepseek_v41_cache_reference(
+            idx_vals, page_size=64, cache_kind="indexed"
+        )
+        indexed_indices = (
+            (
+                (torch.arange(indexed_width, device=device, dtype=torch.int32) * 5 + 7)
+                % (16 * 64)
+            )
+            .unsqueeze(0)
+            .repeat(rows, 1)
+        )
+        indexed_indices[9, 11::19] = -1
+        indexed_lengths = torch.tensor(
+            [p[1] for p in edge_pairs], device=device, dtype=torch.int32
+        )
+
+    out = torch.empty_like(q)
+    plan = compressed_sparse_mla.plan(
+        compressed_sparse_mla.Caps(
+            device=device,
+            num_q_heads=heads,
+            max_q_rows=rows,
+            max_width=swa_width + indexed_width,
+            swa_width=swa_width,
+            indexed_width=indexed_width,
+            max_page_table_width=1,
+            swa_page_size=256,
+            indexed_page_size=64,
+            cache_format="deepseek_v41",
+            compute_mode="bf16",
+            mode="extend",
+            use_cuda_graph=True,
+        ),
+        invocation=compressed_sparse_mla.invocation_from_tensors(
+            q=q,
+            swa_k_cache=swa,
+            indexed_k_cache=indexed,
+            attn_sink=sink,
+            out=out,
+            return_lse=True,
+            lse_scale="base2",
+        ),
+    )
+    bind_args = dict(q=q, swa_indices=swa_indices, swa_lengths=swa_lengths)
+    run_args = dict(
+        swa_k_cache=swa,
+        swa_page_size=256,
+        attn_sink=sink,
+        sm_scale=_SM_SCALE,
+        return_lse=True,
+        lse_scale="base2",
+    )
+    if indexed is not None:
+        bind_args.update(
+            indexed_indices=indexed_indices, indexed_lengths=indexed_lengths
+        )
+        run_args.update(indexed_k_cache=indexed, indexed_page_size=64)
+
+    binding, _ = _prepare_binding(mla_session, plan, bind_args, run_args, out)
+    mla_session.freeze()
+
+    def _compact(idx_2d: torch.Tensor, lens: torch.Tensor):
+        comp_idx = torch.full_like(idx_2d, -1)
+        comp_len = torch.zeros_like(lens)
+        for r in range(idx_2d.shape[0]):
+            lim = min(int(lens[r].item()), idx_2d.shape[1])
+            valid_r = idx_2d[r, :lim]
+            valid_r = valid_r[valid_r >= 0]
+            comp_len[r] = int(valid_r.numel())
+            if valid_r.numel() > 0:
+                comp_idx[r, : valid_r.numel()] = valid_r
+        return comp_idx, comp_len
+
+    def _check(actual_out: torch.Tensor, actual_lse: torch.Tensor) -> None:
+        ref_swa_i, ref_swa_l = _compact(swa_indices, swa_lengths)
+        if indexed is not None:
+            ref_idx_i, ref_idx_l = _compact(indexed_indices, indexed_lengths)
+        else:
+            ref_idx_i, ref_idx_l = None, None
+        ref_out, ref_lse = compressed_sparse_mla_reference(
+            q,
+            swa,
+            ref_swa_i,
+            ref_swa_l,
+            extra_k_cache=indexed,
+            extra_indices=ref_idx_i,
+            extra_topk_lengths=ref_idx_l,
+            swa_page_size=256,
+            extra_page_size=64,
+            cache_format="deepseek_v41",
+            attn_sink=sink,
+            sm_scale=_SM_SCALE,
+            return_lse=True,
+        )
+        torch.testing.assert_close(actual_out, ref_out, atol=3e-3, rtol=3e-3)
+        torch.testing.assert_close(
+            actual_lse, ref_lse * 1.4426950408889634, atol=1e-4, rtol=1e-4
+        )
+        # Empty rows must be exact zero output and sink_log2 LSE.
+        empty_mask = (swa_lengths == 0) & (
+            (indexed_lengths == 0) if indexed_lengths is not None else True
+        )
+        if empty_mask.any():
+            assert torch.equal(
+                actual_out[empty_mask], torch.zeros_like(actual_out[empty_mask])
+            )
+
+    _, lse = compressed_sparse_mla.run(binding=binding, out=out, **run_args)
+    torch.cuda.synchronize(device)
+    _check(out, lse)
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            _, g_lse = compressed_sparse_mla.run(binding=binding, out=out, **run_args)
+        # Mutate live lengths across extremes (all-empty, flipped, causal ramp)
+        # and assert zero allocations + numerical parity on every replay.
+        mutations = [
+            (
+                torch.zeros_like(swa_lengths),
+                torch.zeros_like(indexed_lengths) if indexed is not None else None,
+            ),
+            (
+                swa_lengths.flip(0).clone(),
+                indexed_lengths.flip(0).clone() if indexed is not None else None,
+            ),
+            (
+                torch.arange(1, rows + 1, device=device, dtype=torch.int32).clamp(
+                    max=swa_width
+                ),
+                (torch.arange(rows, device=device, dtype=torch.int32) * 33).clamp(
+                    max=indexed_width
+                )
+                if indexed is not None
+                else None,
+            ),
+        ]
+        for new_swa_l, new_idx_l in mutations:
+            swa_lengths.copy_(new_swa_l)
+            if indexed is not None and new_idx_l is not None:
+                indexed_lengths.copy_(new_idx_l)
+            out.fill_(float("nan"))
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            _check(out, g_lse)
+    finally:
+        graph.reset()
+
+
+@pytest.mark.parametrize("q_rows,kv_len", [(1, 64), (512, 8192), (2048, 131072)])
+@torch.inference_mode()
+def test_v41_bf16_extend_large_context_and_chunk0_ramp_parity(
+    q_rows: int, kv_len: int, mla_session
+) -> None:
+    """Exercise production Q/KV scales (q=1..2048, kv_len=64..131072) with
+    causal Chunk-0 ramps and verify exact parity on sampled rows."""
+    from b12x.attention._shared.mla.compressed_reference import (
+        pack_deepseek_v41_cache_reference,
+    )
+
+    device = require_sm120()
+    heads = 64
+    swa_width = 128
+    indexed_width = 512
+    gen = torch.Generator(device=device).manual_seed(4300 + q_rows)
+    q = (
+        torch.randn((q_rows, heads, 512), device=device, generator=gen) * 0.2
+    ).bfloat16()
+    swa_page_size = min(128 + q_rows, 4096)
+    swa_vals = (
+        torch.randn((swa_page_size, 512), device=device, generator=gen) * 0.25
+    ).bfloat16()
+    swa = pack_deepseek_v41_cache_reference(
+        swa_vals, page_size=swa_page_size, cache_kind="swa"
+    )
+    comp_tokens = max(indexed_width, ((kv_len // 2) + 63) // 64 * 64)
+    idx_vals = (
+        torch.randn((comp_tokens, 512), device=device, generator=gen) * 0.25
+    ).bfloat16()
+    indexed = pack_deepseek_v41_cache_reference(
+        idx_vals, page_size=64, cache_kind="indexed"
+    )
+    pos = torch.arange(q_rows, device=device, dtype=torch.int32)
+    swa_indices = (
+        torch.arange(swa_width, device=device, dtype=torch.int32)
+        .unsqueeze(0)
+        .repeat(q_rows, 1)
+    )
+    swa_lengths = (pos + 1).clamp(max=swa_width)
+    indexed_indices = (
+        (
+            (pos.unsqueeze(1) * 37 + 1) * 19
+            + torch.arange(indexed_width, device=device, dtype=torch.int32).unsqueeze(0)
+            * 13
+        )
+        % comp_tokens
+    ).to(torch.int32)
+    indexed_lengths = ((pos + 1) // 2).clamp(max=indexed_width)
+
+    out = torch.empty_like(q)
+    plan = compressed_sparse_mla.plan(
+        compressed_sparse_mla.Caps(
+            device=device,
+            num_q_heads=heads,
+            max_q_rows=q_rows,
+            max_width=swa_width + indexed_width,
+            swa_width=swa_width,
+            indexed_width=indexed_width,
+            max_page_table_width=1,
+            swa_page_size=swa_page_size,
+            indexed_page_size=64,
+            cache_format="deepseek_v41",
+            compute_mode="bf16",
+            mode="extend",
+        ),
+        invocation=compressed_sparse_mla.invocation_from_tensors(
+            q=q,
+            swa_k_cache=swa,
+            indexed_k_cache=indexed,
+            out=out,
+            return_lse=True,
+            lse_scale="base2",
+        ),
+    )
+    bind_args = dict(
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        indexed_indices=indexed_indices,
+        indexed_lengths=indexed_lengths,
+    )
+    run_args = dict(
+        swa_k_cache=swa,
+        swa_page_size=swa_page_size,
+        indexed_k_cache=indexed,
+        indexed_page_size=64,
+        sm_scale=_SM_SCALE,
+        return_lse=True,
+        lse_scale="base2",
+    )
+    binding, _ = _prepare_binding(mla_session, plan, bind_args, run_args, out)
+    mla_session.freeze()
+
+    _, lse = compressed_sparse_mla.run(binding=binding, out=out, **run_args)
+    torch.cuda.synchronize(device)
+
+    sample_rows = sorted(
+        {0, min(63, q_rows - 1), min(128, q_rows - 1), min(511, q_rows - 1), q_rows - 1}
+    )
+    sample_idx = torch.tensor(sample_rows, device=device, dtype=torch.long)
+    ref_out, ref_lse = compressed_sparse_mla_reference(
+        q[sample_idx],
+        swa,
+        swa_indices[sample_idx],
+        swa_lengths[sample_idx],
+        extra_k_cache=indexed,
+        extra_indices=indexed_indices[sample_idx],
+        extra_topk_lengths=indexed_lengths[sample_idx],
+        swa_page_size=swa_page_size,
+        extra_page_size=64,
+        cache_format="deepseek_v41",
+        sm_scale=_SM_SCALE,
+        return_lse=True,
+    )
+    torch.testing.assert_close(out[sample_idx], ref_out, atol=3e-3, rtol=3e-3)
+    torch.testing.assert_close(
+        lse[sample_idx], ref_lse * 1.4426950408889634, atol=1e-4, rtol=1e-4
+    )
+
+
 @pytest.mark.parametrize("swa_width,indexed_width", [(128, 0), (128, 512), (64, 512)])
 @pytest.mark.parametrize("with_sink", [False, True])
 @pytest.mark.parametrize("lse_scale", ["base2", "natural"])

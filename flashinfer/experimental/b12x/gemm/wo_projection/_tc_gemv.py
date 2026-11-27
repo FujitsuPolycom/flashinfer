@@ -38,6 +38,7 @@ from b12x.gemm.blockscaled._mxfp8_tc_gemv import (
 )
 
 _LANES = 32
+_WOA_FLAGS_CACHE: dict[tuple[int, int, int, int, int], torch.Tensor] = {}
 
 
 def _align_up(value: int, alignment: int = 256) -> int:
@@ -61,30 +62,45 @@ def wo_a16_tc_gemv_splitk_bytes(
 def wo_a16_tc_gemv_flags_bytes(groups: int, rank: int, split_k: int) -> int:
     if int(split_k) <= 1:
         return 0
-    return _align_up(int(groups) * ((int(rank) + 15) // 16) * 4, 256)
+    return int(groups) * ((int(rank) + 15) // 16) * 4
 
 
 def wo_a16_tc_gemv_scratch_bytes(
     max_tokens: int, groups: int, rank: int, split_k: int = 1
 ) -> int:
-    return (
-        wo_a16_tc_gemv_tmp_bytes(max_tokens, groups, rank)
-        + wo_a16_tc_gemv_splitk_bytes(max_tokens, groups, rank, split_k)
-        + wo_a16_tc_gemv_flags_bytes(groups, rank, split_k)
+    return wo_a16_tc_gemv_tmp_bytes(max_tokens, groups, rank) + (
+        wo_a16_tc_gemv_splitk_bytes(max_tokens, groups, rank, split_k)
     )
 
 
 def cached_wo_a16_tc_gemv_flags(
     device: torch.device, groups: int, rank: int, group_width: int, split_k: int
 ) -> torch.Tensor:
-    """Allocate a zeroed split-K completion-counter tensor for standalone callers.
+    """Return a cached zero-initialized split-K completion-counter tensor.
 
-    Prepared WO projections place invocation-private completion flags inside
-    their caller-owned scratch buffer rather than sharing a process-global
-    tensor across concurrent streams.
+    ``GroupedWoaTCGemvKernel`` resets each counter back to zero on the final
+    split CTA before exit, so persistent zero-initialized flags require no
+    per-launch memset and remain CUDA-graph safe.
+
+    Like ``_mxfp8_tc_gemv`` and ``_nvfp4_tc_gemv``, this cache assumes
+    single-stream serialized execution per ``(device, groups, rank,
+    group_width, split_k)``; concurrent multi-stream launches with identical
+    shape keys on the same device are unsupported.
     """
+    key = (
+        int(device.index or 0),
+        int(groups),
+        int(rank),
+        int(group_width),
+        int(split_k),
+    )
+    cached = _WOA_FLAGS_CACHE.get(key)
+    if cached is not None:
+        return cached
     n_blocks = int(groups) * ((int(rank) + 15) // 16)
-    return torch.zeros((n_blocks,), dtype=torch.uint32, device=device)
+    flags = torch.zeros((n_blocks,), dtype=torch.uint32, device=device)
+    _WOA_FLAGS_CACHE[key] = flags
+    return flags
 
 
 @dsl_user_op

@@ -59,6 +59,7 @@ from b12x._lib.intrinsics.atomics import (
     ld_shared_f32,
     ld_shared_u32,
     st_shared_bf16_from_f32,
+    st_shared_bf16x2_from_f32,
     st_shared_f32,
     st_shared_u32,
     store_bf16x2,
@@ -92,6 +93,7 @@ from b12x._lib.intrinsics.memory import (
     shared_ptr_to_u32,
     st_shared_u8,
     st_shared_v4_u32,
+    st_global_cs_v4_u32,
     st_global_v4_u32,
 )
 from b12x._lib.intrinsics.constants import mma_m16n8k16_f32_bf16
@@ -3701,6 +3703,7 @@ def s7_epilogue(
     num_threads: cutlass.Constexpr = 0,
     barrier_id: cutlass.Constexpr = 0,
     coalesced_output: cutlass.Constexpr = False,
+    streaming_output: cutlass.Constexpr = False,
 ):
     """S7: normalized O + base-2 LSE epilogue. ``epilogue_mode`` (const_expr)
     selects the destination + normalizer convention; the (gid, d0) output-write
@@ -3796,29 +3799,45 @@ def s7_epilogue(
                 + tid * Int32(2)
             )
             if cutlass.const_expr(coalesced_output):
-                if lo_valid:
-                    st_shared_bf16_from_f32(
-                        staging_base_addr + (gid * Int32(d_v) + d0) * Int32(2),
-                        acc_nope[at][0] * inv_g0,
-                    )
-                    st_shared_bf16_from_f32(
-                        staging_base_addr
-                        + (gid * Int32(d_v) + d0 + Int32(1)) * Int32(2),
-                        acc_nope[at][1] * inv_g0,
-                    )
-                if cutlass.const_expr(valid_hpb > 8):
-                    if hi_valid:
+                if cutlass.const_expr(streaming_output):
+                    if lo_valid:
+                        st_shared_bf16x2_from_f32(
+                            staging_base_addr + (gid * Int32(d_v) + d0) * Int32(2),
+                            acc_nope[at][0] * inv_g0,
+                            acc_nope[at][1] * inv_g0,
+                        )
+                    if cutlass.const_expr(valid_hpb > 8):
+                        if hi_valid:
+                            st_shared_bf16x2_from_f32(
+                                staging_base_addr
+                                + ((gid + Int32(8)) * Int32(d_v) + d0) * Int32(2),
+                                acc_nope[at][2] * inv_g1,
+                                acc_nope[at][3] * inv_g1,
+                            )
+                else:
+                    if lo_valid:
                         st_shared_bf16_from_f32(
-                            staging_base_addr
-                            + ((gid + Int32(8)) * Int32(d_v) + d0) * Int32(2),
-                            acc_nope[at][2] * inv_g1,
+                            staging_base_addr + (gid * Int32(d_v) + d0) * Int32(2),
+                            acc_nope[at][0] * inv_g0,
                         )
                         st_shared_bf16_from_f32(
                             staging_base_addr
-                            + ((gid + Int32(8)) * Int32(d_v) + d0 + Int32(1))
-                            * Int32(2),
-                            acc_nope[at][3] * inv_g1,
+                            + (gid * Int32(d_v) + d0 + Int32(1)) * Int32(2),
+                            acc_nope[at][1] * inv_g0,
                         )
+                    if cutlass.const_expr(valid_hpb > 8):
+                        if hi_valid:
+                            st_shared_bf16_from_f32(
+                                staging_base_addr
+                                + ((gid + Int32(8)) * Int32(d_v) + d0) * Int32(2),
+                                acc_nope[at][2] * inv_g1,
+                            )
+                            st_shared_bf16_from_f32(
+                                staging_base_addr
+                                + ((gid + Int32(8)) * Int32(d_v) + d0 + Int32(1))
+                                * Int32(2),
+                                acc_nope[at][3] * inv_g1,
+                            )
             elif cutlass.const_expr(_ot == cutlass.BFloat16):
                 if lo_valid:
                     store_bf16x2(
@@ -3909,21 +3928,52 @@ def s7_epilogue(
     if cutlass.const_expr(coalesced_output):
         cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads)
         stores_per_head = d_v // 8
-        store_idx = warp_id * Int32(32) + lane
-        while store_idx < Int32(valid_hpb * stores_per_head):
-            h = store_idx // Int32(stores_per_head)
-            d8 = (store_idx - h * Int32(stores_per_head)) * Int32(8)
-            v0, v1, v2, v3 = ld_shared_v4_u32(
-                staging_base_addr + (h * Int32(d_v) + d8) * Int32(2)
-            )
-            st_global_v4_u32(
-                get_ptr_as_int64(out_o, h.to(Int64) * Int64(d_v) + d8.to(Int64)),
-                v0,
-                v1,
-                v2,
-                v3,
-            )
-            store_idx += Int32(num_threads)
+        total_stores = valid_hpb * stores_per_head
+        if cutlass.const_expr(streaming_output and total_stores % num_threads == 0):
+            store_steps = total_stores // num_threads
+            for step in cutlass.range_constexpr(store_steps):
+                store_idx = Int32(step * num_threads) + warp_id * Int32(32) + lane
+                h = store_idx // Int32(stores_per_head)
+                d8 = (store_idx - h * Int32(stores_per_head)) * Int32(8)
+                v0, v1, v2, v3 = ld_shared_v4_u32(
+                    staging_base_addr + (h * Int32(d_v) + d8) * Int32(2)
+                )
+                st_global_cs_v4_u32(
+                    get_ptr_as_int64(out_o, h.to(Int64) * Int64(d_v) + d8.to(Int64)),
+                    v0,
+                    v1,
+                    v2,
+                    v3,
+                )
+        else:
+            store_idx = warp_id * Int32(32) + lane
+            while store_idx < Int32(total_stores):
+                h = store_idx // Int32(stores_per_head)
+                d8 = (store_idx - h * Int32(stores_per_head)) * Int32(8)
+                v0, v1, v2, v3 = ld_shared_v4_u32(
+                    staging_base_addr + (h * Int32(d_v) + d8) * Int32(2)
+                )
+                if cutlass.const_expr(streaming_output):
+                    st_global_cs_v4_u32(
+                        get_ptr_as_int64(
+                            out_o, h.to(Int64) * Int64(d_v) + d8.to(Int64)
+                        ),
+                        v0,
+                        v1,
+                        v2,
+                        v3,
+                    )
+                else:
+                    st_global_v4_u32(
+                        get_ptr_as_int64(
+                            out_o, h.to(Int64) * Int64(d_v) + d8.to(Int64)
+                        ),
+                        v0,
+                        v1,
+                        v2,
+                        v3,
+                    )
+                store_idx += Int32(num_threads)
 
     # Base-2 LSE: only zero sums denote empty splits; NaNs reach the split merge.
     if warp_id == Int32(0) and tid == Int32(0):
