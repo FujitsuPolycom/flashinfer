@@ -462,7 +462,11 @@ class PCIeDmaAllReduce:
         return 1
 
     def should_all_to_all(self, inp: torch.Tensor) -> bool:
-        if self._closed or self.world_size not in ALL_TO_ALL_WORLD_SIZES or inp.device != self.device:
+        if (
+            self._closed
+            or self.world_size not in ALL_TO_ALL_WORLD_SIZES
+            or inp.device != self.device
+        ):
             return False
         if inp.dtype not in ALL_TO_ALL_DTYPES:
             return False

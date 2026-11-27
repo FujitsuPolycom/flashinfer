@@ -227,7 +227,9 @@ def test_all_to_all_flag_slots_disjoint_from_ring_and_prime() -> None:
     max_world = max(ALL_TO_ALL_WORLD_SIZES)
     assert set(ALL_TO_ALL_WORLD_SIZES) <= set(SUPPORTED_WORLD_SIZES)
     tp16_runtime = _stub_channel(world_size=16, max_bytes=16 * 256, shard_capacity=256)
-    assert not tp16_runtime.should_all_to_all(torch.zeros((16, 128), dtype=torch.bfloat16))
+    assert not tp16_runtime.should_all_to_all(
+        torch.zeros((16, 128), dtype=torch.bfloat16)
+    )
     max_steps = max_world - 1
     ring_data = set(range(2 * max_steps * MAX_PIECES))
     a2a_data = {
