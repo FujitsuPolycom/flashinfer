@@ -28,6 +28,7 @@ META = OpMeta(
         "query_from_call",
         "quantize_rows",
         "quantize_dense_rows",
+        "swiglu_quantize_rows",
         "is_supported",
     ),
     dtypes=("bf16", "fp16"),
@@ -55,6 +56,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         query_from_call,
         quantize_rows,
         quantize_dense_rows,
+        swiglu_quantize_rows,
     )
 
 install_lazy_api(globals(), META)

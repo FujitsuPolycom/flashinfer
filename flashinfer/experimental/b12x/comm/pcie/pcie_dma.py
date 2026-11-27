@@ -35,6 +35,8 @@ SUPPORTED_DTYPES = {
     torch.float16: 1,
     torch.float32: 2,
 }
+ALL_TO_ALL_DTYPES = frozenset((*SUPPORTED_DTYPES, torch.float8_e4m3fn, torch.uint8))
+ALL_TO_ALL_WORLD_SIZES = (2, 3, 4, 6, 8, 10)
 SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8, 10, 16)
 FLAG_STRIDE = 128
 FLAG_SLOTS = 256
@@ -44,6 +46,12 @@ _DONE_CROSS_SLOT = FLAG_SLOTS - 3
 MAX_PIECES = 8
 SCRATCH_ALIGN = 256
 FP8_QUANT_BLOCK = 128
+# Flag slots [0 .. 2 * (max_world - 1) * MAX_PIECES - 1] (= 0..143 for TP10)
+# belong to ring/FP8 data steps, and slots 254..255 belong to ring done and
+# priming. Reserve disjoint ranges in 144..253 for all_to_all data and barriers.
+_A2A_DATA_FLAG_BASE = 144
+_A2A_READY_FLAG_BASE = 224
+_A2A_DONE_FLAG_BASE = 240
 
 
 def _create_high_priority_stream(device: torch.device) -> torch.cuda.ExternalStream:
@@ -445,6 +453,35 @@ class PCIeDmaAllReduce:
         size_bytes = numel * inp.element_size()
         return inp.is_contiguous() and size_bytes <= self.max_bytes
 
+    def _pick_a2a_pieces(self, slice_bytes: int) -> int:
+        override = self._pieces_override
+        candidates = (override,) if 1 <= override <= MAX_PIECES else (2,)
+        for pieces in candidates:
+            if slice_bytes % (pieces * 16) == 0 and slice_bytes // pieces >= 512 << 10:
+                return pieces
+        return 1
+
+    def should_all_to_all(self, inp: torch.Tensor) -> bool:
+        if (
+            self._closed
+            or self.world_size not in ALL_TO_ALL_WORLD_SIZES
+            or inp.device != self.device
+        ):
+            return False
+        if inp.dtype not in ALL_TO_ALL_DTYPES:
+            return False
+        if inp.ndim < 2 or inp.shape[0] != self.world_size:
+            return False
+        if not inp.is_contiguous():
+            return False
+        slice_elems = inp.numel() // self.world_size
+        slice_bytes = slice_elems * inp.element_size()
+        if slice_bytes <= 0 or slice_bytes % 16 != 0:
+            return False
+        if slice_bytes > self.shard_capacity:
+            return False
+        return slice_bytes * self.world_size <= self.max_bytes
+
     def prepare_eager_replay(
         self, dtype: torch.dtype, *, max_elements: int | None = None
     ) -> None:
@@ -610,6 +647,52 @@ class PCIeDmaAllReduce:
                 device=self.device,
             )
         return state.run_reduce_scatter(inp, out=out)
+
+    def all_to_all(
+        self,
+        inp: torch.Tensor,
+        *,
+        plan: Plan,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Experimental Copy-Engine all-to-all `[world_size, *slice] -> [world_size, *slice]`.
+
+        Exchanges ``inp[peer]`` from this rank to ``out[self.rank]`` on ``peer``
+        across the channel's preallocated IPC scratch slots without arithmetic.
+        Each rank transfers ``(world_size - 1) * slice_bytes`` over PCIe.
+
+        Experimental API: opt in by preparing a DMA plan for this channel via
+        ``b12x.comm.pcie.plan(query, runtime=channel)`` and passing the
+        materialized ``plan`` here.
+
+        Limitations:
+            - Supported dtypes: ``torch.bfloat16``, ``torch.float16``,
+              ``torch.float32``, ``torch.float8_e4m3fn``, ``torch.uint8``.
+            - ``inp`` (and ``out`` when provided) must be contiguous on this
+              channel's CUDA device, with ``inp.ndim >= 2`` and
+              ``inp.shape[0] == self.world_size``.
+            - Each per-peer slice must be nonzero, 16-byte aligned, and at most
+              ``self.shard_capacity`` bytes, with ``inp.nbytes <= self.max_bytes``.
+            - ``out`` must match ``inp`` shape, dtype, and device, and be either
+              storage-disjoint from ``inp`` or identical to ``inp`` (in-place);
+              partially overlapping storage is rejected.
+            - Channel submissions must be serialized across invocations and graphs.
+        """
+
+        state = require_prepared(plan, "comm.pcie", self.device)
+        if not hasattr(state, "require_runtime") or not hasattr(
+            state, "run_all_to_all"
+        ):
+            raise TypeError("plan does not contain a prepared DMA channel")
+        state.require_runtime(self)
+        if not self.should_all_to_all(inp):
+            raise ValueError(
+                "input does not satisfy PCIe DMA all_to_all requirements "
+                f"(shape={tuple(inp.shape)}, dtype={inp.dtype}, device={inp.device})"
+            )
+        if out is None:
+            out = torch.empty_like(inp)
+        return state.run_all_to_all(inp, out=out)
 
     @contextmanager
     def capture(self, stream: torch.cuda.Stream | None = None):
@@ -1163,6 +1246,134 @@ class PCIeDmaAllReduce:
         kernels.dma_wait_flag(
             self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
         )
+        return out
+
+    def _run_prepared_all_to_all(
+        self, inp: torch.Tensor, *, out: Optional[torch.Tensor], state
+    ) -> torch.Tensor:
+        state.require_runtime(self)
+        torch.cuda.set_device(self.device)
+        if not self.should_all_to_all(inp):
+            raise ValueError(
+                "input does not satisfy PCIe DMA all_to_all requirements "
+                f"(shape={tuple(inp.shape)}, dtype={inp.dtype}, device={inp.device})"
+            )
+        if (
+            out is None
+            or out.shape != inp.shape
+            or out.dtype != inp.dtype
+            or out.device != self.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                f"DMA all_to_all output must be contiguous {tuple(inp.shape)} "
+                f"{inp.dtype} on {self.device}"
+            )
+        in_base = inp.data_ptr()
+        out_base = out.data_ptr()
+        total_bytes = inp.numel() * inp.element_size()
+        in_place = in_base == out_base
+        if (
+            not in_place
+            and in_base < out_base + total_bytes
+            and out_base < in_base + total_bytes
+        ):
+            raise ValueError(
+                "DMA all_to_all requires disjoint or identical input and output storage"
+            )
+
+        kernels = self._kernels
+        world = self.world_size
+        rank = self.rank
+        steps = world - 1
+        slice_bytes = total_bytes // world
+        pieces = self._pick_a2a_pieces(slice_bytes)
+        piece_bytes = slice_bytes // pieces
+
+        main = torch.cuda.current_stream(self.device)
+        copy_stream = self._copy_stream
+        flag_stream = self._flag_stream
+        copied = self._copied_events
+
+        # Entry handshake across every peer prevents overwriting peer scratch
+        # slots still being read by a preceding ring collective or replay,
+        # while overlapping the local self-copy on main.
+        for step in range(steps):
+            src_peer = (rank - 1 - step) % world
+            slot = _A2A_READY_FLAG_BASE + step
+            kernels.dma_set_flag(
+                self._flag_ptr(src_peer, slot),
+                self._counter_ptr(self._send_counters, slot),
+            )
+        if not in_place:
+            kernels.dma_copy(
+                out_base + rank * slice_bytes,
+                in_base + rank * slice_bytes,
+                slice_bytes,
+            )
+        for step in range(steps):
+            slot = _A2A_READY_FLAG_BASE + step
+            kernels.dma_wait_flag(
+                self._flag_ptr(rank, slot),
+                self._counter_ptr(self._wait_counters, slot),
+            )
+
+        self._input_ready.record(main)
+        copy_stream.wait_event(self._input_ready)
+        flag_stream.wait_event(self._input_ready)
+
+        for p in range(pieces):
+            for step in range(steps):
+                dst_peer = (rank + 1 + step) % world
+                ev = copied[step * pieces + p]
+                fslot = _A2A_DATA_FLAG_BASE + step * MAX_PIECES + p
+                with torch.cuda.stream(copy_stream):
+                    kernels.dma_copy(
+                        self._scratch_ptr(dst_peer, step) + p * piece_bytes,
+                        in_base + dst_peer * slice_bytes + p * piece_bytes,
+                        piece_bytes,
+                    )
+                    ev.record(copy_stream)
+                with torch.cuda.stream(flag_stream):
+                    flag_stream.wait_event(ev)
+                    kernels.dma_set_flag(
+                        self._flag_ptr(dst_peer, fslot),
+                        self._counter_ptr(self._send_counters, fslot),
+                    )
+
+        if in_place:
+            # All outgoing reads from inp must finish before main overwrites out.
+            main.wait_stream(copy_stream)
+
+        for p in range(pieces):
+            for step in range(steps):
+                src_peer = (rank - 1 - step) % world
+                fslot = _A2A_DATA_FLAG_BASE + step * MAX_PIECES + p
+                kernels.dma_wait_flag(
+                    self._flag_ptr(rank, fslot),
+                    self._counter_ptr(self._wait_counters, fslot),
+                )
+                kernels.dma_copy(
+                    out_base + src_peer * slice_bytes + p * piece_bytes,
+                    self._scratch_ptr(rank, step) + p * piece_bytes,
+                    piece_bytes,
+                )
+
+        main.wait_stream(copy_stream)
+        main.wait_stream(flag_stream)
+        for step in range(steps):
+            src_peer = (rank - 1 - step) % world
+            slot = _A2A_DONE_FLAG_BASE + step
+            kernels.dma_set_flag(
+                self._flag_ptr(src_peer, slot),
+                self._counter_ptr(self._send_counters, slot),
+            )
+        for step in range(steps):
+            slot = _A2A_DONE_FLAG_BASE + step
+            kernels.dma_wait_flag(
+                self._flag_ptr(rank, slot),
+                self._counter_ptr(self._wait_counters, slot),
+            )
         return out
 
     def _finish_4x4_handshake(self, main: torch.cuda.Stream) -> None:

@@ -878,6 +878,7 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
             dynamic_route_mode="direct" if direct_routing else "grouped",
             deterministic_output=plan.deterministic_output,
             w4a8_n64_repacked=n64_repacked,
+            prequantized_input=bool(caps.prequantized_input),
         )
         and _impl._env_flag(
             _impl._DYNAMIC_EXTERNAL_ROUTE_PLAN_ENV,
@@ -1887,6 +1888,30 @@ def _dynamic_route_plan_payloads(plan, caps):
         if planned is not None
         else (16, 32, 64, 128)
     )
+    if dynamic["prequantized_input"]:
+        w4a8_repacked = bool(dynamic["w4a8_repacked"])
+        raw_routes = bool(dynamic["raw_routes"])
+        det = bool(plan.deterministic_output)
+        payloads = []
+        for tile in tiles:
+            full_route_plan = bool(
+                w4a8_repacked
+                and tile in {16, 64, 128}
+                and not dynamic["direct_routing"]
+            )
+            for ids_dtype in ("int32", "int64"):
+                payloads.append(
+                    {
+                        "num_experts": int(plan.weight_E),
+                        "tile_m": tile,
+                        "ids_dtype": ids_dtype,
+                        "prequantized_input": True,
+                        "num_topk": int(plan.num_topk),
+                        "full_route_plan": full_route_plan,
+                        "store_pair_idx": bool(det or raw_routes),
+                    }
+                )
+        return tuple(payloads)
     return tuple(
         {"num_experts": int(plan.weight_E), "tile_m": tile, "ids_dtype": ids_dtype}
         for tile in tiles
@@ -1905,6 +1930,72 @@ def compile_dynamic_route_plan(payload, ordinal):
     tile_m = int(payload["tile_m"])
     ids_dtype = getattr(torch, payload["ids_dtype"])
     block_e = 1 << (num_experts - 1).bit_length()
+    if payload.get("prequantized_input", False):
+        num_topk = int(payload["num_topk"])
+        full_route_plan = bool(payload["full_route_plan"])
+        store_pair_idx = bool(payload["store_pair_idx"])
+        rows = _impl._DYNAMIC_PREQUANT_EXTERNAL_ROUTE_PLAN_MAX_ROWS
+        compiled = []
+        with torch.cuda.device(ordinal):
+            compiled.append(
+                _impl._prequant_route_init_zero_kernel.warmup(
+                    MockTensor(torch.int32, (num_experts,)),
+                    MockTensor(torch.int32, (num_experts,)),
+                    MockTensor(torch.int32, (1,)),
+                    MockTensor(torch.int32, (1,)),
+                    NUM_EXPERTS=num_experts,
+                    BLOCK_E=block_e,
+                    RESET_BARRIER=not full_route_plan,
+                    num_warps=4,
+                    grid=(1,),
+                )
+            )
+            compiled.append(
+                _impl._prequant_route_hist_kernel.warmup(
+                    MockTensor(ids_dtype, (rows,)),
+                    MockTensor(torch.int32, (num_experts,)),
+                    rows,
+                    NUM_EXPERTS=num_experts,
+                    BLOCK_ROUTES=_impl._PREQUANT_ROUTE_HIST_BLOCK,
+                    num_warps=4,
+                    grid=(1,),
+                )
+            )
+            compiled.append(
+                _impl._prequant_route_prefix_kernel.warmup(
+                    MockTensor(torch.int32, (num_experts,)),
+                    MockTensor(torch.int32, (num_experts + 1,)),
+                    NUM_EXPERTS=num_experts,
+                    TILE_M=tile_m,
+                    BLOCK_E=block_e,
+                    num_warps=4,
+                    grid=(1,),
+                )
+            )
+            if full_route_plan:
+                compiled.append(
+                    _impl._prequant_route_scatter_kernel.warmup(
+                        MockTensor(ids_dtype, (rows,)),
+                        MockTensor(torch.float32, (rows,)),
+                        MockTensor(torch.int32, (num_experts,)),
+                        MockTensor(torch.int32, (num_experts,)),
+                        MockTensor(torch.int32, (num_experts + 1,)),
+                        MockTensor(torch.int32, (rows,)),
+                        MockTensor(torch.float32, (rows,)),
+                        MockTensor(torch.int32, (rows,)),
+                        MockTensor(torch.int32, (rows,)),
+                        rows,
+                        5,
+                        NUM_EXPERTS=num_experts,
+                        NUM_TOPK=num_topk,
+                        TILE_M=tile_m,
+                        BLOCK_ROUTES=_impl._PREQUANT_ROUTE_SCATTER_BLOCK,
+                        STORE_PAIR_IDX=store_pair_idx,
+                        num_warps=4,
+                        grid=(1,),
+                    )
+                )
+        return tuple(compiled)
     rows = _impl._DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS
     with torch.cuda.device(ordinal):
         return _impl._dynamic_route_plan_kernel.warmup(

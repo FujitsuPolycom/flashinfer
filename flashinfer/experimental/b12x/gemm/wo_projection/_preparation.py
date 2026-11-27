@@ -257,8 +257,47 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
                     dtype=torch.float8_e4m3fn,
                     device="meta",
                 )
+            a_lowering = _lower_query(a_query, device.identity, a_options)
+            if (
+                not use_fused_b
+                and caps.dtype == torch.bfloat16
+                and caps.rank % 32 == 0
+                and (caps.rank * caps.groups) % 128 == 0
+                and a_lowering.policy.split_k_slices == 1
+                and not a_lowering.swap_ab
+                and not a_lowering.plain_fp8
+                and not a_lowering.is_mxfp6
+                and a_lowering.mma_tiler_mn[1] % 32 == 0
+            ):
+                quant_width = caps.rank * caps.groups
+                a_quant_options = dict(a_options)
+                a_quant_options["_quantized_c"] = (
+                    torch.empty(
+                        (caps.max_tokens, quant_width),
+                        dtype=torch.float8_e4m3fn,
+                        device="meta",
+                    ),
+                    torch.empty(
+                        (caps.max_tokens, quant_width // 32),
+                        dtype=torch.float8_e8m0fnu,
+                        device="meta",
+                    ),
+                    torch.empty(
+                        (
+                            32,
+                            4,
+                            (caps.max_tokens + 127) // 128,
+                            4,
+                            quant_width // 128,
+                            1,
+                        ),
+                        dtype=torch.float8_e8m0fnu,
+                        device="meta",
+                    ),
+                )
+                a_lowering = _lower_query(a_query, device.identity, a_quant_options)
             ordinary[key] = (
-                _lower_query(a_query, device.identity, a_options),
+                a_lowering,
                 _default_lowering(b_query, device.identity),
             )
         return ordinary[key]
@@ -792,6 +831,15 @@ class _PreparedWO:
         a_values = binding.weights.wo_a.values
         if a_values.ndim == 2:
             a_values = a_values.unsqueeze(-1)
+        quantized_c = (
+            (
+                binding.tmp_q.values,
+                binding.tmp_q.scale_rows.reshape(tokens, -1),
+                binding.tmp_q.scale_mma,
+            )
+            if self.ordinary_a.lowering.quantize_c
+            else None
+        )
         self.ordinary_a.run(
             (
                 binding.x_q.values.view(
@@ -808,6 +856,7 @@ class _PreparedWO:
                 if self.ordinary_a.lowering.b_tile_major
                 else None
             ),
+            quantized_c=quantized_c,
         )
         if self.fused_b is not None:
             source = binding.tmp
@@ -827,7 +876,8 @@ class _PreparedWO:
                 ),
             )
         else:
-            self.quantizers.quantize_b(binding.tmp, binding.tmp_q)
+            if quantized_c is None:
+                self.quantizers.quantize_b(binding.tmp, binding.tmp_q)
             self.ordinary_b.run(
                 (binding.tmp_q.values.unsqueeze(-1), binding.tmp_q.scale_mma),
                 (
@@ -889,6 +939,15 @@ class _PreparedWO:
         a_values = binding.weights.wo_a.values
         if a_values.ndim == 2:
             a_values = a_values.unsqueeze(-1)
+        quantized_c = (
+            (
+                binding.tmp_q.values,
+                binding.tmp_q.scale_rows.reshape(tokens, -1),
+                binding.tmp_q.scale_mma,
+            )
+            if self.ordinary_a.lowering.quantize_c
+            else None
+        )
         self.ordinary_a.run(
             (
                 binding.x_q.values.view(
@@ -905,6 +964,7 @@ class _PreparedWO:
                 if self.ordinary_a.lowering.b_tile_major
                 else None
             ),
+            quantized_c=quantized_c,
         )
         if self.fused_b is not None:
             source = (
@@ -925,7 +985,8 @@ class _PreparedWO:
                 ),
             )
         else:
-            self.quantizers.quantize_b(binding.tmp, binding.tmp_q)
+            if quantized_c is None:
+                self.quantizers.quantize_b(binding.tmp, binding.tmp_q)
             self.ordinary_b.run(
                 (binding.tmp_q.values.unsqueeze(-1), binding.tmp_q.scale_mma),
                 (
