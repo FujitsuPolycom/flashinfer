@@ -16,8 +16,12 @@ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
 from b12x.moe._shared.kernels.w4a8_compact_projection import (
+    W4A8CompactCoalesceRoutesKernel,
+    W4A8CompactCoalescedFC1Kernel,
+    W4A8CompactCoalescedFC2Kernel,
     W4A8CompactMicroProjectionActivationKernel,
     W4A8CompactMicroProjectionKernel,
+    W4A8CompactTopkSumKernel,
 )
 from b12x.moe._shared.kernels.w4a8_compact_activation import (
     W4A8CompactMicroActivationKernel,
@@ -26,6 +30,8 @@ from b12x.moe._shared.kernels.w4a8_phase2 import W4A8MaterializedPhase2Kernel
 
 
 _ALIGN = 256
+_COALESCED_MAX_TOKENS = 16
+_COALESCED_MAX_PAIRS = 256
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -34,6 +40,14 @@ def _ceil_div(x: int, y: int) -> int:
 
 def _align_up(x: int, alignment: int = _ALIGN) -> int:
     return _ceil_div(x, alignment) * alignment
+
+
+def _coalesced_eligible(max_tokens: int, num_topk: int, fc1_tile_n: int = 128) -> bool:
+    return (
+        int(fc1_tile_n) in (64, 128)
+        and 2 <= int(max_tokens) <= _COALESCED_MAX_TOKENS
+        and int(max_tokens) * int(num_topk) <= _COALESCED_MAX_PAIRS
+    )
 
 
 @program_cache
@@ -52,12 +66,24 @@ def _layout(
     rows = cap * topk
     n_tiles = _ceil_div(n, 128)
     n_padded = n_tiles * 128
+    coalesce_meta_bytes = (
+        (1 + 10 * rows) * 4
+        if cap <= _COALESCED_MAX_TOKENS and rows <= _COALESCED_MAX_PAIRS
+        else 4
+    )
+    route_outputs_bytes = (
+        rows * k * 2
+        if cap <= _COALESCED_MAX_TOKENS and rows <= _COALESCED_MAX_PAIRS
+        else 4
+    )
     regions = (
         ("a_values", cap * k),
         ("a_scales", cap * (k // 32)),
         ("a_mma_scales", _ceil_div(cap, 128) * _ceil_div(k, 128) * 512),
         ("projections", cap * topk * 2 * n * 2),
         ("intermediate", rows * n_padded + rows * n_tiles * 4),
+        ("coalesce_meta", coalesce_meta_bytes),
+        ("route_outputs", route_outputs_bytes),
     )
     offset = 0
     result: dict[str, tuple[int, int]] = {}
@@ -98,6 +124,7 @@ class _DirectW4A8CompactLaunch:
         fc1_max_copy_groups: int = 2,
         fuse_input_quantization: bool = False,
         fc1_pipeline_stages: int = 2,
+        coalesced: bool | None = None,
     ):
         self.capacity = max_tokens
         self.topk = num_topk
@@ -112,13 +139,51 @@ class _DirectW4A8CompactLaunch:
             swiglu_limit=swiglu_limit,
             fast_math=fast_math,
         )
-        self.fuse_activation = fc1_tile_n == 128 and 4 <= self.capacity <= 8
+        if coalesced is None:
+            self.coalesced = _coalesced_eligible(max_tokens, num_topk, fc1_tile_n)
+        else:
+            self.coalesced = bool(coalesced)
+            if self.coalesced and (
+                fc1_tile_n not in (64, 128)
+                or max_tokens > _COALESCED_MAX_TOKENS
+                or max_tokens * num_topk > _COALESCED_MAX_PAIRS
+            ):
+                raise ValueError(
+                    "coalesced compact W4A8 requires fc1_tile_n in (64, 128), "
+                    f"max_tokens <= {_COALESCED_MAX_TOKENS}, and "
+                    f"max_tokens * num_topk <= {_COALESCED_MAX_PAIRS}"
+                )
+        self.fuse_activation = self.coalesced or (
+            fc1_tile_n == 128 and 4 <= self.capacity <= 8
+        )
         if fuse_input_quantization and not self.fuse_activation:
             raise ValueError(
                 "fused input quantization requires paired compact projections"
             )
         self.fuse_input_quantization = bool(fuse_input_quantization)
-        if self.fuse_activation:
+        if self.coalesced:
+            max_pairs = self.capacity * self.topk
+            self.coalesce = W4A8CompactCoalesceRoutesKernel(max_pairs, experts)
+            self.projection = W4A8CompactCoalescedFC1Kernel(
+                k,
+                n,
+                num_topk,
+                max_pairs,
+                self.activation,
+                tile_n=fc1_tile_n,
+                csf_inline=csf_inline_scales,
+                max_copy_groups=fc1_max_copy_groups,
+                fuse_input_quantization=self.fuse_input_quantization,
+                pipeline_stages=fc1_pipeline_stages,
+            )
+            self.phase2 = W4A8CompactCoalescedFC2Kernel(
+                k,
+                n,
+                max_pairs,
+                csf_inline=csf_inline_scales,
+            )
+            self.topk_sum = W4A8CompactTopkSumKernel(k, num_topk, experts)
+        elif self.fuse_activation:
             self.projection = W4A8CompactMicroProjectionActivationKernel(
                 k,
                 n,
@@ -128,6 +193,14 @@ class _DirectW4A8CompactLaunch:
                 max_copy_groups=fc1_max_copy_groups,
                 fuse_input_quantization=self.fuse_input_quantization,
                 pipeline_stages=fc1_pipeline_stages,
+            )
+            self.phase2 = W4A8MaterializedPhase2Kernel(
+                source_tile_m=1,
+                deterministic_output=True,
+                direct_routes=True,
+                fused_topk=num_topk,
+                n64_repacked=self.n % 128 == 64,
+                n64_tail=self.n % 128 == 64,
             )
         else:
             self.projection = W4A8CompactMicroProjectionKernel(
@@ -139,16 +212,16 @@ class _DirectW4A8CompactLaunch:
                 max_copy_groups=fc1_max_copy_groups,
                 pipeline_stages=fc1_pipeline_stages,
             )
-        self.phase2 = W4A8MaterializedPhase2Kernel(
-            source_tile_m=1,
-            deterministic_output=True,
-            direct_routes=True,
-            fused_topk=num_topk,
-            n64_repacked=self.n % 128 == 64,
-            n64_tail=self.n % 128 == 64,
-        )
+            self.phase2 = W4A8MaterializedPhase2Kernel(
+                source_tile_m=1,
+                deterministic_output=True,
+                direct_routes=True,
+                fused_topk=num_topk,
+                n64_repacked=self.n % 128 == 64,
+                n64_tail=self.n % 128 == 64,
+            )
 
-        if self.capacity == 16:
+        if not self.coalesced and self.capacity == 16:
             self.phase2._route_buffer_slots = (
                 (self.topk + self.phase2.fused_groups - 1)
                 // self.phase2.fused_groups
@@ -176,6 +249,8 @@ class _DirectW4A8CompactLaunch:
         w13_scales_ptr: cute.Pointer,
         intermediate_ptr: cute.Pointer,
         projections_ptr: cute.Pointer,
+        coalesce_meta_ptr: cute.Pointer,
+        route_outputs_ptr: cute.Pointer,
         token_weights_ptr: cute.Pointer,
         topk_ids_ptr: cute.Pointer,
         alpha1_ptr: cute.Pointer,
@@ -223,9 +298,6 @@ class _DirectW4A8CompactLaunch:
             projections_ptr,
             cute.make_ordered_layout((pairs, 2 * self.n), order=(1, 0)),
         )
-        # Direct kernels only use this tensor's bounded shape, never its data.
-        token_map = cute.make_tensor(intermediate_ptr, cute.make_layout((rows,)))
-        unused_metadata = cute.make_tensor(intermediate_ptr, cute.make_layout((1,)))
         token_weights = cute.make_tensor(token_weights_ptr, cute.make_layout((pairs,)))
         topk_ids = cute.make_tensor(topk_ids_ptr, cute.make_layout((pairs,)))
         alpha1 = cute.make_tensor(alpha1_ptr, cute.make_layout((self.experts,)))
@@ -240,6 +312,51 @@ class _DirectW4A8CompactLaunch:
             output_ptr,
             cute.make_ordered_layout((self.capacity, self.k), order=(1, 0)),
         )
+        if cutlass.const_expr(self.coalesced):
+            coalesce_meta = cute.make_tensor(
+                coalesce_meta_ptr, cute.make_layout((1 + 10 * pairs,))
+            )
+            route_outputs = cute.make_tensor(
+                route_outputs_ptr, cute.make_layout((pairs * self.k,))
+            )
+            self.coalesce(topk_ids, coalesce_meta, num_pairs, stream)
+            source_a = cute.make_tensor(
+                source_a_ptr, cute.make_layout((self.capacity * self.k,))
+            )
+            input_source = source_a
+            if cutlass.const_expr(not self.fuse_input_quantization):
+                input_source = packed_a
+            self.projection(
+                input_source,
+                a_scales,
+                w13,
+                w13_scales,
+                intermediate,
+                coalesce_meta,
+                alpha1,
+                input_scale,
+                num_pairs,
+                max_active_clusters,
+                stream,
+            )
+            self.phase2(
+                intermediate,
+                w2,
+                w2_scales,
+                route_outputs,
+                token_weights,
+                coalesce_meta,
+                alpha2,
+                down_scale,
+                num_pairs,
+                max_active_clusters,
+                stream,
+            )
+            self.topk_sum(route_outputs, topk_ids, output, num_pairs, stream)
+            return
+        # Direct kernels only use this tensor's bounded shape, never its data.
+        token_map = cute.make_tensor(intermediate_ptr, cute.make_layout((rows,)))
+        unused_metadata = cute.make_tensor(intermediate_ptr, cute.make_layout((1,)))
         if cutlass.const_expr(self.fuse_activation):
             source_a = cute.make_tensor(
                 source_a_ptr, cute.make_layout((self.capacity * self.k,))
@@ -321,6 +438,7 @@ def _compiled_direct_w4a8_compact(
     fc1_max_copy_groups: int = 2,
     fuse_input_quantization: bool = False,
     fc1_pipeline_stages: int = 2,
+    coalesced: bool | None = None,
 ):
     launch = _DirectW4A8CompactLaunch(
         max_tokens=max_tokens,
@@ -337,6 +455,7 @@ def _compiled_direct_w4a8_compact(
         fc1_max_copy_groups=fc1_max_copy_groups,
         fuse_input_quantization=fuse_input_quantization,
         fc1_pipeline_stages=fc1_pipeline_stages,
+        coalesced=coalesced,
     )
     ids_type = cutlass.Int32 if ids_dtype == torch.int32 else cutlass.Int64
 
@@ -363,6 +482,7 @@ def _compiled_direct_w4a8_compact(
             fc1_max_copy_groups,
             bool(fuse_input_quantization),
             fc1_pipeline_stages,
+            bool(launch.coalesced),
         ),
     )
     return b12x_compile(
@@ -373,6 +493,8 @@ def _compiled_direct_w4a8_compact(
         dummy(cutlass.Uint32),
         dummy(cutlass.Uint32),
         dummy(cutlass.Uint32),
+        dummy(cutlass.BFloat16),
+        dummy(cutlass.Int32, 4),
         dummy(cutlass.BFloat16),
         dummy(cutlass.Float32, 4),
         dummy(ids_type, 4 if ids_dtype == torch.int32 else 8),
@@ -388,7 +510,7 @@ def _compiled_direct_w4a8_compact(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a8.compact_micro",
-            32,
+            37,
             (
                 max_tokens,
                 num_topk,
@@ -405,6 +527,7 @@ def _compiled_direct_w4a8_compact(
                 fc1_max_copy_groups,
                 bool(fuse_input_quantization),
                 fc1_pipeline_stages,
+                bool(launch.coalesced),
             ),
         ),
     )
@@ -447,11 +570,24 @@ def launch_w4a8_compact_micro(
     fc1_tile_n: int = 128,
     prequant_a_values: torch.Tensor | None = None,
     prequant_a_scales: torch.Tensor | None = None,
+    coalesced: bool | None = None,
 ) -> torch.Tensor:
     """Run compact W4A8 projections and ordered route reduction into output."""
     if max_active_clusters is not None and max_active_clusters <= 0:
         raise ValueError("max_active_clusters must be positive when set")
-    if a.dtype != torch.bfloat16 or a.ndim != 2 or not a.is_contiguous():
+    has_prequant = (
+        not fuse_input_quantization
+        and prequant_a_values is not None
+        and prequant_a_scales is not None
+    )
+    if (
+        (
+            a.dtype != torch.bfloat16
+            and not (has_prequant and a.dtype == torch.float8_e4m3fn)
+        )
+        or a.ndim != 2
+        or not a.is_contiguous()
+    ):
         raise ValueError("a must be a contiguous BF16 [tokens, K] CUDA tensor")
     if topk_ids.dtype not in (torch.int32, torch.int64):
         raise TypeError("topk_ids must be int32 or int64")
@@ -484,11 +620,9 @@ def launch_w4a8_compact_micro(
 
     intermediate = region("intermediate")
     projections = region("projections")
-    if (
-        not fuse_input_quantization
-        and prequant_a_values is not None
-        and prequant_a_scales is not None
-    ):
+    coalesce_meta = region("coalesce_meta")
+    route_outputs = region("route_outputs")
+    if has_prequant:
         if (
             prequant_a_values.dtype != torch.uint8
             or prequant_a_scales.dtype != torch.uint8
@@ -496,11 +630,11 @@ def launch_w4a8_compact_micro(
             or not prequant_a_scales.is_contiguous()
             or prequant_a_values.device != a.device
             or prequant_a_scales.device != a.device
-            or prequant_a_values.numel() < cap * k
-            or prequant_a_scales.numel() < cap * (k // 32)
+            or prequant_a_values.numel() < num_tokens * k
+            or prequant_a_scales.numel() < num_tokens * (k // 32)
         ):
             raise ValueError(
-                "prequantized MXFP8 buffers must be contiguous uint8 covering [max_tokens, K] and [max_tokens, K//32]"
+                "prequantized MXFP8 buffers must be contiguous uint8 covering [tokens, K] and [tokens, K//32]"
             )
         values = prequant_a_values
         scale_rows = prequant_a_scales
@@ -533,6 +667,7 @@ def launch_w4a8_compact_micro(
         fc1_max_copy_groups,
         fuse_input_quantization,
         fc1_pipeline_stages,
+        coalesced,
     )
     ids = topk_ids.reshape(-1)
     weights = topk_weights.reshape(-1)
@@ -544,6 +679,8 @@ def launch_w4a8_compact_micro(
         _ptr(cutlass.Uint32, w13_scales),
         _ptr(cutlass.Uint32, intermediate),
         _ptr(cutlass.BFloat16, projections),
+        _ptr(cutlass.Int32, coalesce_meta, align=4),
+        _ptr(cutlass.BFloat16, route_outputs),
         _ptr(cutlass.Float32, weights, align=4),
         _ptr(
             cutlass.Int32 if ids.dtype == torch.int32 else cutlass.Int64,

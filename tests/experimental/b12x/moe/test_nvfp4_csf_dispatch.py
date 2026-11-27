@@ -316,7 +316,7 @@ def test_paired_projection_input_quantization_is_a_prepared_choice(
     )
     configs = [c for _, c in TUNING.eligible_plan(query, DEVICE).candidates]
     fused = [c for c in configs if c.compact_fuse_input_quantization]
-    assert bool(fused) == (4 <= capacity <= 8)
+    assert bool(fused) == (2 <= capacity <= 16)
     for config in configs:
         assert MoeDecodeConfig.from_config(FrozenMapping(config.to_dict())) == config
         if config.compact_fuse_input_quantization:
@@ -327,7 +327,7 @@ def test_paired_projection_input_quantization_is_a_prepared_choice(
     standalone = MoeDecodeConfig("micro", "internal", None)
     if capacity <= 16:
         fused_override = replace(standalone, compact_fuse_input_quantization=True)
-        if 4 <= capacity <= 8:
+        if 2 <= capacity <= 16:
             assert (
                 TUNING.configure(query, device=DEVICE, override=fused_override).default
                 == fused_override

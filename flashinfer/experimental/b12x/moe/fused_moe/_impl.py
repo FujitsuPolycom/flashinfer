@@ -2477,7 +2477,7 @@ _MICRO_DYNAMIC_CUTOVER_PAIRS_DEFAULT = 64
 # Micro keeps the m tokens' activations resident in registers; 8 is the budget
 # ceiling. Micro is correct for any 1<=m<=8 (not just powers of two).
 _MICRO_MAX_TOKENS = 8
-_COMPACT_W4A8_MAX_TOKENS = 8
+_COMPACT_W4A8_MAX_TOKENS = 16
 _COMPACT_W4A8_MAX_TOKENS_SM121 = 4
 # Prepared MXFP4 decode keeps the shared-input producer through M=8, while
 # pair-direct routing wins through M=4 for the common top-k=8 regime.
@@ -2892,9 +2892,8 @@ def _w4a8_mx_micro_preferred(
         and query.intermediate_size % 128 == 64
         and query.num_tokens > compact_max_tokens
     ):
-        # No-tune heuristic: keep per-row compact micro within the L2-resident
-        # token band (<=8 on SM120, <=4 on SM121) and route larger capacities
-        # to grouped M16 dynamic to avoid ungrouped expert weight thrash.
+        # No-tune heuristic: compact decode stays on the micro kernel through
+        # 16 tokens on SM120 (coalesced) and 4 tokens on SM121.
         return False
     return not (
         capability == (12, 1)
@@ -3093,10 +3092,20 @@ def _heuristic_moe_decode_config(
         # kernel; there is no micro specialization for them.
         backend = "dynamic"
     elif query.quant_mode == "w4a8_mx":
+        compact_prequant_micro = bool(
+            query.prequantized_input
+            and query.source_format == "fp4_e8m0_k32"
+            and query.intermediate_size % 128 == 64
+            and _w4a8_mx_micro_preferred(query, device)
+        )
         backend = (
-            "dynamic"
-            if query.prequantized_input
-            else ("micro" if _w4a8_mx_micro_preferred(query, device) else "dynamic")
+            "micro"
+            if compact_prequant_micro
+            else (
+                "dynamic"
+                if query.prequantized_input
+                else ("micro" if _w4a8_mx_micro_preferred(query, device) else "dynamic")
+            )
         )
     else:
         backend = select_tp_moe_backend(
@@ -3121,12 +3130,13 @@ def _heuristic_moe_decode_config(
             and query.intermediate_size % 128 == 64
         )
         if compact_n64_pipeline:
-            # Larger compact launches use the split-materialized M16 kernels.
-            # The direct compact micro path owns one through sixteen live tokens.
-            # Pre-quantized MXFP8 inputs use dense shared-input repacked routing:
-            # M64 for moderate prefill densities and M128 (with exact N64 Phase 1
-            # and K64 Phase 2) once average expert occupancy reaches >= 48 rows.
-            if query.prequantized_input:
+            # Larger compact launches use the split-materialized M16 kernels
+            # through 128 tokens (including pre-quantized MXFP8 inputs). Wider
+            # pre-quantized prefill batches use dense shared-input repacked
+            # routing: M64 for moderate prefill densities and M128 (with exact
+            # N64 Phase 1 and K64 Phase 2) once average expert occupancy reaches
+            # >= 48 rows.
+            if query.prequantized_input and query.num_tokens > 128:
                 dynamic_tile_m = (
                     128 if query.routed_rows >= 48 * query.num_experts else 64
                 )
@@ -14947,8 +14957,14 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             fast_math=fast_math,
             csf_inline_scales=inline_scales is not None,
             fuse_input_quantization=plan.decode_config.compact_fuse_input_quantization,
-            prequant_a_values=binding.prequant_a_values,
-            prequant_a_scales=binding.prequant_a_scales,
+            prequant_a_values=(
+                a.view(torch.uint8) if prequantized_input else binding.prequant_a_values
+            ),
+            prequant_a_scales=(
+                binding.a_scales.view(torch.uint8)
+                if prequantized_input
+                else binding.prequant_a_scales
+            ),
         )
         return scatter_output
 

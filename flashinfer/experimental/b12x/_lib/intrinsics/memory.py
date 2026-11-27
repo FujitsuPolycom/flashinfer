@@ -1207,6 +1207,33 @@ def cp_async_u32_shared_global(
 
 
 @dsl_user_op
+def cp_async_u32_shared_global_l2hint(
+    smem_addr: Int32,
+    gmem_addr: Int64,
+    cache_policy: Uint64,
+    *,
+    loc=None,
+    ip=None,
+):
+    """4-byte `cp.async.ca.shared.global.L2::cache_hint` copy."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+            Uint64(cache_policy).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.ca.shared.global.L2::cache_hint [$0], [$1], 4, $2;",
+        "r,l,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def cp_async_u32_shared_global_zfill(
     smem_addr: Int32, gmem_addr: Int64, valid: Int32, *, loc=None, ip=None
 ):
@@ -1260,6 +1287,33 @@ def cp_async4_shared_global(smem_addr: Int32, gmem_addr: Int64, *, loc=None, ip=
         ],
         "cp.async.cg.shared.global [$0], [$1], 16;",
         "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def cp_async4_shared_global_l2hint(
+    smem_addr: Int32,
+    gmem_addr: Int64,
+    cache_policy: Uint64,
+    *,
+    loc=None,
+    ip=None,
+):
+    """16-byte `cp.async.cg.shared.global.L2::cache_hint` copy."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+            Uint64(cache_policy).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.cg.shared.global.L2::cache_hint [$0], [$1], 16, $2;",
+        "r,l,l",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

@@ -29,6 +29,14 @@ META = OpMeta(
         "SMALL_M_MAX",
         "SMALL_N_GEMV_MAX_OUT",
         "SMALL_N_GEMV_MIN_IN",
+        "VocabSummaryBuffers",
+        "VocabSummaryResult",
+        "vocab_summary_tile_n",
+        "vocab_summary_num_tiles",
+        "allocate_vocab_summary_outputs",
+        "bf16_gemv_vocab_summary_stage1",
+        "reduce_vocab_tile_summaries",
+        "bf16_gemv_vocab_summary",
     ),
     dtypes=("bf16",),
     provenance=Provenance(
@@ -57,6 +65,14 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         mm,
         plan,
         query_from_call,
+        VocabSummaryBuffers,
+        VocabSummaryResult,
+        allocate_vocab_summary_outputs,
+        bf16_gemv_vocab_summary,
+        bf16_gemv_vocab_summary_stage1,
+        reduce_vocab_tile_summaries,
+        vocab_summary_num_tiles,
+        vocab_summary_tile_n,
     )
 
 install_lazy_api(globals(), META)
