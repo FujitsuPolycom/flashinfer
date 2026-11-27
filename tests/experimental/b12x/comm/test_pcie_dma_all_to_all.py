@@ -21,6 +21,7 @@ from b12x.comm.pcie._dma_preparation import (
 from b12x.comm.pcie._tuning import PcieQuery
 from b12x.comm.pcie.pcie_dma import (
     ALL_TO_ALL_DTYPES,
+    ALL_TO_ALL_WORLD_SIZES,
     FLAG_SLOTS,
     FLAG_STRIDE,
     MAX_PIECES,
@@ -83,7 +84,7 @@ def _stub_prepared_plan(runtime: PCIeDmaAllReduce) -> tuple[Plan, _DmaExecutionS
     return plan, state
 
 
-@pytest.mark.parametrize("world_size", SUPPORTED_WORLD_SIZES)
+@pytest.mark.parametrize("world_size", ALL_TO_ALL_WORLD_SIZES)
 def test_should_all_to_all_contract(world_size: int) -> None:
     slice_bytes = 256
     runtime = _stub_channel(
@@ -223,7 +224,10 @@ def test_all_to_all_validates_before_allocating_and_rejects_partial_aliasing(
 
 
 def test_all_to_all_flag_slots_disjoint_from_ring_and_prime() -> None:
-    max_world = max(SUPPORTED_WORLD_SIZES)
+    max_world = max(ALL_TO_ALL_WORLD_SIZES)
+    assert set(ALL_TO_ALL_WORLD_SIZES) <= set(SUPPORTED_WORLD_SIZES)
+    tp16_runtime = _stub_channel(world_size=16, max_bytes=16 * 256, shard_capacity=256)
+    assert not tp16_runtime.should_all_to_all(torch.zeros((16, 128), dtype=torch.bfloat16))
     max_steps = max_world - 1
     ring_data = set(range(2 * max_steps * MAX_PIECES))
     a2a_data = {
