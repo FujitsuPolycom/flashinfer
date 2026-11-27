@@ -277,6 +277,8 @@ def _select_mxfp8_tile_k(
     expected_m: Optional[int],
     sm_count: int,
 ) -> int:
+    if k % 128 != 0 and k % 64 == 0:
+        return 64
     plan_m = expected_m if expected_m is not None else m
     if _use_high_sm_mxfp8_bk64_prefill(expected_m, n, k, sm_count):
         return 64
@@ -344,8 +346,10 @@ def _validate_mxfp8_bk64_plan(
     tile_k: int,
     mma_tiler_mn: Tuple[int, int],
     swap_ab: bool,
+    *,
+    allow_short_m: bool = False,
 ) -> None:
-    if tile_k == 64 and (mma_tiler_mn[0] != 128 or swap_ab):
+    if tile_k == 64 and (swap_ab or (not allow_short_m and mma_tiler_mn[0] != 128)):
         raise ValueError(
             "MXFP8 BK64 packed-scale staging requires an unswapped "
             f"128-row tile, got tile={mma_tiler_mn}, swap_ab={swap_ab}"

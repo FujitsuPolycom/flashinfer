@@ -126,6 +126,9 @@ _DYNAMIC_WORK_SOURCE_ENV = "B12X_DYNAMIC_WORK_SOURCE"
 _DYNAMIC_WORK_SOURCE_DEFAULT = "materialized_queue"
 _DYNAMIC_EXTERNAL_ROUTE_PLAN_ENV = "B12X_DYNAMIC_EXTERNAL_ROUTE_PLAN"
 _DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS = 256
+_DYNAMIC_PREQUANT_EXTERNAL_ROUTE_PLAN_MAX_ROWS = 131072
+_PREQUANT_ROUTE_HIST_BLOCK = 1024
+_PREQUANT_ROUTE_SCATTER_BLOCK = 256
 _DYNAMIC_WORK_SOURCES = {
     "persistent_grid",
     "materialized_queue",
@@ -854,12 +857,19 @@ class TPMoEScratchCaps:
     w4a16_a4_prefill_terms: int = 1
     w4a16_a4_prefill_warps: int = 8
     prequantized_input: bool = False
+    reserve_sms: int = 0
     frozen: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_tokens", max(int(self.max_tokens), 1))
         object.__setattr__(self, "num_topk", max(int(self.num_topk), 1))
         object.__setattr__(self, "device", torch.device(self.device))
+        if (
+            isinstance(self.reserve_sms, bool)
+            or not isinstance(self.reserve_sms, int)
+            or self.reserve_sms < 0
+        ):
+            raise ValueError("reserve_sms must be a non-negative integer")
         if not isinstance(self.decode_config, MoeDecodeConfig):
             raise TypeError("decode_config must be a concrete MoeDecodeConfig")
         if not isinstance(self.weight_plan, MoEWeightPreparationPlan):
@@ -2149,6 +2159,105 @@ def _dynamic_route_plan_kernel(
     tl.store(expert_tile_base + NUM_EXPERTS, tl.sum(tiles, axis=0))
 
 
+@triton.jit
+def _prequant_route_init_zero_kernel(
+    row_counts,
+    expert_write_rows,
+    barrier_count,
+    barrier_epoch,
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    RESET_BARRIER: tl.constexpr,
+):
+    """Zero routing counters in a single CTA before multi-CTA histogramming."""
+    experts = tl.arange(0, BLOCK_E)
+    mask = experts < NUM_EXPERTS
+    tl.store(row_counts + experts, 0, mask=mask)
+    tl.store(expert_write_rows + experts, 0, mask=mask)
+    if RESET_BARRIER:
+        tl.store(barrier_count, 0)
+        tl.store(barrier_epoch, 0)
+
+
+@triton.jit(do_not_specialize=["live_routes"])
+def _prequant_route_hist_kernel(
+    topk_ids,
+    row_counts,
+    live_routes,
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK_ROUTES: tl.constexpr,
+):
+    """Multi-CTA parallel expert histogram for prequantized W4A8 prefill."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_ROUTES + tl.arange(0, BLOCK_ROUTES)
+    ids = tl.load(topk_ids + offs, mask=offs < live_routes, other=-1)
+    valid = (offs < live_routes) & (ids >= 0) & (ids < NUM_EXPERTS)
+    e = tl.where(valid, ids, 0).to(tl.int32)
+    tl.atomic_add(row_counts + e, 1, mask=valid, sem="relaxed")
+
+
+@triton.jit
+def _prequant_route_prefix_kernel(
+    row_counts,
+    expert_tile_base,
+    NUM_EXPERTS: tl.constexpr,
+    TILE_M: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    """Compute exclusive physical tile offsets for all experts."""
+    experts = tl.arange(0, BLOCK_E)
+    expert_mask = experts < NUM_EXPERTS
+    counts = tl.load(row_counts + experts, mask=expert_mask, other=0)
+    tiles = (counts + TILE_M - 1) // TILE_M
+    tiles = tl.where(expert_mask, tiles, 0)
+    inclusive = tl.cumsum(tiles, axis=0)
+    tl.store(expert_tile_base + experts, inclusive - tiles, mask=expert_mask)
+    tl.store(expert_tile_base + NUM_EXPERTS, tl.sum(tiles, axis=0))
+
+
+@triton.jit(do_not_specialize=["live_routes", "gate_tile_cnt"])
+def _prequant_route_scatter_kernel(
+    topk_ids,
+    topk_weights,
+    row_counts,
+    expert_write_rows,
+    expert_tile_base,
+    token_map,
+    token_weights,
+    task_expert,
+    task_valid_rows,
+    live_routes,
+    gate_tile_cnt,
+    NUM_EXPERTS: tl.constexpr,
+    NUM_TOPK: tl.constexpr,
+    TILE_M: tl.constexpr,
+    BLOCK_ROUTES: tl.constexpr,
+    STORE_PAIR_IDX: tl.constexpr,
+):
+    """Multi-CTA route scatter and per-tile task metadata publication."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_ROUTES + tl.arange(0, BLOCK_ROUTES)
+    ids = tl.load(topk_ids + offs, mask=offs < live_routes, other=-1)
+    valid = (offs < live_routes) & (ids >= 0) & (ids < NUM_EXPERTS)
+    e = tl.where(valid, ids, 0).to(tl.int32)
+    w = tl.load(topk_weights + offs, mask=valid, other=0.0)
+    row = tl.atomic_add(expert_write_rows + e, 1, mask=valid, sem="relaxed")
+    tile_in_e = row // TILE_M
+    row_in_tile = row % TILE_M
+    base = tl.load(expert_tile_base + e, mask=valid, other=0)
+    phys_tile = base + tile_in_e
+    phys_row = phys_tile * TILE_M + row_in_tile
+    map_val = offs if STORE_PAIR_IDX else (offs // NUM_TOPK)
+    tl.store(token_map + phys_row, map_val.to(tl.int32), mask=valid)
+    tl.store(token_weights + phys_row, w, mask=valid)
+    is_tile_first = valid & (row_in_tile == 0)
+    total_e_rows = tl.load(row_counts + e, mask=is_tile_first, other=0)
+    valid_rows = tl.minimum(TILE_M, total_e_rows - row)
+    meta_idx = phys_tile * gate_tile_cnt
+    tl.store(task_expert + meta_idx, e, mask=is_tile_first)
+    tl.store(task_valid_rows + meta_idx, valid_rows, mask=is_tile_first)
+
+
 def _dynamic_direct_routing_candidate(
     *,
     quant_mode: str,
@@ -2220,12 +2329,22 @@ def _dynamic_external_route_plan_supported(
     dynamic_route_mode: str,
     deterministic_output: bool,
     w4a8_n64_repacked: bool = False,
+    prequantized_input: bool = False,
 ) -> bool:
+    qm = _normalize_quant_mode(quant_mode)
+    if (
+        prequantized_input
+        and qm == "w4a8_mx"
+        and activation in {"silu", SITU}
+        and int(planned_tile_m) in {16, 32, 64, 128}
+        and 0 < int(routed_rows) <= _DYNAMIC_PREQUANT_EXTERNAL_ROUTE_PLAN_MAX_ROWS
+        and dynamic_route_mode == "grouped"
+        and not deterministic_output
+        and _dynamic_work_source() in {_DYNAMIC_WORK_SOURCE_DEFAULT, "persistent_grid"}
+    ):
+        return True
     return bool(
-        (
-            _normalize_quant_mode(quant_mode) == "nvfp4"
-            or (_normalize_quant_mode(quant_mode) == "w4a8_mx" and w4a8_n64_repacked)
-        )
+        (qm == "nvfp4" or (qm == "w4a8_mx" and w4a8_n64_repacked))
         and activation == "silu"
         and int(planned_tile_m) == 16
         and 0 < int(routed_rows) <= _DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS
@@ -2966,11 +3085,17 @@ def _heuristic_moe_decode_config(
         )
         if compact_n64_pipeline:
             # Larger compact launches use the split-materialized M16 kernels
-            # through 128 tokens (including pre-quantized MXFP8 inputs), and
-            # switch to M64 for wider pre-quantized prefill batches.
-            dynamic_tile_m = (
-                64 if (query.prequantized_input and query.num_tokens > 128) else 16
-            )
+            # through 128 tokens (including pre-quantized MXFP8 inputs). Wider
+            # pre-quantized prefill batches use dense shared-input repacked
+            # routing: M64 for moderate prefill densities and M128 (with exact
+            # N64 Phase 1 and K64 Phase 2) once average expert occupancy reaches
+            # >= 48 rows.
+            if query.prequantized_input and query.num_tokens > 128:
+                dynamic_tile_m = (
+                    128 if query.routed_rows >= 48 * query.num_experts else 64
+                )
+            else:
+                dynamic_tile_m = 16
             dynamic_route_mode = "grouped"
         else:
             dynamic_n = _dynamic_kernel_intermediate_size(
@@ -2989,6 +3114,13 @@ def _heuristic_moe_decode_config(
             )[0]
             if query.prequantized_input and dynamic_tile_m == 16:
                 dynamic_tile_m = 32
+            if (
+                query.prequantized_input
+                and query.quant_mode == "w4a8_mx"
+                and query.routed_rows >= 96 * query.num_experts
+                and (device is None or device.compute_capability != (12, 1))
+            ):
+                dynamic_tile_m = 128
             dynamic_route_mode = (
                 "grouped"
                 if query.prequantized_input
@@ -2998,9 +3130,31 @@ def _heuristic_moe_decode_config(
                     planned_tile_m=dynamic_tile_m,
                 )
             )
+    route_planner = "internal"
+    if (
+        backend == "dynamic"
+        and query.prequantized_input
+        and query.quant_mode == "w4a8_mx"
+        and query.output_layout == "token"
+        and query.num_tokens < 4096
+        and _dynamic_external_route_plan_supported(
+            quant_mode=query.quant_mode,
+            activation=query.activation,
+            routed_rows=query.routed_rows,
+            planned_tile_m=dynamic_tile_m,
+            dynamic_route_mode=dynamic_route_mode,
+            deterministic_output=bool(query.deterministic_output),
+            w4a8_n64_repacked=bool(
+                query.source_format == "fp4_e8m0_k32"
+                and query.intermediate_size % 128 == 64
+            ),
+            prequantized_input=True,
+        )
+    ):
+        route_planner = "triton"
     return MoeDecodeConfig(
         backend=backend,
-        route_planner="internal",
+        route_planner=route_planner,
         max_active_clusters=None,
         dynamic_tile_m=dynamic_tile_m,
         dynamic_route_mode=dynamic_route_mode,
@@ -8720,6 +8874,7 @@ def _plan_full_rotation_w4a16_launches(
                 intermediate_hadamard=core_plan.intermediate_hadamard,
                 rotation_input_dtype=rotation_input_dtype,
                 broadcast_suh=broadcast_suh,
+                reserve_sms=caps.reserve_sms,
             )
 
         fused_launches = tuple(
@@ -11941,7 +12096,7 @@ def _get_dynamic_kernel(
         ),
         compile_spec=KernelCompileSpec.from_key(
             "integration.tp_moe.dynamic",
-            21,
+            22,
             cache_key,
         ),
         dsl_compile_options=dsl_compile_options,
@@ -12137,6 +12292,7 @@ def _launch_dynamic_flat(
         dynamic_route_mode=("direct" if direct_routing else "grouped"),
         deterministic_output=deterministic_output,
         w4a8_n64_repacked=w4a8_n64_repacked,
+        prequantized_input=prequantized_input,
     )
     external_route_plan = bool(
         external_route_plan_supported
@@ -12267,24 +12423,102 @@ def _launch_dynamic_flat(
 
     if external_route_plan:
         block_e = 1 << (int(E) - 1).bit_length()
-        # A planned launch: compile-only planning warms and records this
-        # specialization, so the race and the frozen serving path never
-        # meet an uncached Triton program here.
-        launch_triton(
-            _dynamic_route_plan_kernel,
-            (1,),
-            flat_ids,
-            row_counts,
-            expert_tile_base,
-            barrier_count,
-            barrier_epoch,
-            routed_rows,
-            NUM_EXPERTS=E,
-            TILE_M=selected_tile_m,
-            BLOCK_E=block_e,
-            BLOCK_ROUTES=_DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS,
-            num_warps=8,
-        )
+        if prequantized_input:
+            full_route_plan = bool(
+                materialize_intermediate
+                and selected_tile_m in {16, 64, 128}
+                and not direct_routing
+                and not w4a8_trellis
+            )
+            zero_output = bool(
+                full_route_plan and not raw_routes and not deterministic_output
+            )
+            if zero_output:
+                scatter_output[:scatter_rows].zero_()
+            launch_triton(
+                _prequant_route_init_zero_kernel,
+                (1,),
+                row_counts,
+                expert_write_rows,
+                barrier_count,
+                barrier_epoch,
+                NUM_EXPERTS=E,
+                BLOCK_E=block_e,
+                RESET_BARRIER=not full_route_plan,
+                num_warps=4,
+            )
+            hist_grid = max(
+                1,
+                (routed_rows + _PREQUANT_ROUTE_HIST_BLOCK - 1)
+                // _PREQUANT_ROUTE_HIST_BLOCK,
+            )
+            launch_triton(
+                _prequant_route_hist_kernel,
+                (hist_grid,),
+                flat_ids,
+                row_counts,
+                routed_rows,
+                NUM_EXPERTS=E,
+                BLOCK_ROUTES=_PREQUANT_ROUTE_HIST_BLOCK,
+                num_warps=4,
+            )
+            launch_triton(
+                _prequant_route_prefix_kernel,
+                (1,),
+                row_counts,
+                expert_tile_base,
+                NUM_EXPERTS=E,
+                TILE_M=selected_tile_m,
+                BLOCK_E=block_e,
+                num_warps=4,
+            )
+            if full_route_plan:
+                gate_tile_cnt = (int(n) + _LEVEL_TILE_N - 1) // _LEVEL_TILE_N
+                scatter_grid = max(
+                    1,
+                    (routed_rows + _PREQUANT_ROUTE_SCATTER_BLOCK - 1)
+                    // _PREQUANT_ROUTE_SCATTER_BLOCK,
+                )
+                launch_triton(
+                    _prequant_route_scatter_kernel,
+                    (scatter_grid,),
+                    flat_ids,
+                    flat_weights,
+                    row_counts,
+                    expert_write_rows,
+                    expert_tile_base,
+                    token_map,
+                    token_weights,
+                    task_expert,
+                    task_valid_rows,
+                    routed_rows,
+                    gate_tile_cnt,
+                    NUM_EXPERTS=E,
+                    NUM_TOPK=num_topk,
+                    TILE_M=selected_tile_m,
+                    BLOCK_ROUTES=_PREQUANT_ROUTE_SCATTER_BLOCK,
+                    STORE_PAIR_IDX=bool(deterministic_output or raw_routes),
+                    num_warps=4,
+                )
+        else:
+            # A planned launch: compile-only planning warms and records this
+            # specialization, so the race and the frozen serving path never
+            # meet an uncached Triton program here.
+            launch_triton(
+                _dynamic_route_plan_kernel,
+                (1,),
+                flat_ids,
+                row_counts,
+                expert_tile_base,
+                barrier_count,
+                barrier_epoch,
+                routed_rows,
+                NUM_EXPERTS=E,
+                TILE_M=selected_tile_m,
+                BLOCK_E=block_e,
+                BLOCK_ROUTES=_DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS,
+                num_warps=8,
+            )
 
     def _gptr(dtype, t, align=16):
         return make_ptr(

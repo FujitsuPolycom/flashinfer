@@ -510,7 +510,7 @@ def _compiled_direct_w4a8_compact(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a8.compact_micro",
-            36,
+            37,
             (
                 max_tokens,
                 num_topk,

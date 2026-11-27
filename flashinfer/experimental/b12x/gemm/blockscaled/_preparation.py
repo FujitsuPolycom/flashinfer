@@ -137,6 +137,23 @@ def compile_packed(
             )
         if config.mode == "a16":
             if config.a16_backend == "tc_gemv":
+                if query.recipe == "nvfp4":
+                    from ._nvfp4_tc_gemv import compile_nvfp4_tc_gemv
+
+                    return {
+                        "gemm": compile_nvfp4_tc_gemv(
+                            ordinal,
+                            query.out_features,
+                            query.in_features,
+                            query.padded_in_features,
+                            query.num_tokens,
+                            config.split_k,
+                            config.mma_warps or 4,
+                            config.tile_n or 16,
+                            alpha_reciprocal=query.global_scale_kind == "reciprocal",
+                        ),
+                        **activation_program,
+                    }
                 from ._mxfp8_tc_gemv import compile_mxfp8_tc_gemv
 
                 return {
@@ -211,7 +228,7 @@ def compile_packed(
                     _dequantize_mxfp8,
                 )
 
-                k = query.padded_in_features
+                k = query.in_features
                 programs["dequant"] = _dequantize_mxfp8.warmup(
                     torch.float8_e4m3fn,
                     torch.uint8,
@@ -220,6 +237,7 @@ def compile_packed(
                     K=k,
                     BLOCK_R=DEQUANT_BLOCK_R,
                     BLOCK_K=DEQUANT_BLOCK_K,
+                    W_K=query.padded_in_features,
                     grid=(
                         triton.cdiv(query.out_features, DEQUANT_BLOCK_R),
                         triton.cdiv(k, DEQUANT_BLOCK_K),
@@ -331,6 +349,15 @@ def _workspace_bytes(query, config, device=None):
 def _projection_workspace_bytes(query, config, device):
     if config.mode == "a16":
         if config.a16_backend == "tc_gemv":
+            if query.recipe == "nvfp4":
+                from ._nvfp4_tc_gemv import nvfp4_tc_gemv_workspace_bytes
+
+                return nvfp4_tc_gemv_workspace_bytes(
+                    query.num_tokens,
+                    query.out_features,
+                    config.split_k,
+                    config.tile_n or 16,
+                )
             from ._mxfp8_tc_gemv import mxfp8_tc_gemv_workspace_bytes
 
             return mxfp8_tc_gemv_workspace_bytes(
@@ -344,7 +371,7 @@ def _projection_workspace_bytes(query, config, device):
             slices * query.num_tokens * query.out_features * 4 if slices > 1 else 0
         )
         if mxfp8_a16_dequant(query, config):
-            return max(partials, query.out_features * query.padded_in_features * 2)
+            return max(partials, query.out_features * query.in_features * 2)
         return partials
     if functional_mxfp8_quantization(query, config):
         if not query.codegen["split_k_atomic"] or not query.allow_bf16_atomic_reduction:
@@ -613,7 +640,7 @@ class _PackedExecutionState:
             ):
                 from ._dequant import DEQUANT_BLOCK_K, DEQUANT_BLOCK_R
 
-                k = q.padded_in_features
+                k = q.in_features
                 weight = (
                     workspace[: q.out_features * k * 2]
                     .view(torch.bfloat16)
@@ -633,6 +660,7 @@ class _PackedExecutionState:
                     k,
                     DEQUANT_BLOCK_R,
                     DEQUANT_BLOCK_K,
+                    q.padded_in_features,
                 )
                 torch.mm(
                     source.view(m, q.in_features),
@@ -642,15 +670,27 @@ class _PackedExecutionState:
                 return out
             if config.mode == "a16" and config.a16_backend == "tc_gemv":
                 src_2d = source if source.ndim == 2 else source.view(m, q.in_features)
-                self.programs["gemm"](
-                    src_2d,
-                    values,
-                    scale_bytes,
-                    out.view(m, q.out_features),
-                    workspace if config.split_k > 1 else None,
-                    self.tc_flags,
-                    cuda_stream_to_int(stream),
-                )
+                if nvfp4:
+                    self.programs["gemm"](
+                        src_2d,
+                        values,
+                        scale_bytes,
+                        global_scale,
+                        out.view(m, q.out_features),
+                        workspace if config.split_k > 1 else None,
+                        self.tc_flags,
+                        cuda_stream_to_int(stream),
+                    )
+                else:
+                    self.programs["gemm"](
+                        src_2d,
+                        values,
+                        scale_bytes,
+                        out.view(m, q.out_features),
+                        workspace if config.split_k > 1 else None,
+                        self.tc_flags,
+                        cuda_stream_to_int(stream),
+                    )
                 return out
             if config.mode == "a16":
                 import cutlass
@@ -836,12 +876,21 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
             and config.a16_backend == "tc_gemv"
             and config.split_k > 1
         ):
-            from ._mxfp8_tc_gemv import _FLAGS_CACHE, mxfp8_tc_gemv_flags_bytes
-
             n_per_cta = config.tile_n or 16
-            fbytes = mxfp8_tc_gemv_flags_bytes(
-                query.out_features, config.split_k, n_per_cta
-            )
+            if query.recipe == "nvfp4":
+                from ._nvfp4_tc_gemv import _FLAGS_CACHE, nvfp4_tc_gemv_flags_bytes
+
+                fbytes = nvfp4_tc_gemv_flags_bytes(
+                    query.out_features, config.split_k, n_per_cta
+                )
+                flag_tag = "blockscaled.nvfp4_tc_gemv_flags"
+            else:
+                from ._mxfp8_tc_gemv import _FLAGS_CACHE, mxfp8_tc_gemv_flags_bytes
+
+                fbytes = mxfp8_tc_gemv_flags_bytes(
+                    query.out_features, config.split_k, n_per_cta
+                )
+                flag_tag = "blockscaled.mxfp8_tc_gemv_flags"
             fkey = (
                 device.ordinal,
                 query.out_features,
@@ -851,7 +900,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
             )
             persistent.append(
                 PersistentMemory(
-                    ("blockscaled.mxfp8_tc_gemv_flags", *fkey),
+                    (flag_tag, *fkey),
                     fbytes,
                     fbytes if fkey in _FLAGS_CACHE else 0,
                 )
@@ -955,15 +1004,26 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
             and config.a16_backend == "tc_gemv"
             and config.split_k > 1
         ):
-            from ._mxfp8_tc_gemv import cached_mxfp8_tc_gemv_flags
+            if query.recipe == "nvfp4":
+                from ._nvfp4_tc_gemv import cached_nvfp4_tc_gemv_flags
 
-            tc_flags = cached_mxfp8_tc_gemv_flags(
-                resolved_device,
-                query.out_features,
-                query.padded_in_features,
-                config.split_k,
-                config.tile_n or 16,
-            )
+                tc_flags = cached_nvfp4_tc_gemv_flags(
+                    resolved_device,
+                    query.out_features,
+                    query.padded_in_features,
+                    config.split_k,
+                    config.tile_n or 16,
+                )
+            else:
+                from ._mxfp8_tc_gemv import cached_mxfp8_tc_gemv_flags
+
+                tc_flags = cached_mxfp8_tc_gemv_flags(
+                    resolved_device,
+                    query.out_features,
+                    query.padded_in_features,
+                    config.split_k,
+                    config.tile_n or 16,
+                )
         return _PackedExecutionState(
             query,
             config,

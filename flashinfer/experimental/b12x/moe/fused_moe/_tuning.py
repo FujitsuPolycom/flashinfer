@@ -59,6 +59,7 @@ class MoeDecodeQuery:
     a4_prefill: bool | None = None
     autotune_effort: str = "default"
     prequantized_input: bool = False
+    reserve_sms: int = 0
 
     def to_dict(self) -> dict[str, object]:
         d = {
@@ -99,6 +100,8 @@ class MoeDecodeQuery:
         }
         if self.prequantized_input:
             d["prequantized_input"] = True
+        if self.reserve_sms:
+            d["reserve_sms"] = int(self.reserve_sms)
         return d
 
 
@@ -394,6 +397,12 @@ def _validate_query(query: MoeDecodeQuery, _device: DeviceIdentity | None) -> No
         raise TypeError("csf_inline_scales must be boolean")
     if not query.weight_layouts:
         raise ValueError("MoE query requires declared weight layouts")
+    if (
+        isinstance(query.reserve_sms, bool)
+        or not isinstance(query.reserve_sms, int)
+        or query.reserve_sms < 0
+    ):
+        raise ValueError("MoE reserve_sms must be a non-negative integer")
 
 
 def _nvfp4_query(query):
@@ -405,7 +414,8 @@ def _nvfp4_query(query):
 def _csf_inline_eligible(query, config):
     """Only prepared compact CSF payloads expose inline scale candidates."""
     if config.backend == "dynamic" and config.dynamic_tile_m not in {16, 32}:
-        return False
+        if not (_compact_w4a8_query(query) and config.dynamic_tile_m in {64, 128}):
+            return False
     if (
         query.csf_inline_scales
         and config.backend in {"micro", "dynamic"}
@@ -644,12 +654,12 @@ def validate_moe_decode_config(
         and query.intermediate_size % 128 == 64
         and config.backend == "dynamic"
         and (
-            config.dynamic_tile_m not in {16, 64}
+            config.dynamic_tile_m not in {16, 64, 128}
             or config.dynamic_route_mode != "grouped"
         )
     ):
         raise ValueError(
-            "compact N64 W4A8 dynamic execution requires grouped M16 or M64 routing"
+            "compact N64 W4A8 dynamic execution requires grouped M16, M64, or M128 routing"
         )
     if config.backend not in {"micro", "dynamic", "w4a16"}:
         raise ValueError(f"unsupported MoE backend {config.backend!r}")
@@ -716,25 +726,40 @@ def validate_moe_decode_config(
         raise ValueError("the Triton route planner requires dynamic MoE")
     if config.route_planner == "triton" and config.dynamic_route_mode != "grouped":
         raise ValueError("the Triton route planner requires grouped dynamic routing")
-    if config.route_planner == "triton" and config.dynamic_tile_m != 16:
-        raise ValueError("the Triton route planner requires dynamic_tile_m=16")
-    if config.route_planner == "triton" and not (
-        (
-            query.quant_mode == "nvfp4"
-            or (
-                _compact_w4a8_query(query)
+    if config.route_planner == "triton":
+        prequant_triton_ok = bool(
+            query.prequantized_input
+            and query.quant_mode == "w4a8_mx"
+            and config.dynamic_tile_m
+            in ({16, 32, 64, 128} if _compact_w4a8_query(query) else {32, 64, 128})
+            and not query.deterministic_output
+            and query.activation in {"silu", "situ"}
+            and 0 < query.routed_rows <= 131072
+            and query.controls.get("dynamic_work_source", "materialized_queue")
+            in {"materialized_queue", "persistent_grid"}
+        )
+        if not prequant_triton_ok:
+            if config.dynamic_tile_m != 16:
+                raise ValueError("the Triton route planner requires dynamic_tile_m=16")
+            if not (
+                (
+                    query.quant_mode == "nvfp4"
+                    or (
+                        _compact_w4a8_query(query)
+                        and not query.deterministic_output
+                        and query.controls.get(
+                            "dynamic_work_source", "materialized_queue"
+                        )
+                        in {"materialized_queue", "persistent_grid"}
+                    )
+                )
                 and not query.deterministic_output
-                and query.controls.get("dynamic_work_source", "materialized_queue")
-                in {"materialized_queue", "persistent_grid"}
-            )
-        )
-        and not query.deterministic_output
-        and query.activation == "silu"
-        and 0 < query.routed_rows <= 256
-    ):
-        raise ValueError(
-            "the Triton route planner requires small nondeterministic NVFP4 or compact W4A8 SiLU workloads"
-        )
+                and query.activation == "silu"
+                and 0 < query.routed_rows <= 256
+            ):
+                raise ValueError(
+                    "the Triton route planner requires small nondeterministic NVFP4 or compact W4A8 SiLU workloads"
+                )
     if config.max_active_clusters is not None and config.max_active_clusters <= 0:
         raise ValueError("max_active_clusters must be positive when set")
     if config.max_active_clusters is not None:
@@ -803,9 +828,23 @@ def _csf_default_config(query, config, device):
         not query.csf_inline_scales
         or device is None
         or device.compute_capability != (12, 0)
-        or _compact_w4a8_query(query)
     ):
         return config
+    if _compact_w4a8_query(query):
+        return replace(
+            config,
+            csf_inline_scales=bool(
+                _csf_inline_eligible(query, config)
+                and (
+                    config.backend == "micro"
+                    or (
+                        config.dynamic_tile_m is not None
+                        and query.routed_rows
+                        <= config.dynamic_tile_m * query.num_experts
+                    )
+                )
+            ),
+        )
     nvfp4 = _nvfp4_query(query)
     if (
         nvfp4
@@ -1167,6 +1206,13 @@ def _tuning_parameters(query, device):
         ),
         efficiency_predicates=(
             compact_packed_search,
+            # External multi-CTA Triton route planning loses to the internal
+            # planner at M>=4096 due to launch overhead and unsorted scatter.
+            lambda p: not (
+                query.prequantized_input
+                and query.num_tokens >= 4096
+                and p["route_planner"] == "triton"
+            ),
             # Caps below a quarter of the ladder's top rung never win a race.
             lambda p: (
                 p["max_active_clusters"] is None
@@ -1274,7 +1320,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=73,
+    candidate_contract_version=74,
     knobs=(
         Knob(
             name="backend",

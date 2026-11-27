@@ -137,6 +137,8 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
         raise TypeError("caps must be WOProjectionScratchCaps")
     invocation = FrozenMapping(invocation)
     query = _query(caps, invocation)
+    # _lower_dense_gemm_fused_quant_a currently quantizes rows 0..7 per M-tile
+    # (row_local = lane // 4) and validates 1 <= M <= 8.
     use_fused_b = caps.max_tokens <= 8 and not query.dynamic_tokens
     fused = {}
 
@@ -257,8 +259,47 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
                     dtype=torch.float8_e4m3fn,
                     device="meta",
                 )
+            a_lowering = _lower_query(a_query, device.identity, a_options)
+            if (
+                not use_fused_b
+                and caps.dtype == torch.bfloat16
+                and caps.rank % 32 == 0
+                and (caps.rank * caps.groups) % 128 == 0
+                and a_lowering.policy.split_k_slices == 1
+                and not a_lowering.swap_ab
+                and not a_lowering.plain_fp8
+                and not a_lowering.is_mxfp6
+                and a_lowering.mma_tiler_mn[1] % 32 == 0
+            ):
+                quant_width = caps.rank * caps.groups
+                a_quant_options = dict(a_options)
+                a_quant_options["_quantized_c"] = (
+                    torch.empty(
+                        (caps.max_tokens, quant_width),
+                        dtype=torch.float8_e4m3fn,
+                        device="meta",
+                    ),
+                    torch.empty(
+                        (caps.max_tokens, quant_width // 32),
+                        dtype=torch.float8_e8m0fnu,
+                        device="meta",
+                    ),
+                    torch.empty(
+                        (
+                            32,
+                            4,
+                            (caps.max_tokens + 127) // 128,
+                            4,
+                            quant_width // 128,
+                            1,
+                        ),
+                        dtype=torch.float8_e8m0fnu,
+                        device="meta",
+                    ),
+                )
+                a_lowering = _lower_query(a_query, device.identity, a_quant_options)
             ordinary[key] = (
-                _lower_query(a_query, device.identity, a_options),
+                a_lowering,
                 _default_lowering(b_query, device.identity),
             )
         return ordinary[key]
@@ -266,7 +307,11 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
     def memory(config, device):
         if config.backend == "a16_tc_gemv":
             from b12x._lib.scratch import scratch_buffer_spec
-            from ._tc_gemv import wo_a16_tc_gemv_scratch_bytes
+            from ._tc_gemv import (
+                _WOA_FLAGS_CACHE,
+                wo_a16_tc_gemv_flags_bytes,
+                wo_a16_tc_gemv_scratch_bytes,
+            )
 
             nbytes = wo_a16_tc_gemv_scratch_bytes(
                 caps.max_tokens, caps.groups, caps.rank, config.wo_a_split_k
@@ -278,7 +323,26 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
                     device=torch.device("cuda", device.ordinal),
                 ),
             )
-            return MemoryRequirements(scratch=scratch, persistent=())
+            persistent = ()
+            if config.wo_a_split_k > 1:
+                fbytes = wo_a16_tc_gemv_flags_bytes(
+                    caps.groups, caps.rank, config.wo_a_split_k
+                )
+                fkey = (
+                    device.ordinal,
+                    caps.groups,
+                    caps.rank,
+                    caps.group_width,
+                    config.wo_a_split_k,
+                )
+                persistent = (
+                    PersistentMemory(
+                        ("wo_projection.a16_woa_flags", *fkey),
+                        fbytes,
+                        fbytes if fkey in _WOA_FLAGS_CACHE else 0,
+                    ),
+                )
+            return MemoryRequirements(scratch=scratch, persistent=persistent)
         scratch = _materialize_wo_projection_scratch(
             caps, config=config
         ).scratch_specs()
@@ -368,10 +432,24 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
         config = selection.config
         if config.backend == "a16_tc_gemv":
             from b12x.gemm.blockscaled._mxfp8_tc_gemv import compile_mxfp8_tc_gemv
-            from ._tc_gemv import compile_grouped_woa_tc_gemv
+            from ._tc_gemv import (
+                cached_wo_a16_tc_gemv_flags,
+                compile_grouped_woa_tc_gemv,
+            )
 
             a_fn = compile_grouped_woa_tc_gemv(device.ordinal, *_a16_woa_args(config))
             b_fn = compile_mxfp8_tc_gemv(device.ordinal, *_a16_wob_args(config))
+            woa_flags = (
+                cached_wo_a16_tc_gemv_flags(
+                    torch.device("cuda", device.ordinal),
+                    caps.groups,
+                    caps.rank,
+                    caps.group_width,
+                    config.wo_a_split_k,
+                )
+                if config.wo_a_split_k > 1
+                else None
+            )
             return _PreparedWO(
                 _A16WOScratchState(caps, config),
                 query,
@@ -381,7 +459,7 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
                 None,
                 a16_wo_a=a_fn,
                 a16_wo_b=b_fn,
-                a16_woa_flags=None,
+                a16_woa_flags=woa_flags,
                 a16_split_k=config.wo_a_split_k,
             )
         from b12x._lib.dense_gemm.preparation import (
@@ -477,14 +555,9 @@ class _A16WOScratchState:
             splitk_scratch = storage[tmp_bytes : tmp_bytes + splitk_bytes].view(
                 torch.float32
             )
-            n_blocks = self.caps.groups * ((self.caps.rank + 15) // 16)
-            flags_start = tmp_bytes + splitk_bytes
-            splitk_flags = storage[flags_start : flags_start + n_blocks * 4].view(
-                torch.uint32
-            )
         else:
             splitk_scratch = None
-            splitk_flags = None
+        splitk_flags = None
         if out is None:
             out = torch.empty(
                 (tokens, self.caps.hidden),
@@ -757,15 +830,7 @@ class _PreparedWO:
             from b12x._lib.utils.device import cuda_stream_to_int
 
             stream_int = cuda_stream_to_int(stream)
-            flags = binding.tmp_q if self.a16_split_k > 1 else None
-            if flags is not None:
-                if stream_int is not None:
-                    with torch.cuda.stream(
-                        torch.cuda.ExternalStream(stream_int, device=flags.device)
-                    ):
-                        flags.zero_()
-                else:
-                    flags.zero_()
+            flags = self.a16_woa_flags if self.a16_split_k > 1 else None
             self.a16_wo_a(
                 binding.source_tgd,
                 None,
@@ -792,6 +857,15 @@ class _PreparedWO:
         a_values = binding.weights.wo_a.values
         if a_values.ndim == 2:
             a_values = a_values.unsqueeze(-1)
+        quantized_c = (
+            (
+                binding.tmp_q.values,
+                binding.tmp_q.scale_rows.reshape(tokens, -1),
+                binding.tmp_q.scale_mma,
+            )
+            if self.ordinary_a.lowering.quantize_c
+            else None
+        )
         self.ordinary_a.run(
             (
                 binding.x_q.values.view(
@@ -808,6 +882,7 @@ class _PreparedWO:
                 if self.ordinary_a.lowering.b_tile_major
                 else None
             ),
+            quantized_c=quantized_c,
         )
         if self.fused_b is not None:
             source = binding.tmp
@@ -827,7 +902,8 @@ class _PreparedWO:
                 ),
             )
         else:
-            self.quantizers.quantize_b(binding.tmp, binding.tmp_q)
+            if quantized_c is None:
+                self.quantizers.quantize_b(binding.tmp, binding.tmp_q)
             self.ordinary_b.run(
                 (binding.tmp_q.values.unsqueeze(-1), binding.tmp_q.scale_mma),
                 (
@@ -845,15 +921,7 @@ class _PreparedWO:
             from b12x._lib.utils.device import cuda_stream_to_int
 
             stream_int = cuda_stream_to_int(stream)
-            flags = binding.tmp_q if self.a16_split_k > 1 else None
-            if flags is not None:
-                if stream_int is not None:
-                    with torch.cuda.stream(
-                        torch.cuda.ExternalStream(stream_int, device=flags.device)
-                    ):
-                        flags.zero_()
-                else:
-                    flags.zero_()
+            flags = self.a16_woa_flags if self.a16_split_k > 1 else None
             self.a16_wo_a(
                 binding.o,
                 binding.positions,
@@ -889,6 +957,15 @@ class _PreparedWO:
         a_values = binding.weights.wo_a.values
         if a_values.ndim == 2:
             a_values = a_values.unsqueeze(-1)
+        quantized_c = (
+            (
+                binding.tmp_q.values,
+                binding.tmp_q.scale_rows.reshape(tokens, -1),
+                binding.tmp_q.scale_mma,
+            )
+            if self.ordinary_a.lowering.quantize_c
+            else None
+        )
         self.ordinary_a.run(
             (
                 binding.x_q.values.view(
@@ -905,6 +982,7 @@ class _PreparedWO:
                 if self.ordinary_a.lowering.b_tile_major
                 else None
             ),
+            quantized_c=quantized_c,
         )
         if self.fused_b is not None:
             source = (
@@ -925,7 +1003,8 @@ class _PreparedWO:
                 ),
             )
         else:
-            self.quantizers.quantize_b(binding.tmp, binding.tmp_q)
+            if quantized_c is None:
+                self.quantizers.quantize_b(binding.tmp, binding.tmp_q)
             self.ordinary_b.run(
                 (binding.tmp_q.values.unsqueeze(-1), binding.tmp_q.scale_mma),
                 (

@@ -17,6 +17,17 @@ def compile_norm(payload, pdl, ordinal):
     query = Query(**dict(payload))
     q_weight_dtype = getattr(torch, query.query_weight_dtype)
     kv_weight_dtype = getattr(torch, query.kv_weight_dtype)
+    rope_args = (
+        (
+            torch.float32,
+            torch.float32,
+            query.kv_rope_dim // 2,
+            query.kv_rope_dim // 2,
+            query.kv_rope_dim,
+        )
+        if query.kv_rope_dim > 0
+        else (None, None, 0, 0, 0)
+    )
     with torch.cuda.device(ordinal):
         return mla_norm_mxfp8_kernel.warmup(
             torch.bfloat16,
@@ -33,6 +44,7 @@ def compile_norm(payload, pdl, ordinal):
             query.min_amax,
             pdl,
             query.release_dependents,
+            *rope_args,
             grid=(query.rows, 2, 1),
             num_warps=8,
             enable_fp_fusion=False,
@@ -48,7 +60,18 @@ class State:
     program: object
 
     def run(
-        self, projected, qw, kw, query, kv, values_base, scale_rows_base, scale_mma_base
+        self,
+        projected,
+        qw,
+        kw,
+        query,
+        kv,
+        values_base,
+        scale_rows_base,
+        scale_mma_base,
+        *,
+        cos=None,
+        sin=None,
     ):
         q = self.query
         from b12x.quantization import mxfp8
@@ -87,6 +110,44 @@ class State:
                     raise ValueError(
                         "MLA normalization requires disjoint projected input, affine weights and outputs"
                     )
+        if q.kv_rope_dim > 0:
+            half_rope = q.kv_rope_dim // 2
+            if cos is None or sin is None:
+                raise ValueError(
+                    "MLA normalization with fused KV RoPE requires cos and sin tensors"
+                )
+            for angle in (cos, sin):
+                if (
+                    angle.device != self.device
+                    or angle.dtype != torch.float32
+                    or tuple(angle.shape) != (q.rows, half_rope)
+                    or angle.stride(1) != 1
+                    or angle.data_ptr() % 16
+                    or (angle.stride(0) * angle.element_size()) % 16
+                ):
+                    raise ValueError(
+                        "MLA normalization KV RoPE cos/sin must be 16-byte aligned FP32 [rows, kv_rope_dim/2] tensors"
+                    )
+                angle_start = angle.data_ptr()
+                angle_span = (
+                    (q.rows - 1) * angle.stride(0) + half_rope
+                ) * angle.element_size()
+                for output_tensor, _, _ in facts[3:]:
+                    out_start = output_tensor.data_ptr()
+                    out_end = (
+                        out_start + output_tensor.numel() * output_tensor.element_size()
+                    )
+                    if angle_start < out_end and out_start < angle_start + angle_span:
+                        raise ValueError(
+                            "MLA normalization KV RoPE angles must not overlap outputs"
+                        )
+            cos_stride, sin_stride = int(cos.stride(0)), int(sin.stride(0))
+        else:
+            if cos is not None or sin is not None:
+                raise ValueError(
+                    "MLA normalization cos/sin requires kv_rope_dim > 0 in Query"
+                )
+            cos_stride = sin_stride = 0
         self.program[(q.rows, 2, 1)](
             projected,
             qw,
@@ -102,6 +163,11 @@ class State:
             q.min_amax,
             self.programmatic_serialization,
             q.release_dependents,
+            cos,
+            sin,
+            cos_stride,
+            sin_stride,
+            q.kv_rope_dim,
         )
 
 
@@ -161,24 +227,56 @@ def _execute(
     scale_rows_base: torch.Tensor,
     scale_mma_base: torch.Tensor,
     handle: int,
+    cos: torch.Tensor | None = None,
+    sin: torch.Tensor | None = None,
 ) -> None:
     state = require_prepared(
         plan_from_handle(handle), "quantization.mla_norm_mxfp8", projected.device
     )
     state.run(
-        projected, qw, kw, query, kv, values_base, scale_rows_base, scale_mma_base
+        projected,
+        qw,
+        kw,
+        query,
+        kv,
+        values_base,
+        scale_rows_base,
+        scale_mma_base,
+        cos=cos,
+        sin=sin,
     )
 
 
 @_execute.register_fake
 def _fake(
-    projected, qw, kw, query, kv, values_base, scale_rows_base, scale_mma_base, handle
+    projected,
+    qw,
+    kw,
+    query,
+    kv,
+    values_base,
+    scale_rows_base,
+    scale_mma_base,
+    handle,
+    cos=None,
+    sin=None,
 ):
     pass
 
 
 def run(
-    projected, qw, kw, query, kv, values_base, scale_rows_base, scale_mma_base, *, plan
+    projected,
+    qw,
+    kw,
+    query,
+    kv,
+    values_base,
+    scale_rows_base,
+    scale_mma_base,
+    *,
+    plan,
+    cos=None,
+    sin=None,
 ):
     _execute(
         projected,
@@ -190,4 +288,6 @@ def run(
         scale_rows_base,
         scale_mma_base,
         plan.handle,
+        cos,
+        sin,
     )

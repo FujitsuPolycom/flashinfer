@@ -310,9 +310,14 @@ def pack_mxfp8_linear_weight(
     weight_scale: torch.Tensor,
     *,
     allocate=None,
+    k_alignment: int = 128,
 ) -> MXFP8LinearWeight:
     """Pack ModelOpt ``[N,K]`` MXFP8 values and compact ``[N,K/32]`` scales."""
 
+    if k_alignment not in (64, 128):
+        raise ValueError(
+            f"MXFP8 weight k_alignment must be 64 or 128, got {k_alignment}"
+        )
     _check_gpu_tensor("weight", weight)
     _check_gpu_tensor("weight_scale", weight_scale)
     if weight.ndim != 2:
@@ -343,7 +348,7 @@ def pack_mxfp8_linear_weight(
             f"{(out_features, scale_k)}, got {tuple(weight_scale.shape)}"
         )
 
-    padded_in_features = _align_up(in_features, 128)
+    padded_in_features = _align_up(in_features, k_alignment)
     padded_scale_k = padded_in_features // MXFP8_SCALE_VEC_SIZE
     if allocate is None:
         weight_values = _pad_k(weight[:out_features, :in_features], padded_in_features)
@@ -472,6 +477,7 @@ def pack_weight(
     global_scale_kind: str = "multiplier",
     activation_global_scale: torch.Tensor | None = None,
     allocate=None,
+    k_alignment: int = 128,
 ) -> Weight:
     """Pack a serialized dense weight for ``blockscaled.mm``.
 
@@ -540,7 +546,9 @@ def pack_weight(
         and scale.ndim == 2
         and recipe != "tensor_fp8"
     ):
-        return pack_mxfp8_linear_weight(weight, scale, allocate=allocate)
+        return pack_mxfp8_linear_weight(
+            weight, scale, allocate=allocate, k_alignment=k_alignment
+        )
     raise ValueError(
         "unsupported blockscaled weight scale: expected one FP32 combined "
         "tensor scale or a 2D uint8/UE8M0 MXFP8 scale; got "

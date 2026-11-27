@@ -1111,7 +1111,8 @@ def empty_mxfp8_rows_bases(
     """
     if m <= 0 or k <= 0 or num_groups <= 0:
         raise ValueError("m, k, and num_groups must be positive")
-    _check_mxfp8_k(k)
+    if k % 64 != 0:
+        _check_mxfp8_k(k)
     if num_groups == 1:
         values_base = torch.empty((m, k), device=device, dtype=torch.float8_e4m3fn)
     else:
@@ -1238,7 +1239,8 @@ def _expand_block_scales_to_mxfp8_rows(
     _check_gpu_tensor("scale", scale)
     if m <= 0 or k <= 0 or num_groups <= 0:
         raise ValueError("m, k, and num_groups must be positive")
-    _check_mxfp8_k(k)
+    if k % 64 != 0:
+        _check_mxfp8_k(k)
 
     block_n, block_k = block_size
     m_tiles = math.ceil(m / block_n)
@@ -1305,7 +1307,8 @@ def pack_mxfp8_scales_for_dense_gemm(
         raise ValueError(f"scale_rows must be uint8/e8m0, got {scale_rows.dtype}")
     if m <= 0 or k <= 0 or num_groups <= 0:
         raise ValueError("m, k, and num_groups must be positive")
-    _check_mxfp8_k(k)
+    if k % 64 != 0:
+        _check_mxfp8_k(k)
 
     sf_k = k // MXFP8_SCALE_VEC_SIZE
     if scale_rows.ndim == 2:
@@ -1502,7 +1505,8 @@ def pack_fp8_block_scaled_weight_mxfp8(
         raise ValueError(f"weight must be float8_e4m3fn, got {weight.dtype}")
     if m <= 0 or k <= 0 or num_groups <= 0:
         raise ValueError("m, k, and num_groups must be positive")
-    _check_mxfp8_k(k)
+    if k % 64 != 0:
+        _check_mxfp8_k(k)
     block_size = tuple(block_size)
     if block_size not in ((128, 128), (32, 32)):
         raise ValueError(f"unsupported FP8 weight block_size {block_size}")
@@ -2314,7 +2318,8 @@ def quantize_mxfp8_rows_torch(
     if type(retain_scale_rows) is not bool:
         raise TypeError("retain_scale_rows must be a boolean")
     grouped, m, k, num_groups = _as_grouped_mkl(source)
-    _check_mxfp8_k(k)
+    if k % 64 != 0:
+        _check_mxfp8_k(k)
 
     chunks = k // MXFP8_SCALE_VEC_SIZE
     grouped_f32 = grouped.to(torch.float32)

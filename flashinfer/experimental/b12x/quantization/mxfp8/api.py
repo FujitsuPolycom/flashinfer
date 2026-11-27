@@ -5,6 +5,9 @@ from __future__ import annotations
 import torch
 
 from ..._lib.gating import default_is_supported
+from ..._lib.quant.mxfp8_rows import (
+    swiglu_quantize_mxfp8_rows_cute as swiglu_quantize_rows,
+)
 from ...gemm._shared.wo_mxfp8 import MXFP8Rows, mxfp8_rows_from_bases
 from . import META
 from ._preparation import (
@@ -17,27 +20,37 @@ from ._preparation import (
 )
 
 
-def dense_rows_storage_shapes(m: int, k: int) -> tuple[tuple[int, ...], ...]:
+def dense_rows_storage_shapes(
+    m: int, k: int, *, k_alignment: int = 128
+) -> tuple[tuple[int, ...], ...]:
     """Shapes of caller-owned values, compact scales, and physical MMA scales.
 
     Values use E4M3 storage; both scale bases use uint8 storage. The returned
     shapes cover one dense-GEMM batch and include MMA scale padding.
     """
-    if type(m) is not int or m <= 0 or type(k) is not int or k <= 0 or k % 128:
-        raise ValueError("dense MXFP8 rows require positive M and K divisible by 128")
-    return ((m, k), (1, m, k // 32), (1, (m + 127) // 128, k // 128, 32, 4, 4))
+    if k_alignment not in (64, 128):
+        raise ValueError(
+            f"dense MXFP8 k_alignment must be 64 or 128, got {k_alignment}"
+        )
+    if type(m) is not int or m <= 0 or type(k) is not int or k <= 0 or k % k_alignment:
+        raise ValueError(
+            f"dense MXFP8 rows require positive M and K divisible by {k_alignment}"
+        )
+    return ((m, k), (1, m, k // 32), (1, (m + 127) // 128, (k + 127) // 128, 32, 4, 4))
 
 
 def dense_rows_from_bases(
     values_base: torch.Tensor,
     scale_rows_base: torch.Tensor,
     scale_mma_base: torch.Tensor,
+    *,
+    k_alignment: int = 128,
 ) -> MXFP8Rows:
     """Build canonical dense-GEMM views over caller-owned contiguous buffers."""
     if values_base.ndim != 2:
         raise ValueError("dense MXFP8 values must have shape [M,K]")
     m, k = (int(size) for size in values_base.shape)
-    expected = dense_rows_storage_shapes(m, k)
+    expected = dense_rows_storage_shapes(m, k, k_alignment=k_alignment)
     for name, tensor, shape, dtype in (
         ("values", values_base, expected[0], torch.float8_e4m3fn),
         ("scale_rows", scale_rows_base, expected[1], torch.uint8),
@@ -115,5 +128,6 @@ __all__ = [
     "query_from_call",
     "quantize_rows",
     "quantize_dense_rows",
+    "swiglu_quantize_rows",
     "is_supported",
 ]
