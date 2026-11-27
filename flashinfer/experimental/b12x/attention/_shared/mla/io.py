@@ -452,6 +452,24 @@ def io_issue_gather(
             cute.arch.mbarrier_arrive(full_mbar_ptr)
         return
 
+    # DSV4.1 FP8 mode overlaps the bulk payload copy (bytes [0, 528) or [0, 288))
+    # with the scalar metadata/scale conversion (disjoint sidecar +544 and kv_sc)
+    # when indices are read directly from _section_idx.
+    overlap_dsv41_fp8 = cutlass.const_expr(
+        bool(dsv41_fp8) and (mapping_page_table is None)
+    )
+    if cutlass.const_expr(overlap_dsv41_fp8):
+        if cutlass.const_expr(split_mbar_arrival):
+            if (io_lane & Int32(31)) == Int32(0):
+                cute.arch.mbarrier_expect_tx(full_mbar_ptr, Int32(bi // 2) * _NOPE)
+        else:
+            if io_lane == Int32(0):
+                cute.arch.mbarrier_expect_tx(full_mbar_ptr, Int32(bi) * _NOPE)
+        cute.arch.sync_warp()
+        _issue_payload()
+
+    _dsv41_tag_off = Int32(528 if (dsv41_swa or kv_smem_stride >= 544) else 288)
+
     # --- (1) per-entry validity index staging + (DSV4 only) scalar footer gather. ---
     eo = Int32(0)
     for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
@@ -485,7 +503,7 @@ def io_issue_gather(
                 if idx_raw < Int32(0):
                     source_tag = Uint32(2)
                 st_shared_u32(
-                    kv_fp8_dst_addr + entry * Int32(kv_smem_stride) + Int32(528),
+                    kv_fp8_dst_addr + entry * Int32(kv_smem_stride) + _dsv41_tag_off,
                     source_tag,
                 )
             if cutlass.const_expr(dsv41_fp8):
@@ -562,6 +580,13 @@ def io_issue_gather(
     if cutlass.const_expr(overlap_footer_gather):
         if (io_lane & Int32(31)) == Int32(0):
             cute.arch.mbarrier_arrive(full_mbar_ptr)
+    elif cutlass.const_expr(overlap_dsv41_fp8):
+        if cutlass.const_expr(split_mbar_arrival):
+            if (io_lane & Int32(31)) == Int32(0):
+                cute.arch.mbarrier_arrive(full_mbar_ptr)
+        else:
+            if io_lane == Int32(0):
+                cute.arch.mbarrier_arrive(full_mbar_ptr)
     else:
         if cutlass.const_expr(split_mbar_arrival):
             # Native H16 has two producer warps, each responsible for 32 of the

@@ -86,6 +86,7 @@ from b12x._lib.intrinsics.memory import (
     ld_global_nc_v4_u32,
     ld_shared_v2_u32,
     ld_shared_v4_u32,
+    ld_shared_u16_offset,
     ld_shared_u8_offset,
     ldmatrix_m8n8x2_b16,
     ldmatrix_m8n8x4_b16,
@@ -564,6 +565,102 @@ def s0_load_q_bf16_to_smem(
 
 
 @cute.jit
+def s0_load_q_bf16_vec(
+    q_token: cute.Tensor,  # (NUM_HEADS, D_QK) bf16 view for this token; dim stride 1
+    q_nope_bf16_base_addr: Int32,  # u32 smem addr of BF16 Q-NoPE
+    q_rope_base_addr: Int32,  # u32 smem addr of q_rope (HPB x q_rope_stride bf16)
+    head_base: Int32,  # first head index of this CTA (h_start)
+    valid_hpb: Int32,  # number of valid heads (<= HPB)
+    tid: Int32,  # flat thread id in [0, MATH_THREADS)
+    *,
+    d_nope: cutlass.Constexpr,  # 512
+    d_rope: cutlass.Constexpr,  # 0 or 64
+    hpb: cutlass.Constexpr,  # 16
+    q_nope_bf16_stride: cutlass.Constexpr,  # D_NOPE + 8 (520; 1040B = 65*16B)
+    q_rope_stride: cutlass.Constexpr,  # D_ROPE plus optional bank-layout pad
+    num_threads: cutlass.Constexpr,  # 256
+    barrier_id: cutlass.Constexpr,
+):
+    """S0 (NVFP4/DSV4.1 BF16): vectorized 16-byte BF16 Q staging (0-ULP exact).
+
+    Replaces 8,192 scalar BF16->FP32->BF16 element ops/CTA with 4x `ld.global.nc.v4.u32`
+    + 4x `st.shared.v4.u32` per math thread (16 heads x 512 BF16 = 1,024 16B vectors).
+    Issues all global loads before shared stores to hide DRAM/L2 latency in the
+    length-independent prologue; zero-fills invalid tail heads (h >= valid_hpb).
+    Requires 16-byte-aligned unit-stride Q rows (verified by the launcher).
+    """
+    nope_vecs = d_nope // 8
+    total_nope_vecs = hpb * nope_vecs
+    nope_iters = (total_nope_vecs + num_threads - 1) // num_threads
+    q_words = []
+    for it in cutlass.range_constexpr(nope_iters):
+        idx = tid + Int32(it * num_threads)
+        h = idx // Int32(nope_vecs)
+        vec = idx - h * Int32(nope_vecs)
+        w0 = Uint32(0)
+        w1 = Uint32(0)
+        w2 = Uint32(0)
+        w3 = Uint32(0)
+        if idx < Int32(total_nope_vecs) and h < valid_hpb:
+            q_off = cute.crd2idx((head_base + h, vec * Int32(8)), q_token.layout)
+            w0, w1, w2, w3 = ld_global_nc_v4_u32(get_ptr_as_int64(q_token, q_off))
+        q_words.append((w0, w1, w2, w3))
+
+    rope_vecs = d_rope // 8
+    total_rope_vecs = hpb * rope_vecs
+    rope_iters = (total_rope_vecs + num_threads - 1) // num_threads
+    r_words = []
+    if cutlass.const_expr(d_rope > 0):
+        for it in cutlass.range_constexpr(rope_iters):
+            idx = tid + Int32(it * num_threads)
+            rh = idx // Int32(rope_vecs)
+            rvec = idx - rh * Int32(rope_vecs)
+            r0 = Uint32(0)
+            r1 = Uint32(0)
+            r2 = Uint32(0)
+            r3 = Uint32(0)
+            if idx < Int32(total_rope_vecs) and rh < valid_hpb:
+                q_off = cute.crd2idx(
+                    (head_base + rh, Int32(d_nope) + rvec * Int32(8)), q_token.layout
+                )
+                r0, r1, r2, r3 = ld_global_nc_v4_u32(get_ptr_as_int64(q_token, q_off))
+            r_words.append((r0, r1, r2, r3))
+
+    for it in cutlass.range_constexpr(nope_iters):
+        idx = tid + Int32(it * num_threads)
+        if idx < Int32(total_nope_vecs):
+            h = idx // Int32(nope_vecs)
+            vec = idx - h * Int32(nope_vecs)
+            w0, w1, w2, w3 = q_words[it]
+            st_shared_v4_u32(
+                q_nope_bf16_base_addr
+                + (h * Int32(q_nope_bf16_stride) + vec * Int32(8)) * Int32(2),
+                w0,
+                w1,
+                w2,
+                w3,
+            )
+
+    if cutlass.const_expr(d_rope > 0):
+        for it in cutlass.range_constexpr(rope_iters):
+            idx = tid + Int32(it * num_threads)
+            if idx < Int32(total_rope_vecs):
+                rh = idx // Int32(rope_vecs)
+                rvec = idx - rh * Int32(rope_vecs)
+                r0, r1, r2, r3 = r_words[it]
+                st_shared_v4_u32(
+                    q_rope_base_addr
+                    + (rh * Int32(q_rope_stride) + rvec * Int32(8)) * Int32(2),
+                    r0,
+                    r1,
+                    r2,
+                    r3,
+                )
+
+    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads)
+
+
+@cute.jit
 def s0_quantize_q_vec(
     q_token: cute.Tensor,  # (NUM_HEADS, D_QK) bf16 view for this token; dim stride 1
     q_fp8_base_addr: Int32,  # u32 smem addr of q_fp8 (rows of q_nope_stride bytes)
@@ -950,6 +1047,111 @@ def _s1_qk_dsv41_source(
                 b1,
             )
     return qk[0], qk[1], qk[2], qk[3]
+
+
+@cute.jit
+def _extract_u8(word: Uint32, byte_idx: cutlass.Constexpr) -> Uint32:
+    if cutlass.const_expr(byte_idx == 0):
+        return word & Uint32(0xFF)
+    if cutlass.const_expr(byte_idx == 1):
+        return (word >> Uint32(8)) & Uint32(0xFF)
+    if cutlass.const_expr(byte_idx == 2):
+        return (word >> Uint32(16)) & Uint32(0xFF)
+    return (word >> Uint32(24)) & Uint32(0xFF)
+
+
+@cute.jit
+def s1_qk_dsv41_source_decode(
+    qk,
+    q_nope_bf16_base_addr: Int32,
+    kv_base_addr: Int32,
+    warp_first_cand: Int32,
+    lane: Int32,
+    *,
+    num_scales: cutlass.Constexpr,
+    quant_tile: cutlass.Constexpr,
+    q_nope_bf16_stride: cutlass.Constexpr,
+    swa: cutlass.Constexpr,
+):
+    """Compile-time source-specialized BF16 QK-NoPE for DSV4.1 decode (0-ULP exact).
+
+    Ports prefill #142 Fix 2 to UnifiedDecodeKernel:
+      - Compile-time SWA (544B stride, tag @ +528) vs Indexed NVFP4 (304B
+        bank-conflict-free stride, tag @ +288).
+      - Per-tile warp vote (`all_valid` / `none_valid`) eliminates inner tag checks.
+      - Hoisted `ld.shared.v4.u32` scale loads (1x for SWA, 2x for NVFP4) and
+        immediate-offset payload loads with zero register spills.
+    """
+    kv_row_stride = cutlass.const_expr(544 if swa else 304)
+    tag_off = cutlass.const_expr(528 if swa else 288)
+    expected_tag = Uint32(1 if swa else 0)
+
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+    kv_gid_row = warp_first_cand + gid
+    row_addr = kv_base_addr + kv_gid_row * Int32(kv_row_stride)
+
+    valid = ld_shared_u32(row_addr + Int32(tag_off)) == expected_tag
+    none_valid = cute.arch.vote_all_sync(not valid)
+
+    q0, q1, q2, q3 = qk[0], qk[1], qk[2], qk[3]
+
+    if not none_valid:
+        if cutlass.const_expr(swa):
+            sw0, sw1, sw2, sw3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+            if valid:
+                sw0, sw1, sw2, sw3 = ld_shared_v4_u32(row_addr + Int32(512))
+            sc_words = (sw0, sw1, sw2, sw3)
+            lane_data_base = row_addr + tid * Int32(2)
+            for blk in cutlass.range_constexpr(num_scales):
+                for ks in cutlass.range_constexpr(quant_tile // 16):
+                    ko_imm = blk * quant_tile + ks * 16
+                    scale_idx = blk * 2 + (ks // 2)
+                    scale_byte = _extract_u8(sc_words[scale_idx // 4], scale_idx % 4)
+                    p0 = ld_shared_u16_offset(lane_data_base, ko_imm)
+                    p1 = ld_shared_u16_offset(lane_data_base, ko_imm + 8)
+                    b0, b1 = _mixed_pairs_to_bf16x2_sm120(p0, p1, scale_byte, swa=True)
+                    if not valid:
+                        b0 = Uint32(0)
+                        b1 = Uint32(0)
+                    a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (
+                        Int32(ko_imm) + a_col
+                    ) * Int32(2)
+                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(q_nope_bf16_base_addr + a_byte)
+                    q0, q1, q2, q3 = mma_m16n8k16_f32_bf16(
+                        q0, q1, q2, q3, a0, a1, a2, a3, b0, b1
+                    )
+        else:
+            sw0, sw1, sw2, sw3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+            sw4, sw5, sw6, sw7 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+            if valid:
+                sw0, sw1, sw2, sw3 = ld_shared_v4_u32(row_addr + Int32(256))
+                sw4, sw5, sw6, sw7 = ld_shared_v4_u32(row_addr + Int32(272))
+            sc_words = (sw0, sw1, sw2, sw3, sw4, sw5, sw6, sw7)
+            lane_data_base = row_addr + tid
+            for blk in cutlass.range_constexpr(num_scales):
+                for ks in cutlass.range_constexpr(quant_tile // 16):
+                    ko_imm = blk * quant_tile + ks * 16
+                    byte_imm = blk * 32 + ks * 8
+                    scale_byte = _extract_u8(sc_words[blk], ks)
+                    p0 = ld_shared_u8_offset(lane_data_base, byte_imm)
+                    p1 = ld_shared_u8_offset(lane_data_base, byte_imm + 4)
+                    b0, b1 = _mixed_pairs_to_bf16x2_sm120(p0, p1, scale_byte, swa=False)
+                    if not valid:
+                        b0 = Uint32(0)
+                        b1 = Uint32(0)
+                    a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (
+                        Int32(ko_imm) + a_col
+                    ) * Int32(2)
+                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(q_nope_bf16_base_addr + a_byte)
+                    q0, q1, q2, q3 = mma_m16n8k16_f32_bf16(
+                        q0, q1, q2, q3, a0, a1, a2, a3, b0, b1
+                    )
+
+    qk[0], qk[1], qk[2], qk[3] = q0, q1, q2, q3
+    return qk
 
 
 @cute.jit
@@ -2843,6 +3045,118 @@ def s6_xv_nope_nvfp4_bf16(
 
 
 @cute.jit
+def s6_xv_dsv41_source_decode(
+    acc_nope,
+    sm_p_full_addr: Int32,
+    kv_base_addr: Int32,
+    warp_id: Int32,
+    lane: Int32,
+    *,
+    n_v_chunks: cutlass.Constexpr,
+    v_chunk: cutlass.Constexpr,
+    bi: cutlass.Constexpr,
+    n_warps: cutlass.Constexpr,
+    nt_per_warp_xv: cutlass.Constexpr,
+    sm_p_stride: cutlass.Constexpr,
+    swa: cutlass.Constexpr,
+):
+    """Compile-time source-specialized BF16 P.V for DSV4.1 decode (0-ULP exact).
+
+    Ports prefill #142 Fix 2 to UnifiedDecodeKernel: pre-loads the 8 per-lane
+    source tags once into an 8-bit `valid_mask`, splits `all_valid` / partial /
+    `none_valid` via warp vote, and uses immediate-offset loads at 544B (SWA) or
+    304B bank-conflict-free (NVFP4) stride.
+    """
+    kv_row_stride = cutlass.const_expr(544 if swa else 304)
+    tag_off = cutlass.const_expr(528 if swa else 288)
+    expected_tag = Uint32(1 if swa else 0)
+    p_stride = cutlass.const_expr(sm_p_stride if sm_p_stride else bi)
+
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    entry_parity = gid & Int32(1)
+    pair_selector = Int32(0x5410)
+    if entry_parity != Int32(0):
+        pair_selector = Int32(0x3276)
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+
+    base_ent = tid * Int32(2) + entry_parity
+    row0_base = kv_base_addr + base_ent * Int32(kv_row_stride)
+
+    valid_mask = Uint32(0)
+    for ks_t in cutlass.range_constexpr(bi // 16):
+        t0 = ld_shared_u32(row0_base + Int32(ks_t * 16 * kv_row_stride + tag_off))
+        t8 = ld_shared_u32(row0_base + Int32((ks_t * 16 + 8) * kv_row_stride + tag_off))
+        if t0 == expected_tag:
+            valid_mask = valid_mask | Uint32(1 << (ks_t * 2))
+        if t8 == expected_tag:
+            valid_mask = valid_mask | Uint32(1 << (ks_t * 2 + 1))
+
+    none_valid = cute.arch.vote_all_sync(valid_mask == Uint32(0))
+
+    if cutlass.const_expr(swa):
+        data_row_base = row0_base + warp_id * Int32(8) + (gid & ~Int32(1))
+        scale_row_base = row0_base + (warp_id >> Int32(2))
+    else:
+        data_row_base = row0_base + warp_id * Int32(4) + (gid >> Int32(1))
+        scale_row_base = row0_base + (warp_id >> Int32(1))
+
+    if not none_valid:
+        for vc in cutlass.range_constexpr(n_v_chunks):
+            for nt in cutlass.range_constexpr(nt_per_warp_xv):
+                xv0 = Float32(0.0)
+                xv1 = Float32(0.0)
+                xv2 = Float32(0.0)
+                xv3 = Float32(0.0)
+
+                for ks in cutlass.range_constexpr(bi // 16):
+                    r0_imm = ks * 16 * kv_row_stride
+                    r8_imm = (ks * 16 + 8) * kv_row_stride
+                    if cutlass.const_expr(swa):
+                        d_imm = vc * v_chunk + nt * n_warps * 8
+                        s_imm = 512 + (vc * v_chunk + nt * n_warps * 8) // 32
+                        p0 = ld_shared_u16_offset(data_row_base, r0_imm + d_imm)
+                        sc0 = ld_shared_u8_offset(scale_row_base, r0_imm + s_imm)
+                        pair0 = mxfp8_pair_to_bf16x2_sm120(p0, sc0)
+                        p8 = ld_shared_u16_offset(data_row_base, r8_imm + d_imm)
+                        sc8 = ld_shared_u8_offset(scale_row_base, r8_imm + s_imm)
+                        pair8 = mxfp8_pair_to_bf16x2_sm120(p8, sc8)
+                    else:
+                        d_imm = (vc * v_chunk + nt * n_warps * 8) // 2
+                        s_imm = 256 + (vc * v_chunk + nt * n_warps * 8) // 16
+                        p0 = ld_shared_u8_offset(data_row_base, r0_imm + d_imm)
+                        sc0 = ld_shared_u8_offset(scale_row_base, r0_imm + s_imm)
+                        pair0 = nvfp4_pair_to_bf16x2_sm120(p0, sc0)
+                        p8 = ld_shared_u8_offset(data_row_base, r8_imm + d_imm)
+                        sc8 = ld_shared_u8_offset(scale_row_base, r8_imm + s_imm)
+                        pair8 = nvfp4_pair_to_bf16x2_sm120(p8, sc8)
+                    if (valid_mask & Uint32(1 << (ks * 2))) == Uint32(0):
+                        pair0 = Uint32(0)
+                    if (valid_mask & Uint32(1 << (ks * 2 + 1))) == Uint32(0):
+                        pair8 = Uint32(0)
+                    peer0 = cute.arch.shuffle_sync_bfly(pair0, offset=4)
+                    peer8 = cute.arch.shuffle_sync_bfly(pair8, offset=4)
+                    b0 = byte_perm(pair0, peer0, pair_selector)
+                    b1 = byte_perm(pair8, peer8, pair_selector)
+
+                    a_byte = (
+                        a_row * Int32(p_stride) + (Int32(ks * 16) + a_col)
+                    ) * Int32(2)
+                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sm_p_full_addr + a_byte)
+                    xv0, xv1, xv2, xv3 = mma_m16n8k16_f32_bf16(
+                        xv0, xv1, xv2, xv3, a0, a1, a2, a3, b0, b1
+                    )
+
+                at = vc * nt_per_warp_xv + nt
+                acc_nope[at][0] = acc_nope[at][0] + xv0
+                acc_nope[at][1] = acc_nope[at][1] + xv1
+                acc_nope[at][2] = acc_nope[at][2] + xv2
+                acc_nope[at][3] = acc_nope[at][3] + xv3
+    return acc_nope
+
+
+@cute.jit
 def s6_xv_nope_glm_h8_swap_ab(
     w_pre,
     acc_nope,
@@ -3420,25 +3734,42 @@ def s7_epilogue(
     tid = lane & Int32(3)
 
     # ── per-physical-row inverse normalizer (gid heads, gid+8 heads). ──
+    lo_valid = gid < Int32(valid_hpb) if cutlass.const_expr(valid_hpb < 8) else True
+    hi_valid = (
+        (gid + Int32(8)) < Int32(valid_hpb)
+        if cutlass.const_expr(8 < valid_hpb < 16)
+        else True
+    )
     if cutlass.const_expr(epilogue_mode == EPILOGUE_FINAL_BF16 and has_attn_sink):
-        # FINAL_BF16 + sink: il = 1/(l + exp2(sink_log2 - m)) (FlashInfer:494).
-        s0 = Float32(attn_sink[head_base + gid]) * Float32(LOG2_E)
-        denom0 = global_sum[0] + _exp2_approx_ftz_f32(s0 - global_max[0])
+        # FINAL_BF16 + sink: overflow-safe normalizer matching merge.py:
+        #   new_m = max(m, sink_log2); inv_g = exp2(m - new_m) / (l*exp2(m - new_m) + exp2(sink_log2 - new_m))
+        # Reduces to 1/(l + exp2(sink_log2 - m)) when m >= sink_log2 and never
+        # overflows exp2 when sink_log2 >> m; empty row (l == 0) stays 0.
         inv_g0 = Float32(0.0)
-        if denom0 != Float32(0.0):
-            if cutlass.const_expr(fast_rcp):
-                inv_g0 = rcp_approx_ftz(denom0)
-            else:
-                inv_g0 = Float32(1.0) / denom0
+        if lo_valid and global_sum[0] != Float32(0.0):
+            s0 = Float32(attn_sink[head_base + gid]) * Float32(LOG2_E)
+            new_m0 = fmax_f32(global_max[0], s0)
+            prev_s0 = _exp2_approx_ftz_f32(global_max[0] - new_m0)
+            sink_s0 = _exp2_approx_ftz_f32(s0 - new_m0)
+            denom0 = global_sum[0] * prev_s0 + sink_s0
+            if denom0 != Float32(0.0):
+                if cutlass.const_expr(fast_rcp):
+                    inv_g0 = prev_s0 * rcp_approx_ftz(denom0)
+                else:
+                    inv_g0 = prev_s0 / denom0
         inv_g1 = Float32(0.0)
         if cutlass.const_expr(valid_hpb > 8):
-            s1 = Float32(attn_sink[head_base + gid + Int32(8)]) * Float32(LOG2_E)
-            denom1 = global_sum[1] + _exp2_approx_ftz_f32(s1 - global_max[1])
-            if denom1 != Float32(0.0):
-                if cutlass.const_expr(fast_rcp):
-                    inv_g1 = rcp_approx_ftz(denom1)
-                else:
-                    inv_g1 = Float32(1.0) / denom1
+            if hi_valid and global_sum[1] != Float32(0.0):
+                s1 = Float32(attn_sink[head_base + gid + Int32(8)]) * Float32(LOG2_E)
+                new_m1 = fmax_f32(global_max[1], s1)
+                prev_s1 = _exp2_approx_ftz_f32(global_max[1] - new_m1)
+                sink_s1 = _exp2_approx_ftz_f32(s1 - new_m1)
+                denom1 = global_sum[1] * prev_s1 + sink_s1
+                if denom1 != Float32(0.0):
+                    if cutlass.const_expr(fast_rcp):
+                        inv_g1 = prev_s1 * rcp_approx_ftz(denom1)
+                    else:
+                        inv_g1 = prev_s1 / denom1
     else:
         # PARTIAL_WRITEBACK or FINAL_BF16-without-sink: il = 1/l (0 if empty).
         inv_g0 = Float32(0.0)
@@ -3469,62 +3800,70 @@ def s7_epilogue(
             )
             if cutlass.const_expr(coalesced_output):
                 if cutlass.const_expr(streaming_output):
-                    st_shared_bf16x2_from_f32(
-                        staging_base_addr + (gid * Int32(d_v) + d0) * Int32(2),
-                        acc_nope[at][0] * inv_g0,
-                        acc_nope[at][1] * inv_g0,
-                    )
-                    if cutlass.const_expr(valid_hpb > 8):
+                    if lo_valid:
                         st_shared_bf16x2_from_f32(
-                            staging_base_addr
-                            + ((gid + Int32(8)) * Int32(d_v) + d0) * Int32(2),
-                            acc_nope[at][2] * inv_g1,
-                            acc_nope[at][3] * inv_g1,
+                            staging_base_addr + (gid * Int32(d_v) + d0) * Int32(2),
+                            acc_nope[at][0] * inv_g0,
+                            acc_nope[at][1] * inv_g0,
                         )
+                    if cutlass.const_expr(valid_hpb > 8):
+                        if hi_valid:
+                            st_shared_bf16x2_from_f32(
+                                staging_base_addr
+                                + ((gid + Int32(8)) * Int32(d_v) + d0) * Int32(2),
+                                acc_nope[at][2] * inv_g1,
+                                acc_nope[at][3] * inv_g1,
+                            )
                 else:
-                    st_shared_bf16_from_f32(
-                        staging_base_addr + (gid * Int32(d_v) + d0) * Int32(2),
+                    if lo_valid:
+                        st_shared_bf16_from_f32(
+                            staging_base_addr + (gid * Int32(d_v) + d0) * Int32(2),
+                            acc_nope[at][0] * inv_g0,
+                        )
+                        st_shared_bf16_from_f32(
+                            staging_base_addr
+                            + (gid * Int32(d_v) + d0 + Int32(1)) * Int32(2),
+                            acc_nope[at][1] * inv_g0,
+                        )
+                    if cutlass.const_expr(valid_hpb > 8):
+                        if hi_valid:
+                            st_shared_bf16_from_f32(
+                                staging_base_addr
+                                + ((gid + Int32(8)) * Int32(d_v) + d0) * Int32(2),
+                                acc_nope[at][2] * inv_g1,
+                            )
+                            st_shared_bf16_from_f32(
+                                staging_base_addr
+                                + ((gid + Int32(8)) * Int32(d_v) + d0 + Int32(1))
+                                * Int32(2),
+                                acc_nope[at][3] * inv_g1,
+                            )
+            elif cutlass.const_expr(_ot == cutlass.BFloat16):
+                if lo_valid:
+                    store_bf16x2(
+                        get_ptr_as_int64(out_o, cute.crd2idx((gid, d0), out_o.layout)),
                         acc_nope[at][0] * inv_g0,
-                    )
-                    st_shared_bf16_from_f32(
-                        staging_base_addr
-                        + (gid * Int32(d_v) + d0 + Int32(1)) * Int32(2),
                         acc_nope[at][1] * inv_g0,
                     )
-                    if cutlass.const_expr(valid_hpb > 8):
-                        st_shared_bf16_from_f32(
-                            staging_base_addr
-                            + ((gid + Int32(8)) * Int32(d_v) + d0) * Int32(2),
+                if cutlass.const_expr(valid_hpb > 8):
+                    if hi_valid:
+                        store_bf16x2(
+                            get_ptr_as_int64(
+                                out_o, cute.crd2idx((gid + Int32(8), d0), out_o.layout)
+                            ),
                             acc_nope[at][2] * inv_g1,
-                        )
-                        st_shared_bf16_from_f32(
-                            staging_base_addr
-                            + ((gid + Int32(8)) * Int32(d_v) + d0 + Int32(1))
-                            * Int32(2),
                             acc_nope[at][3] * inv_g1,
                         )
-            elif cutlass.const_expr(_ot == cutlass.BFloat16):
-                store_bf16x2(
-                    get_ptr_as_int64(out_o, cute.crd2idx((gid, d0), out_o.layout)),
-                    acc_nope[at][0] * inv_g0,
-                    acc_nope[at][1] * inv_g0,
-                )
-                if cutlass.const_expr(valid_hpb > 8):
-                    store_bf16x2(
-                        get_ptr_as_int64(
-                            out_o, cute.crd2idx((gid + Int32(8), d0), out_o.layout)
-                        ),
-                        acc_nope[at][2] * inv_g1,
-                        acc_nope[at][3] * inv_g1,
-                    )
             else:
-                out_o[gid, d0] = (acc_nope[at][0] * inv_g0).to(_ot)
-                out_o[gid, d0 + Int32(1)] = (acc_nope[at][1] * inv_g0).to(_ot)
+                if lo_valid:
+                    out_o[gid, d0] = (acc_nope[at][0] * inv_g0).to(_ot)
+                    out_o[gid, d0 + Int32(1)] = (acc_nope[at][1] * inv_g0).to(_ot)
                 if cutlass.const_expr(valid_hpb > 8):
-                    out_o[gid + Int32(8), d0] = (acc_nope[at][2] * inv_g1).to(_ot)
-                    out_o[gid + Int32(8), d0 + Int32(1)] = (
-                        acc_nope[at][3] * inv_g1
-                    ).to(_ot)
+                    if hi_valid:
+                        out_o[gid + Int32(8), d0] = (acc_nope[at][2] * inv_g1).to(_ot)
+                        out_o[gid + Int32(8), d0 + Int32(1)] = (
+                            acc_nope[at][3] * inv_g1
+                        ).to(_ot)
 
     # RoPE dims (DSV4 only: V_HAS_ROPE). GLM V == nope-only so this is elided.
     if cutlass.const_expr(v_has_rope):
@@ -3536,47 +3875,55 @@ def s7_epilogue(
                 + tid * Int32(2)
             )
             if cutlass.const_expr(coalesced_output):
-                st_shared_bf16_from_f32(
-                    staging_base_addr + (gid * Int32(d_v) + rd0) * Int32(2),
-                    acc_rope[r + 0] * inv_g0,
-                )
-                st_shared_bf16_from_f32(
-                    staging_base_addr + (gid * Int32(d_v) + rd0 + Int32(1)) * Int32(2),
-                    acc_rope[r + 1] * inv_g0,
-                )
+                if lo_valid:
+                    st_shared_bf16_from_f32(
+                        staging_base_addr + (gid * Int32(d_v) + rd0) * Int32(2),
+                        acc_rope[r + 0] * inv_g0,
+                    )
+                    st_shared_bf16_from_f32(
+                        staging_base_addr
+                        + (gid * Int32(d_v) + rd0 + Int32(1)) * Int32(2),
+                        acc_rope[r + 1] * inv_g0,
+                    )
                 if cutlass.const_expr(valid_hpb > 8):
-                    st_shared_bf16_from_f32(
-                        staging_base_addr
-                        + ((gid + Int32(8)) * Int32(d_v) + rd0) * Int32(2),
-                        acc_rope[r + 2] * inv_g1,
-                    )
-                    st_shared_bf16_from_f32(
-                        staging_base_addr
-                        + ((gid + Int32(8)) * Int32(d_v) + rd0 + Int32(1)) * Int32(2),
-                        acc_rope[r + 3] * inv_g1,
-                    )
+                    if hi_valid:
+                        st_shared_bf16_from_f32(
+                            staging_base_addr
+                            + ((gid + Int32(8)) * Int32(d_v) + rd0) * Int32(2),
+                            acc_rope[r + 2] * inv_g1,
+                        )
+                        st_shared_bf16_from_f32(
+                            staging_base_addr
+                            + ((gid + Int32(8)) * Int32(d_v) + rd0 + Int32(1))
+                            * Int32(2),
+                            acc_rope[r + 3] * inv_g1,
+                        )
             elif cutlass.const_expr(_ot == cutlass.BFloat16):
-                store_bf16x2(
-                    get_ptr_as_int64(out_o, cute.crd2idx((gid, rd0), out_o.layout)),
-                    acc_rope[r + 0] * inv_g0,
-                    acc_rope[r + 1] * inv_g0,
-                )
-                if cutlass.const_expr(valid_hpb > 8):
+                if lo_valid:
                     store_bf16x2(
-                        get_ptr_as_int64(
-                            out_o, cute.crd2idx((gid + Int32(8), rd0), out_o.layout)
-                        ),
-                        acc_rope[r + 2] * inv_g1,
-                        acc_rope[r + 3] * inv_g1,
+                        get_ptr_as_int64(out_o, cute.crd2idx((gid, rd0), out_o.layout)),
+                        acc_rope[r + 0] * inv_g0,
+                        acc_rope[r + 1] * inv_g0,
                     )
-            else:
-                out_o[gid, rd0] = (acc_rope[r + 0] * inv_g0).to(_ot)
-                out_o[gid, rd0 + Int32(1)] = (acc_rope[r + 1] * inv_g0).to(_ot)
                 if cutlass.const_expr(valid_hpb > 8):
-                    out_o[gid + Int32(8), rd0] = (acc_rope[r + 2] * inv_g1).to(_ot)
-                    out_o[gid + Int32(8), rd0 + Int32(1)] = (
-                        acc_rope[r + 3] * inv_g1
-                    ).to(_ot)
+                    if hi_valid:
+                        store_bf16x2(
+                            get_ptr_as_int64(
+                                out_o, cute.crd2idx((gid + Int32(8), rd0), out_o.layout)
+                            ),
+                            acc_rope[r + 2] * inv_g1,
+                            acc_rope[r + 3] * inv_g1,
+                        )
+            else:
+                if lo_valid:
+                    out_o[gid, rd0] = (acc_rope[r + 0] * inv_g0).to(_ot)
+                    out_o[gid, rd0 + Int32(1)] = (acc_rope[r + 1] * inv_g0).to(_ot)
+                if cutlass.const_expr(valid_hpb > 8):
+                    if hi_valid:
+                        out_o[gid + Int32(8), rd0] = (acc_rope[r + 2] * inv_g1).to(_ot)
+                        out_o[gid + Int32(8), rd0 + Int32(1)] = (
+                            acc_rope[r + 3] * inv_g1
+                        ).to(_ot)
 
     if cutlass.const_expr(coalesced_output):
         cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads)
@@ -3637,26 +3984,35 @@ def s7_epilogue(
         if global_sum[1] != Float32(0.0):
             lse1 = _log2_approx_ftz_f32(global_sum[1]) + global_max[1]
         if cutlass.const_expr(epilogue_mode == EPILOGUE_FINAL_BF16 and has_attn_sink):
-            # FlashMLA sink fold: lse += log2(1 + exp2(sink_log2 - lse)); empty ->
-            # sink_log2 (prefill_kernel.cuh:548-560).
-            sink0 = Float32(attn_sink[head_base + gid]) * Float32(LOG2_E)
-            if lse0 != Float32(_NEG_INF):
-                lse0 = lse0 + _log2_approx_ftz_f32(
-                    Float32(1.0) + _exp2_approx_ftz_f32(sink0 - lse0)
-                )
-            else:
-                lse0 = sink0
-            if cutlass.const_expr(valid_hpb > 8):
-                sink1 = Float32(attn_sink[head_base + gid + Int32(8)]) * Float32(LOG2_E)
-                if lse1 != Float32(_NEG_INF):
-                    lse1 = lse1 + _log2_approx_ftz_f32(
-                        Float32(1.0) + _exp2_approx_ftz_f32(sink1 - lse1)
+            # Overflow-safe FlashMLA sink fold in base-2 domain:
+            # lse = max(lse, sink) + log2(1 + exp2(min(lse, sink) - max(lse, sink)))
+            if lo_valid:
+                sink0 = Float32(attn_sink[head_base + gid]) * Float32(LOG2_E)
+                if lse0 != Float32(_NEG_INF):
+                    m0 = fmax_f32(lse0, sink0)
+                    lse0 = m0 + _log2_approx_ftz_f32(
+                        Float32(1.0) + _exp2_approx_ftz_f32(fmin_f32(lse0, sink0) - m0)
                     )
                 else:
-                    lse1 = sink1
-        out_lse[gid] = lse0
+                    lse0 = sink0
+            if cutlass.const_expr(valid_hpb > 8):
+                if hi_valid:
+                    sink1 = Float32(attn_sink[head_base + gid + Int32(8)]) * Float32(
+                        LOG2_E
+                    )
+                    if lse1 != Float32(_NEG_INF):
+                        m1 = fmax_f32(lse1, sink1)
+                        lse1 = m1 + _log2_approx_ftz_f32(
+                            Float32(1.0)
+                            + _exp2_approx_ftz_f32(fmin_f32(lse1, sink1) - m1)
+                        )
+                    else:
+                        lse1 = sink1
+        if lo_valid:
+            out_lse[gid] = lse0
         if cutlass.const_expr(valid_hpb > 8):
-            out_lse[gid + Int32(8)] = lse1
+            if hi_valid:
+                out_lse[gid + Int32(8)] = lse1
 
 
 # ── extra typed helpers for the PV path ───────────────────────────────────────
