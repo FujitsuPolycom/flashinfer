@@ -78,9 +78,26 @@ from ._kernels import (
 
 SPLIT_LAGGED_MAX_TOKENS = 128
 SPLIT_LAGGED_HIDDEN_SIZES = (4096, 5120, 7168)
-CLUSTER_AR_MHC_MAX_TOKENS = 32
+CLUSTER_AR_MHC_MAX_TOKENS = 128
+CLUSTER_AR_MHC_ONESHOT_MAX_TOKENS = 4
 CLUSTER_AR_MHC_WORLD_SIZES = (2, 3, 4, 6, 8)
+_CLUSTER_AR_MHC_TRANSPORTS = ("oneshot", "rsag")
 _PARTIAL_STRIDE = 32
+
+
+def cluster_allreduce_transport(tokens: int, world_size: int) -> str:
+    """Return the Lamport PCIe transport for ``ClusterMhcAllReducePostYNorm``.
+
+    For TP2 (where 1-hop and 2-hop move identical byte volume) or tiny batches
+    (``tokens <= 4``), 1-hop ``"oneshot"`` minimizes round-trip latency. For
+    wider batches (``5 <= tokens <= 128``) with ``world_size >= 3``, 2-hop
+    Lamport reduce-scatter + all-gather (``"rsag"``) halves per-rank PCIe TX
+    traffic on TP4 (1.5x vs 3.0x payload) while keeping the entire AllReduce +
+    mHC + RMSNorm + MXFP8 sequence fused in a single kernel launch.
+    """
+    if int(world_size) <= 2 or int(tokens) <= CLUSTER_AR_MHC_ONESHOT_MAX_TOKENS:
+        return "oneshot"
+    return "rsag"
 
 
 def split_lagged_cluster_size(tokens: int) -> int:
@@ -1294,12 +1311,23 @@ def supports_cluster_allreduce_post_y_norm(
     norm_dtype: torch.dtype,
     world_size: int,
 ) -> bool:
-    """Return True when fused Lamport-sentinel AllReduce + ClusterMhcPostYNorm is supported."""
-    return (
-        supports_split_lagged(device, max_tokens, hidden_size, norm_dtype)
-        and int(max_tokens) <= CLUSTER_AR_MHC_MAX_TOKENS
+    """Return True when fused Lamport-sentinel AllReduce + ClusterMhcPostYNorm is supported.
+
+    Verifies SM120+ architecture, geometry, world size, and full-grid SM residency
+    so peer-waiting Lamport CTAs can never deadlock from partial grid scheduling.
+    """
+    max_tokens_i = int(max_tokens)
+    if not (
+        supports_split_lagged(device, max_tokens_i, hidden_size, norm_dtype)
+        and max_tokens_i <= CLUSTER_AR_MHC_MAX_TOKENS
         and int(world_size) in CLUSTER_AR_MHC_WORLD_SIZES
-    )
+    ):
+        return False
+    sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    # ClusterMhcAllReducePostYNorm launches 1 CTA/row (cs=1, M>48, 1 CTA/SM),
+    # 4 CTAs/row (cs=4, 17<=M<=48, >=4 CTAs/SM), or 8 CTAs/row (cs=8, M<=16, >=8 CTAs/SM).
+    # Requiring sm_count >= max(36, max_tokens) guarantees full grid residency.
+    return sm_count >= max(36, max_tokens_i)
 
 
 def oneshot_channel_sentinel_params(
@@ -1388,6 +1416,7 @@ class ClusterMhcAllReducePostYNorm:
         device_slot_selection: bool = True,
         slot_bias: int = 0,
         release_dependents: bool = False,
+        transport: str = "oneshot",
     ):
         self.hidden = int(hidden)
         self.world_size = int(world_size)
@@ -1398,6 +1427,11 @@ class ClusterMhcAllReducePostYNorm:
             )
         if not 0 <= self.rank < self.world_size:
             raise ValueError(f"rank ({self.rank}) must be in [0, {self.world_size})")
+        if transport not in _CLUSTER_AR_MHC_TRANSPORTS:
+            raise ValueError(
+                f"transport must be in {_CLUSTER_AR_MHC_TRANSPORTS}, got {transport!r}"
+            )
+        self.transport = str(transport)
         self.norm_eps = float(norm_eps)
         self.norm_is_bf16 = bool(norm_is_bf16)
         self.packs = self.hidden // 8
@@ -1567,69 +1601,174 @@ class ClusterMhcAllReducePostYNorm:
                 self_enc3 = _encode_bf16_sentinel_word(local_words[3])
 
             self_shard_off = (Int64(self.rank) * shard_packs + pack_idx) * Int64(16)
-            for peer_index in cutlass.range_constexpr(1, self.world_size):
-                target = (self.rank + peer_index) % self.world_size
-                dst_addr = Int64(slot_table[target]) + region_bytes + self_shard_off
-                st_relaxed_sys_global_v4_u32(
-                    dst_addr, self_enc0, self_enc1, self_enc2, self_enc3
-                )
+            if const_expr(self.transport == "oneshot"):
+                for peer_index in cutlass.range_constexpr(1, self.world_size):
+                    target = (self.rank + peer_index) % self.world_size
+                    dst_addr = Int64(slot_table[target]) + region_bytes + self_shard_off
+                    st_relaxed_sys_global_v4_u32(
+                        dst_addr, self_enc0, self_enc1, self_enc2, self_enc3
+                    )
 
-            # Overlap [M, 4, H] residual stream preload while peer PCIe TLPs are in flight.
-            rw0 = ld_global_v4_u32(res_base + Int64(0) * row_bytes + boff)
-            rw1 = ld_global_v4_u32(res_base + Int64(1) * row_bytes + boff)
-            rw2 = ld_global_v4_u32(res_base + Int64(2) * row_bytes + boff)
-            rw3 = ld_global_v4_u32(res_base + Int64(3) * row_bytes + boff)
-            for wd in cutlass.range_constexpr(4):
-                rw_buf[0, wd] = rw0[wd]
-                rw_buf[1, wd] = rw1[wd]
-                rw_buf[2, wd] = rw2[wd]
-                rw_buf[3, wd] = rw3[wd]
+                # Overlap [M, 4, H] residual stream preload while peer PCIe TLPs are in flight.
+                rw0 = ld_global_v4_u32(res_base + Int64(0) * row_bytes + boff)
+                rw1 = ld_global_v4_u32(res_base + Int64(1) * row_bytes + boff)
+                rw2 = ld_global_v4_u32(res_base + Int64(2) * row_bytes + boff)
+                rw3 = ld_global_v4_u32(res_base + Int64(3) * row_bytes + boff)
+                for wd in cutlass.range_constexpr(4):
+                    rw_buf[0, wd] = rw0[wd]
+                    rw_buf[1, wd] = rw1[wd]
+                    rw_buf[2, wd] = rw2[wd]
+                    rw_buf[3, wd] = rw3[wd]
 
-            # Step B: spin on local Lamport slots until every remote peer arrives,
-            # clear consumed slots to zero, and sum in canonical rank order 0..W-1.
-            local_base = Int64(slot_table[self.rank]) + region_bytes
-            incoming_words = cute.make_rmem_tensor((self.world_size, 4), Uint32)
-            incoming_words[self.rank, 0] = self_enc0
-            incoming_words[self.rank, 1] = self_enc1
-            incoming_words[self.rank, 2] = self_enc2
-            incoming_words[self.rank, 3] = self_enc3
+                # Step B: spin on local Lamport slots until every remote peer arrives,
+                # clear consumed slots to zero, and sum in canonical rank order 0..W-1.
+                local_base = Int64(slot_table[self.rank]) + region_bytes
+                incoming_words = cute.make_rmem_tensor((self.world_size, 4), Uint32)
+                incoming_words[self.rank, 0] = self_enc0
+                incoming_words[self.rank, 1] = self_enc1
+                incoming_words[self.rank, 2] = self_enc2
+                incoming_words[self.rank, 3] = self_enc3
 
-            waiting = cutlass.Boolean(True)
-            while waiting:
-                waiting = cutlass.Boolean(False)
+                waiting = cutlass.Boolean(True)
+                while waiting:
+                    waiting = cutlass.Boolean(False)
+                    for peer_index in cutlass.range_constexpr(1, self.world_size):
+                        peer = (self.rank + peer_index) % self.world_size
+                        addr = local_base + (
+                            Int64(peer) * shard_packs + pack_idx
+                        ) * Int64(16)
+                        words = ld_relaxed_sys_global_v4_u32(addr)
+                        for wd in cutlass.range_constexpr(4):
+                            incoming_words[peer, wd] = words[wd]
+                            waiting = (
+                                waiting
+                                | ((words[wd] & Uint32(0xFFFF)) == Uint32(0))
+                                | ((words[wd] & Uint32(0xFFFF0000)) == Uint32(0))
+                            )
+
                 for peer_index in cutlass.range_constexpr(1, self.world_size):
                     peer = (self.rank + peer_index) % self.world_size
                     addr = local_base + (Int64(peer) * shard_packs + pack_idx) * Int64(
                         16
                     )
-                    words = ld_relaxed_sys_global_v4_u32(addr)
-                    for wd in cutlass.range_constexpr(4):
-                        incoming_words[peer, wd] = words[wd]
-                        waiting = (
-                            waiting
-                            | ((words[wd] & Uint32(0xFFFF)) == Uint32(0))
-                            | ((words[wd] & Uint32(0xFFFF0000)) == Uint32(0))
+                    st_relaxed_sys_global_v4_u32(
+                        addr, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                    )
+
+                for wd in cutlass.range_constexpr(4):
+                    acc_lo = Float32(0.0)
+                    acc_hi = Float32(0.0)
+                    for peer in cutlass.range_constexpr(self.world_size):
+                        lo, hi = unpack_bf16x2(incoming_words[peer, wd])
+                        if const_expr(peer == 0):
+                            acc_lo = lo
+                            acc_hi = hi
+                        else:
+                            acc_lo = acc_lo + lo
+                            acc_hi = acc_hi + hi
+                    xw[wd] = pack_f32x2_to_bf16x2(acc_lo, acc_hi)
+            else:
+                # 2-hop Lamport reduce-scatter + all-gather with warp-uniform rotated owners.
+                # Every 32-thread warp owns one uniform peer rank, ensuring coalesced 512B
+                # PCIe TLP bursts and zero warp divergence between owner and non-owner warps.
+                owner = (
+                    Int32(row) + Int32(c_rank) * Int32(self.num_warps) + Int32(warp)
+                ) % Int32(self.world_size)
+                local_base = Int64(slot_table[self.rank]) + region_bytes
+
+                if owner != Int32(self.rank):
+                    dst_addr = Int64(slot_table[owner]) + region_bytes + self_shard_off
+                    st_relaxed_sys_global_v4_u32(
+                        dst_addr, self_enc0, self_enc1, self_enc2, self_enc3
+                    )
+
+                # Overlap [M, 4, H] residual stream preload while Hop-1 PCIe TLPs are in flight.
+                rw0 = ld_global_v4_u32(res_base + Int64(0) * row_bytes + boff)
+                rw1 = ld_global_v4_u32(res_base + Int64(1) * row_bytes + boff)
+                rw2 = ld_global_v4_u32(res_base + Int64(2) * row_bytes + boff)
+                rw3 = ld_global_v4_u32(res_base + Int64(3) * row_bytes + boff)
+                for wd in cutlass.range_constexpr(4):
+                    rw_buf[0, wd] = rw0[wd]
+                    rw_buf[1, wd] = rw1[wd]
+                    rw_buf[2, wd] = rw2[wd]
+                    rw_buf[3, wd] = rw3[wd]
+
+                if owner == Int32(self.rank):
+                    incoming_words = cute.make_rmem_tensor((self.world_size, 4), Uint32)
+                    incoming_words[self.rank, 0] = self_enc0
+                    incoming_words[self.rank, 1] = self_enc1
+                    incoming_words[self.rank, 2] = self_enc2
+                    incoming_words[self.rank, 3] = self_enc3
+
+                    waiting = cutlass.Boolean(True)
+                    while waiting:
+                        waiting = cutlass.Boolean(False)
+                        for peer_index in cutlass.range_constexpr(1, self.world_size):
+                            peer = (self.rank + peer_index) % self.world_size
+                            addr = local_base + (
+                                Int64(peer) * shard_packs + pack_idx
+                            ) * Int64(16)
+                            words = ld_relaxed_sys_global_v4_u32(addr)
+                            for wd in cutlass.range_constexpr(4):
+                                incoming_words[peer, wd] = words[wd]
+                                waiting = (
+                                    waiting
+                                    | ((words[wd] & Uint32(0xFFFF)) == Uint32(0))
+                                    | ((words[wd] & Uint32(0xFFFF0000)) == Uint32(0))
+                                )
+
+                    for peer_index in cutlass.range_constexpr(1, self.world_size):
+                        peer = (self.rank + peer_index) % self.world_size
+                        addr = local_base + (
+                            Int64(peer) * shard_packs + pack_idx
+                        ) * Int64(16)
+                        st_relaxed_sys_global_v4_u32(
+                            addr, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
                         )
 
-            for peer_index in cutlass.range_constexpr(1, self.world_size):
-                peer = (self.rank + peer_index) % self.world_size
-                addr = local_base + (Int64(peer) * shard_packs + pack_idx) * Int64(16)
-                st_relaxed_sys_global_v4_u32(
-                    addr, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-                )
+                    for wd in cutlass.range_constexpr(4):
+                        acc_lo = Float32(0.0)
+                        acc_hi = Float32(0.0)
+                        for peer in cutlass.range_constexpr(self.world_size):
+                            lo, hi = unpack_bf16x2(incoming_words[peer, wd])
+                            if const_expr(peer == 0):
+                                acc_lo = lo
+                                acc_hi = hi
+                            else:
+                                acc_lo = acc_lo + lo
+                                acc_hi = acc_hi + hi
+                        xw[wd] = _encode_bf16_sentinel_word(
+                            pack_f32x2_to_bf16x2(acc_lo, acc_hi)
+                        )
 
-            for wd in cutlass.range_constexpr(4):
-                acc_lo = Float32(0.0)
-                acc_hi = Float32(0.0)
-                for peer in cutlass.range_constexpr(self.world_size):
-                    lo, hi = unpack_bf16x2(incoming_words[peer, wd])
-                    if const_expr(peer == 0):
-                        acc_lo = lo
-                        acc_hi = hi
-                    else:
-                        acc_lo = acc_lo + lo
-                        acc_hi = acc_hi + hi
-                xw[wd] = pack_f32x2_to_bf16x2(acc_lo, acc_hi)
+                    # Hop 2 (All-Gather): broadcast reduced sentinel words to every peer.
+                    for peer_index in cutlass.range_constexpr(1, self.world_size):
+                        target = (self.rank + peer_index) % self.world_size
+                        dst_addr = (
+                            Int64(slot_table[target]) + region_bytes + self_shard_off
+                        )
+                        st_relaxed_sys_global_v4_u32(
+                            dst_addr, xw[0], xw[1], xw[2], xw[3]
+                        )
+                else:
+                    # Hop 2 (All-Gather): wait on owner's reduced pack and clear slot.
+                    addr = local_base + (Int64(owner) * shard_packs + pack_idx) * Int64(
+                        16
+                    )
+                    waiting = cutlass.Boolean(True)
+                    while waiting:
+                        words = ld_relaxed_sys_global_v4_u32(addr)
+                        waiting = cutlass.Boolean(False)
+                        for wd in cutlass.range_constexpr(4):
+                            xw[wd] = words[wd]
+                            waiting = (
+                                waiting
+                                | ((words[wd] & Uint32(0xFFFF)) == Uint32(0))
+                                | ((words[wd] & Uint32(0xFFFF0000)) == Uint32(0))
+                            )
+                    st_relaxed_sys_global_v4_u32(
+                        addr, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                    )
 
         # Step C: in-register ClusterMhcPostYNorm (load coefficients after PCIe spin to
         # keep register pressure low and preserve Sinkhorn overlap).
@@ -1876,6 +2015,7 @@ def compile_cluster_allreduce_post_y_norm(
     device_slot_selection: bool = True,
     slot_bias: int = 0,
     release_dependents: bool = False,
+    transport: str = "auto",
 ):
     hidden = int(hidden)
     world_size = int(world_size)
@@ -1887,8 +2027,23 @@ def compile_cluster_allreduce_post_y_norm(
     device_slot_selection = bool(device_slot_selection)
     slot_bias = int(slot_bias) & 1 if device_slot_selection else 0
     release_dependents = bool(release_dependents)
+    if transport not in ("auto", *_CLUSTER_AR_MHC_TRANSPORTS):
+        raise ValueError(
+            f"transport must be 'auto' or in {_CLUSTER_AR_MHC_TRANSPORTS}, got {transport!r}"
+        )
     norm_cute_dt = BFloat16 if norm_is_bf16 else Float32
-    cluster_sizes = (8, 4) if cluster_size is None else (int(cluster_size),)
+    cluster_sizes = (8, 4, 1) if cluster_size is None else (int(cluster_size),)
+    specs: list[tuple[int, str]] = []
+    for cs in cluster_sizes:
+        if transport != "auto":
+            specs.append((cs, transport))
+        elif world_size <= 2:
+            specs.append((cs, "oneshot"))
+        elif cs == 8:
+            specs.append((8, "oneshot"))
+            specs.append((8, "rsag"))
+        else:
+            specs.append((cs, "rsag"))
 
     fake = (
         make_ptr(cutlass.Uint64, 16, cute.AddressSpace.gmem, assumed_align=8),
@@ -1905,9 +2060,9 @@ def compile_cluster_allreduce_post_y_norm(
         make_ptr(Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
     )
-    compiled_by_cluster: dict[int, object] = {}
+    compiled_by_spec: dict[tuple[int, str], object] = {}
     with torch.cuda.device(ordinal):
-        for cs in cluster_sizes:
+        for cs, resolved_t in specs:
             kernel = ClusterMhcAllReducePostYNorm(
                 hidden,
                 world_size,
@@ -1920,6 +2075,7 @@ def compile_cluster_allreduce_post_y_norm(
                 device_slot_selection=device_slot_selection,
                 slot_bias=slot_bias,
                 release_dependents=release_dependents,
+                transport=resolved_t,
             )
             key = (
                 hidden,
@@ -1933,8 +2089,9 @@ def compile_cluster_allreduce_post_y_norm(
                 device_slot_selection,
                 slot_bias,
                 release_dependents,
+                resolved_t,
             )
-            compiled_by_cluster[cs] = b12x_compile(
+            compiled_by_spec[(cs, resolved_t)] = b12x_compile(
                 kernel,
                 *fake,
                 Int64(1),
@@ -1942,12 +2099,10 @@ def compile_cluster_allreduce_post_y_norm(
                 Int32(1),
                 current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
-                    "norm.mhc.cluster_allreduce_post_y_norm", 1, key
+                    "norm.mhc.cluster_allreduce_post_y_norm", 2, key
                 ),
             )
-    fixed_raw = (
-        compiled_by_cluster[cluster_sizes[0]] if len(cluster_sizes) == 1 else None
-    )
+    fixed_raw = compiled_by_spec[specs[0]] if len(specs) == 1 else None
 
     def run(
         peer_table_address: int,
@@ -1989,11 +2144,20 @@ def compile_cluster_allreduce_post_y_norm(
             raise ValueError(
                 f"shard_packs ({shard_packs}) must cover payload packs ({tokens * (hidden // 8)})"
             )
-        raw = (
-            fixed_raw
-            if fixed_raw is not None
-            else compiled_by_cluster[split_lagged_cluster_size(tokens)]
-        )
+        if fixed_raw is not None:
+            raw = fixed_raw
+        else:
+            cs = (
+                int(cluster_size)
+                if cluster_size is not None
+                else split_lagged_cluster_size(tokens)
+            )
+            resolved_t = (
+                cluster_allreduce_transport(tokens, world_size)
+                if transport == "auto"
+                else transport
+            )
+            raw = compiled_by_spec[(cs, resolved_t)]
         add_t = input_addend if has_addend else x
         av_t = a_values if (emit_mxfp8 and a_values is not None) else y
         as_t = a_scales if (emit_mxfp8 and a_scales is not None) else y
@@ -2073,15 +2237,17 @@ def compile_cluster_allreduce_post_y_norm(
             ),
         )
 
-    return attach_programs(run, *compiled_by_cluster.values())
+    return attach_programs(run, *compiled_by_spec.values())
 
 
 __all__ = [
     "CLUSTER_AR_MHC_MAX_TOKENS",
+    "CLUSTER_AR_MHC_ONESHOT_MAX_TOKENS",
     "CLUSTER_AR_MHC_WORLD_SIZES",
     "ClusterMhcAllReducePostYNorm",
     "SPLIT_LAGGED_HIDDEN_SIZES",
     "SPLIT_LAGGED_MAX_TOKENS",
+    "cluster_allreduce_transport",
     "compile_cluster_allreduce_post_y_norm",
     "compile_cluster_post_y_norm",
     "compile_readonly_fn_sinkhorn",

@@ -50,7 +50,9 @@ from b12x.comm.pcie._oneshot_cute import (
 from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool, _CuTeOneshotBackend
 from b12x.norm.mhc._split_lagged import (
     CLUSTER_AR_MHC_MAX_TOKENS,
+    CLUSTER_AR_MHC_ONESHOT_MAX_TOKENS,
     _encode_bf16_sentinel_word,
+    cluster_allreduce_transport,
     compile_cluster_allreduce_post_y_norm,
     compile_cluster_post_y_norm,
     oneshot_channel_sentinel_params,
@@ -261,6 +263,88 @@ class _SimulatedLamportRing:
             add = None if peer_addends is None else peer_addends[src]
             push(dst_addr, peer_xs[src], add, stream=stream)
 
+    def populate_rsag_remote_peers(
+        self,
+        *,
+        slot: int,
+        target_rank: int,
+        peer_xs: list[torch.Tensor],
+        peer_addends: list[torch.Tensor] | None = None,
+        cluster_size: int | None = None,
+        stream=None,
+    ) -> torch.Tensor:
+        """Populate target_rank's Lamport slot for 2-hop RS+AG simulation.
+
+        For packs owned by target_rank (Hop 1 RS), writes every peer's raw sentinel pack.
+        For packs owned by peer != target_rank (Hop 2 AG), writes peer's reduced sentinel pack.
+        Returns the canonical BF16 sum tensor (sentinel-encoded for bit-exact comparison).
+        """
+        tokens, hidden = peer_xs[0].shape
+        packs = hidden // 8
+        cs = (
+            split_lagged_cluster_size(tokens)
+            if cluster_size is None
+            else int(cluster_size)
+        )
+        packs_per_cta = packs // cs
+        threads = ((packs_per_cta + 31) // 32) * 32
+        num_warps = threads // 32
+        dev = self.device
+
+        # Compute warp-uniform owner[row, pack] matching ClusterMhcAllReducePostYNorm (rsag).
+        rows_idx = torch.arange(tokens, device=dev, dtype=torch.int64)[:, None]
+        pack_idx = torch.arange(packs, device=dev, dtype=torch.int64)[None, :]
+        c_rank = pack_idx // packs_per_cta
+        tid = pack_idx % packs_per_cta
+        warp = tid // 32
+        owner = (
+            rows_idx + c_rank * num_warps + warp
+        ) % self.world_size  # [tokens, packs]
+
+        reduced_bf16 = _canonical_bf16_sum(peer_xs, peer_addends)
+        # Sentinel-encode +0.0 -> -0.0 on reduced_bf16 (matching Hop-2 AG wire format).
+        rbits = reduced_bf16.view(torch.uint16)
+        reduced_enc_u16 = torch.where(
+            rbits == 0,
+            torch.tensor(0x8000, dtype=torch.uint16, device=dev),
+            rbits,
+        )
+        reduced_enc_i32 = reduced_enc_u16.view(torch.int32).reshape(tokens, packs, 4)
+
+        slot_buf = self.slots[slot & 1][target_rank]
+        for src in range(self.world_size):
+            if src == target_rank:
+                continue
+            raw_term = (
+                peer_xs[src]
+                if peer_addends is None
+                else (peer_xs[src] + peer_addends[src])
+            )
+            sbits = raw_term.view(torch.uint16)
+            src_enc_u16 = torch.where(
+                sbits == 0,
+                torch.tensor(0x8000, dtype=torch.uint16, device=dev),
+                sbits,
+            )
+            src_enc_i32 = src_enc_u16.view(torch.int32).reshape(tokens, packs, 4)
+
+            is_self_owned = (owner == target_rank).unsqueeze(-1)
+            is_src_owned = (owner == src).unsqueeze(-1)
+            zeros_i32 = torch.zeros_like(src_enc_i32)
+            # In target_rank's shard `src`:
+            # - where owner == target_rank: peer `src` pushed its raw partial (Hop 1 RS)
+            # - where owner == src: owner `src` broadcast the reduced result (Hop 2 AG)
+            # - otherwise: untouched (must remain 0!)
+            shard_val = torch.where(
+                is_self_owned,
+                src_enc_i32,
+                torch.where(is_src_owned, reduced_enc_i32, zeros_i32),
+            )
+            start_i32 = (self.region_packs + src * self.shard_packs) * 4
+            end_i32 = start_i32 + tokens * packs * 4
+            slot_buf[start_i32:end_i32].copy_(shard_val.reshape(-1))
+        return reduced_enc_u16.view(torch.bfloat16)
+
 
 def _canonical_bf16_sum(
     peer_xs: list[torch.Tensor],
@@ -318,7 +402,7 @@ def _make_mhc_tensors(
 
 
 @pytest.mark.parametrize("hidden", [4096, 5120])
-@pytest.mark.parametrize("tokens", [1, 2, 4, 7, 8, 9, 12, 16, 24, 32])
+@pytest.mark.parametrize("tokens", [1, 2, 4, 7, 8, 9, 12, 16, 24, 32, 48, 64, 96, 128])
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 @pytest.mark.parametrize("has_addend", [False, True])
 def test_cluster_allreduce_post_y_norm_bit_exact_simulation(
@@ -326,16 +410,17 @@ def test_cluster_allreduce_post_y_norm_bit_exact_simulation(
 ):
     _sm120_required()
     # Keep full matrix on DeepSeek-V4.1 (H=5120, TP4) and representative coverage on H=4096 / TP2 / TP8.
-    if hidden == 4096 and (tokens not in (1, 4, 8, 16, 32) or world_size == 8):
+    if hidden == 4096 and (tokens not in (1, 4, 8, 16, 32, 64, 128) or world_size == 8):
         pytest.skip("reduced matrix for H=4096")
-    if world_size == 8 and (hidden != 5120 or tokens not in (1, 8, 16, 32)):
+    if world_size == 8 and (hidden != 5120 or tokens not in (1, 8, 16, 32, 64, 128)):
         pytest.skip("reduced matrix for TP8")
-    if world_size == 2 and tokens not in (1, 2, 4, 8, 16, 32):
+    if world_size == 2 and tokens not in (1, 2, 4, 8, 16, 32, 64, 128):
         pytest.skip("reduced matrix for TP2")
 
     device = torch.device("cuda", torch.cuda.current_device())
     ordinal = int(device.index or 0)
-    assert CLUSTER_AR_MHC_MAX_TOKENS == 32
+    assert CLUSTER_AR_MHC_MAX_TOKENS == 128
+    assert CLUSTER_AR_MHC_ONESHOT_MAX_TOKENS == 4
     assert supports_cluster_allreduce_post_y_norm(
         device, tokens, hidden, torch.bfloat16, world_size
     )
@@ -343,13 +428,14 @@ def test_cluster_allreduce_post_y_norm_bit_exact_simulation(
         device, CLUSTER_AR_MHC_MAX_TOKENS + 1, hidden, torch.bfloat16, world_size
     )
 
+    transport = cluster_allreduce_transport(tokens, world_size)
     norm_dtype = (
         torch.float32
-        if (hidden == 5120 and tokens in (7, 16) and world_size == 4)
+        if (hidden == 5120 and tokens in (7, 16, 64) and world_size == 4)
         else torch.bfloat16
     )
     emit_mxfp8 = True
-    release_dependents = tokens in (1, 8, 16, 32)
+    release_dependents = tokens in (1, 8, 16, 32, 64, 128)
 
     peer_xs, peer_addends, residual, prev_post, prev_comb, incoming, norm_weight = (
         _make_mhc_tensors(
@@ -371,14 +457,8 @@ def test_cluster_allreduce_post_y_norm_bit_exact_simulation(
         region_packs=region_packs,
         device=device,
     )
-    ring_ref = _SimulatedLamportRing(
-        world_size=world_size,
-        shard_packs=shard_packs,
-        region_packs=region_packs,
-        device=device,
-    )
 
-    # Compile fused kernel (rank 0) and standalone OneshotAllReduce + ClusterMhcPostYNorm.
+    # Compile fused kernel (rank 0) and standalone ClusterMhcPostYNorm.
     fused_runner = compile_cluster_allreduce_post_y_norm(
         ordinal,
         hidden,
@@ -391,6 +471,7 @@ def test_cluster_allreduce_post_y_norm_bit_exact_simulation(
         device_slot_selection=True,
         slot_bias=0,
         release_dependents=release_dependents,
+        transport="auto",
     )
     post_y_runner = compile_cluster_post_y_norm(
         ordinal,
@@ -401,47 +482,57 @@ def test_cluster_allreduce_post_y_norm_bit_exact_simulation(
         cluster_size=split_lagged_cluster_size(tokens),
         emit_mxfp8=emit_mxfp8,
     )
-    ar_launcher = get_oneshot_launcher(
-        "bfloat16",
-        world_size,
-        0,
-        True,
-        True,
-        0,
-        "remote_push_full",
-        256,
-        ordinal,
-        has_addend=has_addend,
-    )
     load_programs(fused_runner)
     load_programs(post_y_runner)
 
-    # Pre-populate peer ranks 1..W-1 into slot 0 of both rings.
-    ring_fused.populate_remote_peers(
-        slot=0, target_rank=0, peer_xs=peer_xs, peer_addends=addends
-    )
-    ring_ref.populate_remote_peers(
-        slot=0, target_rank=0, peer_xs=peer_xs, peer_addends=addends
-    )
+    ring_ref = None
+    if transport == "oneshot":
+        ring_ref = _SimulatedLamportRing(
+            world_size=world_size,
+            shard_packs=shard_packs,
+            region_packs=region_packs,
+            device=device,
+        )
+        ar_launcher = get_oneshot_launcher(
+            "bfloat16",
+            world_size,
+            0,
+            True,
+            True,
+            0,
+            "remote_push_full",
+            256,
+            ordinal,
+            has_addend=has_addend,
+        )
+        ring_fused.populate_remote_peers(
+            slot=0, target_rank=0, peer_xs=peer_xs, peer_addends=addends
+        )
+        ring_ref.populate_remote_peers(
+            slot=0, target_rank=0, peer_xs=peer_xs, peer_addends=addends
+        )
+        ar_out = torch.empty_like(peer_xs[0])
+        ar_kwargs = {"addend_address": peer_addends[0].data_ptr()} if has_addend else {}
+        ar_launcher(
+            ring_ref.peer_table_address,
+            ring_ref.signal_table_address,
+            peer_xs[0].data_ptr(),
+            ar_out.data_ptr(),
+            tokens * (hidden // 8),
+            region_packs,
+            shard_packs,
+            0,
+            0,
+            0,
+            0,
+            16,
+            **ar_kwargs,
+        )
+    else:
+        ar_out = ring_fused.populate_rsag_remote_peers(
+            slot=0, target_rank=0, peer_xs=peer_xs, peer_addends=addends
+        )
 
-    # Path 1 (Reference): standalone OneshotAllReduce(remote_push_full) -> ClusterMhcPostYNorm.
-    ar_out = torch.empty_like(peer_xs[0])
-    ar_kwargs = {"addend_address": peer_addends[0].data_ptr()} if has_addend else {}
-    ar_launcher(
-        ring_ref.peer_table_address,
-        ring_ref.signal_table_address,
-        peer_xs[0].data_ptr(),
-        ar_out.data_ptr(),
-        tokens * (hidden // 8),
-        region_packs,
-        shard_packs,
-        0,
-        0,
-        0,
-        0,
-        16,
-        **ar_kwargs,
-    )
     out_ref = torch.empty_like(residual)
     y_ref = torch.empty_like(peer_xs[0])
     av_ref = torch.empty((tokens, hidden), dtype=torch.uint8, device=device)
@@ -489,18 +580,26 @@ def test_cluster_allreduce_post_y_norm_bit_exact_simulation(
     assert torch.equal(av_fused, av_ref)
     assert torch.equal(as_fused, as_ref)
 
-    # 2. Verify Lamport slots on rank 0 were completely zero-cleared and peers received exact sentinel packs!
-    assert torch.equal(ring_fused.slots[0][0], ring_ref.slots[0][0])
+    # 2. Verify Lamport slots on rank 0 were completely zero-cleared and peers received exact packs!
     assert int(ring_fused.slots[0][0].any().item()) == 0
-    for peer in range(1, world_size):
-        assert torch.equal(ring_fused.slots[0][peer], ring_ref.slots[0][peer])
+    if ring_ref is not None:
+        assert torch.equal(ring_fused.slots[0][0], ring_ref.slots[0][0])
+        for peer in range(1, world_size):
+            assert torch.equal(ring_fused.slots[0][peer], ring_ref.slots[0][peer])
+        assert ring_ref.epoch_and_arrived(0) == (1, 0)
+    else:
+        # In RS+AG, rank 0 must have written its own partial for peer-owned warps and
+        # its reduced result for rank-0-owned warps into every peer's shard 0.
+        for peer in range(1, world_size):
+            start_i32 = (region_packs + 0 * shard_packs) * 4
+            end_i32 = start_i32 + tokens * (hidden // 8) * 4
+            assert int(ring_fused.slots[0][peer][start_i32:end_i32].any().item()) != 0
 
     # 3. Verify epoch advanced identically (epoch == 1, arrived == 0).
     assert ring_fused.epoch_and_arrived(0) == (1, 0)
-    assert ring_ref.epoch_and_arrived(0) == (1, 0)
 
     # 4. Also verify non-zero rank (e.g. rank = world_size - 1) produces identical canonical 0-ULP output!
-    if world_size == 4 and tokens in (1, 8, 16) and hidden == 5120:
+    if world_size == 4 and tokens in (1, 8, 16, 32, 48, 64, 128) and hidden == 5120:
         r_test = world_size - 1
         ring_r = _SimulatedLamportRing(
             world_size=world_size,
@@ -508,9 +607,14 @@ def test_cluster_allreduce_post_y_norm_bit_exact_simulation(
             region_packs=region_packs,
             device=device,
         )
-        ring_r.populate_remote_peers(
-            slot=0, target_rank=r_test, peer_xs=peer_xs, peer_addends=addends
-        )
+        if transport == "oneshot":
+            ring_r.populate_remote_peers(
+                slot=0, target_rank=r_test, peer_xs=peer_xs, peer_addends=addends
+            )
+        else:
+            ring_r.populate_rsag_remote_peers(
+                slot=0, target_rank=r_test, peer_xs=peer_xs, peer_addends=addends
+            )
         fused_r = compile_cluster_allreduce_post_y_norm(
             ordinal,
             hidden,
@@ -523,6 +627,7 @@ def test_cluster_allreduce_post_y_norm_bit_exact_simulation(
             device_slot_selection=True,
             slot_bias=0,
             release_dependents=release_dependents,
+            transport="auto",
         )
         load_programs(fused_r)
         out_r = torch.empty_like(residual)
@@ -556,13 +661,17 @@ def test_cluster_allreduce_post_y_norm_bit_exact_simulation(
         assert ring_r.epoch_and_arrived(r_test) == (1, 0)
 
 
+@pytest.mark.parametrize("tokens", [4, 8])
 @pytest.mark.parametrize("has_addend", [False, True])
-def test_cluster_allreduce_post_y_norm_adversarial_zero_and_exponents(has_addend: bool):
-    """Test +0.0, -0.0, subnormals, extreme finite exponents, and mixed cancellation."""
+def test_cluster_allreduce_post_y_norm_adversarial_zero_and_exponents(
+    tokens: int, has_addend: bool
+):
+    """Test +0.0, -0.0, subnormals, extreme finite exponents, and mixed cancellation across oneshot & rsag."""
     _sm120_required()
     device = torch.device("cuda", torch.cuda.current_device())
     ordinal = int(device.index or 0)
-    tokens, hidden, world_size = 8, 5120, 4
+    hidden, world_size = 5120, 4
+    transport = cluster_allreduce_transport(tokens, world_size)
 
     # Construct adversarial BF16 bit patterns covering +0.0 (0x0000), -0.0 (0x8000),
     # smallest subnormal (0x0001 / 0x8001), tiny normal (0x0080), cancellation pairs,
@@ -636,18 +745,6 @@ def test_cluster_allreduce_post_y_norm_adversarial_zero_and_exponents(has_addend
         region_packs=region_packs,
         device=device,
     )
-    ring_ref = _SimulatedLamportRing(
-        world_size=world_size,
-        shard_packs=shard_packs,
-        region_packs=region_packs,
-        device=device,
-    )
-    ring_fused.populate_remote_peers(
-        slot=0, target_rank=0, peer_xs=peer_xs, peer_addends=peer_addends
-    )
-    ring_ref.populate_remote_peers(
-        slot=0, target_rank=0, peer_xs=peer_xs, peer_addends=peer_addends
-    )
 
     fused_runner = compile_cluster_allreduce_post_y_norm(
         ordinal,
@@ -660,42 +757,60 @@ def test_cluster_allreduce_post_y_norm_adversarial_zero_and_exponents(has_addend
         has_addend=has_addend,
         device_slot_selection=True,
         slot_bias=0,
+        transport="auto",
     )
     post_y_runner = compile_cluster_post_y_norm(
         ordinal, hidden, False, 1e-20, torch.bfloat16, cluster_size=8, emit_mxfp8=True
     )
-    ar_launcher = get_oneshot_launcher(
-        "bfloat16",
-        world_size,
-        0,
-        True,
-        True,
-        0,
-        "remote_push_full",
-        256,
-        ordinal,
-        has_addend=has_addend,
-    )
     load_programs(fused_runner)
     load_programs(post_y_runner)
 
-    ar_out = torch.empty_like(peer_xs[0])
-    ar_kwargs = {"addend_address": peer_addends[0].data_ptr()} if has_addend else {}
-    ar_launcher(
-        ring_ref.peer_table_address,
-        ring_ref.signal_table_address,
-        peer_xs[0].data_ptr(),
-        ar_out.data_ptr(),
-        tokens * (hidden // 8),
-        region_packs,
-        shard_packs,
-        0,
-        0,
-        0,
-        0,
-        16,
-        **ar_kwargs,
-    )
+    if transport == "oneshot":
+        ring_ref = _SimulatedLamportRing(
+            world_size=world_size,
+            shard_packs=shard_packs,
+            region_packs=region_packs,
+            device=device,
+        )
+        ring_fused.populate_remote_peers(
+            slot=0, target_rank=0, peer_xs=peer_xs, peer_addends=peer_addends
+        )
+        ring_ref.populate_remote_peers(
+            slot=0, target_rank=0, peer_xs=peer_xs, peer_addends=peer_addends
+        )
+        ar_launcher = get_oneshot_launcher(
+            "bfloat16",
+            world_size,
+            0,
+            True,
+            True,
+            0,
+            "remote_push_full",
+            256,
+            ordinal,
+            has_addend=has_addend,
+        )
+        ar_out = torch.empty_like(peer_xs[0])
+        ar_kwargs = {"addend_address": peer_addends[0].data_ptr()} if has_addend else {}
+        ar_launcher(
+            ring_ref.peer_table_address,
+            ring_ref.signal_table_address,
+            peer_xs[0].data_ptr(),
+            ar_out.data_ptr(),
+            tokens * (hidden // 8),
+            region_packs,
+            shard_packs,
+            0,
+            0,
+            0,
+            0,
+            16,
+            **ar_kwargs,
+        )
+    else:
+        ar_out = ring_fused.populate_rsag_remote_peers(
+            slot=0, target_rank=0, peer_xs=peer_xs, peer_addends=peer_addends
+        )
     out_ref, y_ref = torch.empty_like(residual), torch.empty_like(peer_xs[0])
     av_ref = torch.empty((tokens, hidden), dtype=torch.uint8, device=device)
     as_ref = torch.empty((tokens, hidden // 32), dtype=torch.uint8, device=device)
@@ -757,13 +872,14 @@ def test_cluster_allreduce_post_y_norm_adversarial_zero_and_exponents(has_addend
     assert torch.all(as_fused[0] == 127)
 
 
-@pytest.mark.parametrize("tokens", [1, 8, 16, 32])
+@pytest.mark.parametrize("tokens", [1, 8, 16, 32, 48, 64, 96, 128])
 def test_cluster_allreduce_post_y_norm_50_iter_zero_alloc_cuda_graph(tokens: int):
     """Verify 50-iteration zero-allocation CUDA-graph replay alternating ping-pong slots."""
     _sm120_required()
     device = torch.device("cuda", torch.cuda.current_device())
     ordinal = int(device.index or 0)
     hidden, world_size = 5120, 4
+    transport = cluster_allreduce_transport(tokens, world_size)
 
     shard_packs = tokens * (hidden // 8)
     region_packs = 64
@@ -786,6 +902,7 @@ def test_cluster_allreduce_post_y_norm_50_iter_zero_alloc_cuda_graph(tokens: int
         device_slot_selection=True,
         slot_bias=0,
         release_dependents=True,
+        transport="auto",
     )
     post_y_runner = compile_cluster_post_y_norm(
         ordinal,
@@ -811,18 +928,30 @@ def test_cluster_allreduce_post_y_norm_50_iter_zero_alloc_cuda_graph(tokens: int
     a_values = torch.empty((tokens, hidden), dtype=torch.uint8, device=device)
     a_scales = torch.empty((tokens, hidden // 32), dtype=torch.uint8, device=device)
 
+    # Pre-stage immutable RS+AG peer slot template so CUDA graph replay uses pure zero-alloc copy_.
+    rsag_template = None
+    if transport == "rsag":
+        ring.populate_rsag_remote_peers(
+            slot=0, target_rank=0, peer_xs=peer_xs, peer_addends=peer_addends
+        )
+        rsag_template = ring.slots[0][0].clone()
+        ring.slots[0][0].zero_()
+
     stream = torch.cuda.Stream(device=device)
     # Capture a 2-step ping-pong graph: step 0 uses slot 0, step 1 uses slot 1!
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         # Iteration A (slot 0)
-        ring.populate_remote_peers(
-            slot=0,
-            target_rank=0,
-            peer_xs=peer_xs,
-            peer_addends=peer_addends,
-            stream=stream,
-        )
+        if transport == "oneshot":
+            ring.populate_remote_peers(
+                slot=0,
+                target_rank=0,
+                peer_xs=peer_xs,
+                peer_addends=peer_addends,
+                stream=stream,
+            )
+        else:
+            ring.slots[0][0].copy_(rsag_template)
         fused_runner(
             ring.peer_table_address,
             ring.signal_table_address,
@@ -842,13 +971,16 @@ def test_cluster_allreduce_post_y_norm_50_iter_zero_alloc_cuda_graph(tokens: int
             stream=stream,
         )
         # Iteration B (slot 1)
-        ring.populate_remote_peers(
-            slot=1,
-            target_rank=0,
-            peer_xs=peer_xs,
-            peer_addends=peer_addends,
-            stream=stream,
-        )
+        if transport == "oneshot":
+            ring.populate_remote_peers(
+                slot=1,
+                target_rank=0,
+                peer_xs=peer_xs,
+                peer_addends=peer_addends,
+                stream=stream,
+            )
+        else:
+            ring.slots[1][0].copy_(rsag_template)
         fused_runner(
             ring.peer_table_address,
             ring.signal_table_address,
@@ -893,6 +1025,12 @@ def test_cluster_allreduce_post_y_norm_50_iter_zero_alloc_cuda_graph(tokens: int
             prev_post.copy_(new_pp)
             prev_comb.copy_(new_pc)
             incoming.copy_(new_in)
+            if transport == "rsag":
+                ring.populate_rsag_remote_peers(
+                    slot=0, target_rank=0, peer_xs=peer_xs, peer_addends=peer_addends
+                )
+                rsag_template.copy_(ring.slots[0][0])
+                ring.slots[0][0].zero_()
             torch.cuda.synchronize()
 
         allocated_before = torch.cuda.memory_stats(device)["allocation.all.allocated"]
@@ -906,6 +1044,13 @@ def test_cluster_allreduce_post_y_norm_50_iter_zero_alloc_cuda_graph(tokens: int
 
         if it in (0, 12, 24):
             expected_reduced = _canonical_bf16_sum(peer_xs, peer_addends)
+            if transport == "rsag":
+                ebits = expected_reduced.view(torch.uint16)
+                expected_reduced = torch.where(
+                    ebits == 0,
+                    torch.tensor(0x8000, dtype=torch.uint16, device=device),
+                    ebits,
+                ).view(torch.bfloat16)
             out_ref = torch.empty_like(residual)
             y_ref = torch.empty_like(peer_xs[0])
             av_ref = torch.empty_like(a_values)
@@ -932,6 +1077,86 @@ def test_cluster_allreduce_post_y_norm_50_iter_zero_alloc_cuda_graph(tokens: int
     assert ring.epoch_and_arrived(0) == (52, 0)
     assert int(ring.slots[0][0].any().item()) == 0
     assert int(ring.slots[1][0].any().item()) == 0
+
+
+def test_cluster_allreduce_post_y_norm_zero_register_spills():
+    """Verify 0 register spills (LMEM == 0) and launchable max_threads for cs in {8, 4, 1}."""
+    _sm120_required()
+    import glob
+    import re
+    import cuda.bindings.driver as cu
+    from b12x._lib import compiler as _b12x_compiler
+    from b12x._lib.compile_plan import program_keys
+
+    ordinal = int(torch.cuda.current_device())
+    cache_dir = (
+        str(_b12x_compiler._disk_cache_root())
+        if hasattr(_b12x_compiler, "_disk_cache_root")
+        else os.path.expanduser("~/.cache/b12x")
+    )
+    for hidden in (4096, 5120, 7168):
+        for cs, transport in (
+            (8, "oneshot"),
+            (8, "rsag"),
+            (4, "rsag"),
+            (1, "rsag"),
+            (1, "oneshot"),
+        ):
+            threads = (((hidden // 8) // cs) + 31) // 32 * 32
+            runner = compile_cluster_allreduce_post_y_norm(
+                ordinal,
+                hidden,
+                4,
+                0,
+                1e-20,
+                torch.bfloat16,
+                cluster_size=cs,
+                emit_mxfp8=True,
+                has_addend=True,
+                device_slot_selection=True,
+                slot_bias=0,
+                release_dependents=True,
+                transport=transport,
+            )
+            load_programs(runner)
+            inspected = 0
+            for pk in program_keys(runner):
+                for obj_path in glob.glob(
+                    os.path.join(cache_dir, "**", f"*{pk.key}*.o"), recursive=True
+                ):
+                    data = open(obj_path, "rb").read()
+                    pos = data.find(b"\x50\xed\x55\xba")
+                    if pos < 0:
+                        continue
+                    err, mod = cu.cuModuleLoadData(data[pos:])
+                    assert err == cu.CUresult.CUDA_SUCCESS
+                    try:
+                        for nm in sorted(
+                            set(re.findall(rb"[A-Za-z_][A-Za-z0-9_$]{6,200}", data))
+                        ):
+                            e2, fn = cu.cuModuleGetFunction(mod, nm)
+                            if e2 == cu.CUresult.CUDA_SUCCESS:
+                                _, lmem = cu.cuFuncGetAttribute(
+                                    cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+                                    fn,
+                                )
+                                _, maxt = cu.cuFuncGetAttribute(
+                                    cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+                                    fn,
+                                )
+                                assert lmem == 0, (
+                                    f"H={hidden} cs={cs} {transport} spilled {lmem}B"
+                                )
+                                assert maxt >= threads, (
+                                    f"H={hidden} cs={cs} {transport} maxt={maxt} < {threads}"
+                                )
+                                inspected += 1
+                                break
+                    finally:
+                        cu.cuModuleUnload(mod)
+            assert inspected > 0, (
+                f"no compiled cubin inspected for H={hidden} cs={cs} {transport}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1060,6 +1285,13 @@ def _multi_gpu_worker(rank: int, world_size: int, port: int, hidden: int, tokens
         torch.cuda.synchronize(device)
 
         expected_reduced = _canonical_bf16_sum(all_xs, all_addends)
+        if cluster_allreduce_transport(tokens, world_size) == "rsag":
+            ebits = expected_reduced.view(torch.uint16)
+            expected_reduced = torch.where(
+                ebits == 0,
+                torch.tensor(0x8000, dtype=torch.uint16, device=device),
+                ebits,
+            ).view(torch.bfloat16)
         out_ref = torch.empty_like(residual)
         y_ref = torch.empty_like(x)
         av_ref = torch.empty_like(a_values)
@@ -1092,7 +1324,7 @@ def _multi_gpu_worker(rank: int, world_size: int, port: int, hidden: int, tokens
     reason="set B12X_RUN_PCIE_ONESHOT_TEST=1 on a multi-GPU SM120 host to run live multi-rank PCIe test",
 )
 @pytest.mark.parametrize("hidden", [4096, 5120])
-@pytest.mark.parametrize("tokens", [1, 8, 16])
+@pytest.mark.parametrize("tokens", [1, 4, 8, 16, 24, 64, 128])
 def test_cluster_allreduce_post_y_norm_live_multi_gpu(hidden: int, tokens: int):
     _sm120_required()
     world_size = torch.cuda.device_count()
