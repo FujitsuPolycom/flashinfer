@@ -26,13 +26,15 @@ from ._tuning import (
 )
 
 
-# Compiled choices for local push, cross-island scatter/gather, and cross-island DMA.
+# Compiled choices for local push, cross-island scatter/gather, cross-island DMA, and cross-island push.
 ISLAND_VARIANTS = {
-    "island_rs": (False, False, False),
-    "island_rsag": (False, True, False),
-    "island_push": (True, False, False),
-    "island_push_rsag": (True, True, False),
-    "island_hybrid_rsag": (True, True, True),
+    "island_rs": (False, False, False, False),
+    "island_rsag": (False, True, False, False),
+    "island_push": (True, False, False, False),
+    "island_push_rsag": (True, True, False, False),
+    "island_hybrid_rsag": (True, True, True, False),
+    "island_allpush_full": (True, False, False, True),
+    "island_allpush_rsag": (True, True, False, True),
 }
 
 
@@ -356,7 +358,7 @@ def _validate_query(query, device):
             raise ValueError("native alternatives must use the same rank group")
         if name in ("dcp_route_separate", "dcp_route_row") and (
             query.operation != "all_gather_pair_kimi_topk"
-            or query.world_size != 16
+            or query.world_size not in (8, 16)
             or native.call.get("route_transport")
             != {"dcp_route_separate": "separate", "dcp_route_row": "row"}[name]
         ):
@@ -387,6 +389,7 @@ def _validate_query(query, device):
                 bool(native.call.get("local_push", False)),
                 bool(native.call.get("cross_island_rsag", False)),
                 bool(native.call.get("cross_island_dma", False)),
+                bool(native.call.get("cross_island_push", False)),
             ) != ISLAND_VARIANTS[name]:
                 raise ValueError(
                     "island implementation differs from its compiled protocol"

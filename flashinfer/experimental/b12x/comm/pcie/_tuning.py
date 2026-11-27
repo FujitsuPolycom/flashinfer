@@ -101,11 +101,19 @@ def _validate_query(query: PcieQuery, device) -> None:
             push = query.call.get("local_push", False)
             scattered = query.call.get("cross_island_rsag", False)
             dma = query.call.get("cross_island_dma", False)
-            if any(type(value) is not bool for value in (push, scattered, dma)):
+            cross_push = query.call.get("cross_island_push", False)
+            if any(
+                type(value) is not bool
+                for value in (push, scattered, dma, cross_push)
+            ):
                 raise TypeError("island protocol choices must be booleans")
             if dma and not (push and scattered):
                 raise ValueError(
                     "cross-island DMA requires local push and scatter/gather"
+                )
+            if cross_push and (not push or dma):
+                raise ValueError(
+                    "cross-island push requires local push without cross-island DMA"
                 )
         blocks, active = query.call["blocks"], query.call["active_blocks"]
         if (
@@ -211,16 +219,21 @@ def _validate_query(query: PcieQuery, device) -> None:
         ):
             raise ValueError("batched paired loads require disjoint multi-CTA rows")
     if query.surface.endswith(".all_gather_pair_kimi_topk"):
+        expected_qhd = (
+            (3584 * 2 + 896 * 4) // query.world_size
+            if query.world_size in (8, 16)
+            else -1
+        )
         if "rows" in query.call and (
             type(query.call["rows"]) is not int
             or not 2 <= query.call["rows"] <= 64
-            or query.world_size != 16
+            or query.world_size not in (8, 16)
             or query.setup.get("max_batch_size", 0) < query.call["rows"]
-            or query.setup.get("query_head_dim") != 672
+            or query.setup.get("query_head_dim") != expected_qhd
             or query.call.get("route_transport") not in ("separate", "row")
         ):
             raise ValueError(
-                "multi-row Kimi expert selection requires a sixteen-rank 672-byte channel"
+                "multi-row Kimi expert selection requires an 8- or 16-rank route channel"
             )
         for field in ("row_blocks", "load_batch"):
             value = query.call.get(field, 1)
@@ -237,6 +250,6 @@ def _validate_query(query: PcieQuery, device) -> None:
         )
 
 
-TUNING = replace(TUNING, query_schema_version=43, validate_query=_validate_query)
+TUNING = replace(TUNING, query_schema_version=44, validate_query=_validate_query)
 
 __all__ = ["PcieQuery", "PcieConfig", "SURFACES", "TUNING"]
