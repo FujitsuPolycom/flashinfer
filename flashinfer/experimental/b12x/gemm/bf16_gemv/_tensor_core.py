@@ -23,10 +23,19 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile, run_compiled
-from b12x._lib.intrinsics.memory import get_ptr_as_int64, ld_global_nc_v4_u32
+from b12x._lib.intrinsics.dsmem import ld_dsm_v4_f32
+from b12x._lib.intrinsics.memory import (
+    get_ptr_as_int64,
+    ld_global_nc_v4_u32,
+    shared_ptr_to_u32,
+)
 from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32
 from b12x._lib.program_cache import program_cache
 from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.dsmem import (
+    SM120_DSMEM_CLUSTER_SIZES,
+    sm120_dsmem_split_enabled,
+)
 from b12x._lib.utils.pdl import sm120_consumer_pdl_enabled
 from b12x._lib.utils.pointers import make_ptr
 
@@ -174,6 +183,7 @@ class TensorCoreGemvKernel:
         max_rows: int = 8,
         split_k: int = 1,
         use_pdl: bool = False,
+        use_dsmem: bool = False,
     ):
         if k <= 0 or k % TC_K_MULTIPLE:
             raise ValueError(
@@ -189,6 +199,11 @@ class TensorCoreGemvKernel:
         self.max_m_tiles = (int(max_rows) + 7) // 8
         self.split_k = int(split_k)
         self.use_pdl = bool(use_pdl)
+        self.use_dsmem = bool(use_dsmem)
+        if self.use_dsmem and self.split_k not in SM120_DSMEM_CLUSTER_SIZES:
+            raise ValueError(
+                f"DSMEM cluster split-K requires split_k in {SM120_DSMEM_CLUSTER_SIZES}, got {self.split_k}"
+            )
         self.chunks_per_split = chunks // self.split_k
         self.warps = min(TC_MAX_WARPS, self.chunks_per_split)
         while self.chunks_per_split % self.warps:
@@ -224,7 +239,7 @@ class TensorCoreGemvKernel:
         output_stride: Int64,
         stream: cuda.CUstream,
     ):
-        self.kernel(
+        launch_call = self.kernel(
             _flat(x),
             _flat(weight),
             _flat(output),
@@ -234,12 +249,22 @@ class TensorCoreGemvKernel:
             x_stride,
             weight_stride,
             output_stride,
-        ).launch(
-            grid=((self.n + 15) // 16, self.split_k, 1),
-            block=(self.warps * _LANES, 1, 1),
-            stream=stream,
-            use_pdl=self.use_pdl,
         )
+        if cutlass.const_expr(self.use_dsmem):
+            launch_call.launch(
+                grid=((self.n + 15) // 16, self.split_k, 1),
+                block=(self.warps * _LANES, 1, 1),
+                cluster=(1, self.split_k, 1),
+                stream=stream,
+                use_pdl=self.use_pdl,
+            )
+        else:
+            launch_call.launch(
+                grid=((self.n + 15) // 16, self.split_k, 1),
+                block=(self.warps * _LANES, 1, 1),
+                stream=stream,
+                use_pdl=self.use_pdl,
+            )
 
     @cute.kernel
     def kernel(
@@ -373,6 +398,87 @@ class TensorCoreGemvKernel:
                             output[Int64(row) * output_stride + Int64(feature)] = (
                                 total.to(result_dtype)
                             )
+        elif cutlass.const_expr(self.use_dsmem):
+            # SM120 hardware DSMEM cluster reduction across cluster=(1, split_k, 1):
+            # zero L2 scratch traffic, zero atomic contention, exact sp=0..split_k-1 FP32 order.
+            partials_addr = shared_ptr_to_u32(storage.partials.data_ptr())
+            for mt in cutlass.range_constexpr(self.max_m_tiles):
+                if warp == Int32(mt % self.warps):
+                    t0 = (
+                        acc[mt, 0]
+                        if cutlass.const_expr(self.warps == 1)
+                        else Float32(0.0)
+                    )
+                    t1 = (
+                        acc[mt, 1]
+                        if cutlass.const_expr(self.warps == 1)
+                        else Float32(0.0)
+                    )
+                    t2 = (
+                        acc[mt, 2]
+                        if cutlass.const_expr(self.warps == 1)
+                        else Float32(0.0)
+                    )
+                    t3 = (
+                        acc[mt, 3]
+                        if cutlass.const_expr(self.warps == 1)
+                        else Float32(0.0)
+                    )
+                    if cutlass.const_expr(self.warps > 1):
+                        for w in cutlass.range_constexpr(self.warps):
+                            pbase = ((mt * self.warps + w) * _LANES + lane) * 4
+                            t0 = t0 + partials[pbase + 0]
+                            t1 = t1 + partials[pbase + 1]
+                            t2 = t2 + partials[pbase + 2]
+                            t3 = t3 + partials[pbase + 3]
+                    p_out = (mt * self.warps * _LANES + lane) * 4
+                    partials[p_out + 0] = t0
+                    partials[p_out + 1] = t1
+                    partials[p_out + 2] = t2
+                    partials[p_out + 3] = t3
+            cute.arch.sync_threads()
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+            if Int32(k_split) == Int32(0):
+                for mt in cutlass.range_constexpr(self.max_m_tiles):
+                    if warp == Int32(mt % self.warps):
+                        s0 = Float32(0.0)
+                        s1 = Float32(0.0)
+                        s2 = Float32(0.0)
+                        s3 = Float32(0.0)
+                        dsm_off = partials_addr + Int32(
+                            (mt * self.warps * _LANES + lane) * 16
+                        )
+                        for sp in cutlass.range_constexpr(self.split_k):
+                            v0, v1, v2, v3 = ld_dsm_v4_f32(dsm_off, Int32(sp))
+                            s0 = s0 + v0
+                            s1 = s1 + v1
+                            s2 = s2 + v2
+                            s3 = s3 + v3
+                        f_lo = first + group
+                        f_hi = first + group + 8
+                        r0 = Int32(mt * 8) + quad * 2
+                        r1 = r0 + 1
+                        if f_lo < self.n:
+                            if r0 < rows:
+                                output[Int64(r0) * output_stride + Int64(f_lo)] = (
+                                    s0.to(result_dtype)
+                                )
+                            if r1 < rows:
+                                output[Int64(r1) * output_stride + Int64(f_lo)] = (
+                                    s1.to(result_dtype)
+                                )
+                        if f_hi < self.n:
+                            if r0 < rows:
+                                output[Int64(r0) * output_stride + Int64(f_hi)] = (
+                                    s2.to(result_dtype)
+                                )
+                            if r1 < rows:
+                                output[Int64(r1) * output_stride + Int64(f_hi)] = (
+                                    s3.to(result_dtype)
+                                )
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
         else:
             tile_elems = self.max_m_tiles * 128
             scratch_base = Int64(scratch.toint())
@@ -448,16 +554,23 @@ def _compile_tc_projection_cached(
     k: int,
     output_dtype: str,
     use_pdl: bool,
+    use_dsmem: bool,
 ):
     """Compile one TensorCoreGemvKernel for up to 32 rows and optional split-K."""
     y_type = getattr(torch, output_dtype)
     ct_y = Float32 if y_type == torch.float32 else BFloat16
     max_m_tiles = (int(max_rows) + 7) // 8
     use_pdl = bool(use_pdl)
+    use_dsmem = bool(use_dsmem)
     kernel = TensorCoreGemvKernel(
-        n, k, max_rows=max_m_tiles * 8, split_k=split_k, use_pdl=use_pdl
+        n,
+        k,
+        max_rows=max_m_tiles * 8,
+        split_k=split_k,
+        use_pdl=use_pdl,
+        use_dsmem=use_dsmem,
     )
-    key = (max_m_tiles, int(split_k), int(n), int(k), output_dtype, use_pdl)
+    key = (max_m_tiles, int(split_k), int(n), int(k), output_dtype, use_pdl, use_dsmem)
     fake_x = make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16)
     fake_w = make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16)
     fake_y = make_ptr(ct_y, 16, cute.AddressSpace.gmem, assumed_align=y_type.itemsize)
@@ -477,7 +590,7 @@ def _compile_tc_projection_cached(
             Int64(n),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.bf16_projection.tc_multirow", 3, key
+                "gemm.bf16_projection.tc_multirow", 4, key
             ),
         )
 
@@ -522,14 +635,23 @@ def compile_tc_projection(
     output_dtype: str,
     *,
     use_pdl: bool | None = None,
+    use_dsmem: bool | None = None,
 ):
     resolved_pdl = (
         sm120_consumer_pdl_enabled(ordinal, env_var="B12X_BF16_GEMV_PDL")
         if use_pdl is None
         else bool(use_pdl)
     )
+    resolved_dsmem = (
+        (int(split_k) == 2 or (int(split_k) == 4 and int(max_rows) <= 8))
+        and sm120_dsmem_split_enabled(
+            ordinal, num_splits=split_k, env_var="B12X_TC_GEMV_DSMEM_SPLIT"
+        )
+        if use_dsmem is None
+        else bool(use_dsmem)
+    )
     return _compile_tc_projection_cached(
-        ordinal, max_rows, split_k, n, k, output_dtype, resolved_pdl
+        ordinal, max_rows, split_k, n, k, output_dtype, resolved_pdl, resolved_dsmem
     )
 
 

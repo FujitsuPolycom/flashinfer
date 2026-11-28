@@ -24,10 +24,19 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile, run_compiled
-from b12x._lib.intrinsics.memory import get_ptr_as_int64, ld_global_nc_v4_u32
+from b12x._lib.intrinsics.dsmem import ld_dsm_v4_f32
+from b12x._lib.intrinsics.memory import (
+    get_ptr_as_int64,
+    ld_global_nc_v4_u32,
+    shared_ptr_to_u32,
+)
 from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32
 from b12x._lib.program_cache import program_cache
 from b12x._lib.utils.device import cuda_stream_from_int_or_current, current_cuda_stream
+from b12x._lib.utils.dsmem import (
+    SM120_DSMEM_CLUSTER_SIZES,
+    sm120_dsmem_split_enabled,
+)
 from b12x._lib.utils.pdl import sm120_consumer_pdl_enabled
 from b12x._lib.utils.pointers import make_ptr
 
@@ -287,6 +296,7 @@ class MXFP8MultiRowTCGemvKernel:
         rope_head_dim: int = 0,
         rope_dim: int = 64,
         use_pdl: bool = False,
+        use_dsmem: bool = False,
     ):
         self.n = int(n)
         self.in_features = int(in_features)
@@ -295,6 +305,11 @@ class MXFP8MultiRowTCGemvKernel:
         self.split_k = int(split_k)
         self.n_per_cta = int(n_per_cta)
         self.use_pdl = bool(use_pdl)
+        self.use_dsmem = bool(use_dsmem)
+        if self.use_dsmem and self.split_k not in SM120_DSMEM_CLUSTER_SIZES:
+            raise ValueError(
+                f"DSMEM cluster split-K requires split_k in {SM120_DSMEM_CLUSTER_SIZES}, got {self.split_k}"
+            )
         if self.n_per_cta not in (16, 32):
             raise ValueError(
                 f"MXFP8 TC-GEMV requires n_per_cta in (16, 32), got {self.n_per_cta}"
@@ -359,7 +374,7 @@ class MXFP8MultiRowTCGemvKernel:
         x_stride_elems: Int64,
         stream: cuda.CUstream,
     ):
-        self.kernel(
+        launch_call = self.kernel(
             cute.make_tensor(x, cute.make_layout((Int64(1) << Int64(50),))),
             w_u8,
             s_u8,
@@ -369,12 +384,22 @@ class MXFP8MultiRowTCGemvKernel:
             rows,
             x_stride_elems,
             None,
-        ).launch(
-            grid=((self.n + self.n_per_cta - 1) // self.n_per_cta, self.split_k, 1),
-            block=(self.warps * _LANES, 1, 1),
-            stream=stream,
-            use_pdl=self.use_pdl,
         )
+        if cutlass.const_expr(self.use_dsmem):
+            launch_call.launch(
+                grid=((self.n + self.n_per_cta - 1) // self.n_per_cta, self.split_k, 1),
+                block=(self.warps * _LANES, 1, 1),
+                cluster=(1, self.split_k, 1),
+                stream=stream,
+                use_pdl=self.use_pdl,
+            )
+        else:
+            launch_call.launch(
+                grid=((self.n + self.n_per_cta - 1) // self.n_per_cta, self.split_k, 1),
+                block=(self.warps * _LANES, 1, 1),
+                stream=stream,
+                use_pdl=self.use_pdl,
+            )
 
     @cute.jit
     def launch_rope(
@@ -390,7 +415,7 @@ class MXFP8MultiRowTCGemvKernel:
         x_stride_elems: Int64,
         stream: cuda.CUstream,
     ):
-        self.kernel(
+        launch_call = self.kernel(
             cute.make_tensor(x, cute.make_layout((Int64(1) << Int64(50),))),
             w_u8,
             s_u8,
@@ -400,12 +425,22 @@ class MXFP8MultiRowTCGemvKernel:
             rows,
             x_stride_elems,
             cute.make_tensor(cos_sin, cute.make_layout((Int64(1) << Int64(30),))),
-        ).launch(
-            grid=((self.n + self.n_per_cta - 1) // self.n_per_cta, self.split_k, 1),
-            block=(self.warps * _LANES, 1, 1),
-            stream=stream,
-            use_pdl=self.use_pdl,
         )
+        if cutlass.const_expr(self.use_dsmem):
+            launch_call.launch(
+                grid=((self.n + self.n_per_cta - 1) // self.n_per_cta, self.split_k, 1),
+                block=(self.warps * _LANES, 1, 1),
+                cluster=(1, self.split_k, 1),
+                stream=stream,
+                use_pdl=self.use_pdl,
+            )
+        else:
+            launch_call.launch(
+                grid=((self.n + self.n_per_cta - 1) // self.n_per_cta, self.split_k, 1),
+                block=(self.warps * _LANES, 1, 1),
+                stream=stream,
+                use_pdl=self.use_pdl,
+            )
 
     @cute.jit
     def _maybe_rope(
@@ -760,6 +795,100 @@ class MXFP8MultiRowTCGemvKernel:
                                 out[Int64(row) * Int64(self.n) + Int64(feature)] = (
                                     bf_val
                                 )
+        elif cutlass.const_expr(self.use_dsmem):
+            partials_addr = shared_ptr_to_u32(storage.partials.data_ptr())
+            for nt in cutlass.range_constexpr(self.n_tiles):
+                for mt in cutlass.range_constexpr(self.max_m_tiles):
+                    slot_idx = nt * self.max_m_tiles + mt
+                    if warp == Int32(slot_idx % self.warps):
+                        t0 = (
+                            acc[nt, mt, 0]
+                            if cutlass.const_expr(self.warps == 1)
+                            else Float32(0.0)
+                        )
+                        t1 = (
+                            acc[nt, mt, 1]
+                            if cutlass.const_expr(self.warps == 1)
+                            else Float32(0.0)
+                        )
+                        t2 = (
+                            acc[nt, mt, 2]
+                            if cutlass.const_expr(self.warps == 1)
+                            else Float32(0.0)
+                        )
+                        t3 = (
+                            acc[nt, mt, 3]
+                            if cutlass.const_expr(self.warps == 1)
+                            else Float32(0.0)
+                        )
+                        if cutlass.const_expr(self.warps > 1):
+                            for w_i in cutlass.range_constexpr(self.warps):
+                                pbase = (
+                                    (slot_idx * self.warps + w_i) * _LANES + lane
+                                ) * 4
+                                t0 = t0 + partials[pbase + 0]
+                                t1 = t1 + partials[pbase + 1]
+                                t2 = t2 + partials[pbase + 2]
+                                t3 = t3 + partials[pbase + 3]
+                        p_out = (slot_idx * self.warps * _LANES + lane) * 4
+                        partials[p_out + 0] = t0
+                        partials[p_out + 1] = t1
+                        partials[p_out + 2] = t2
+                        partials[p_out + 3] = t3
+            cute.arch.sync_threads()
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+            if Int32(k_split) == Int32(0):
+                for nt in cutlass.range_constexpr(self.n_tiles):
+                    in_rope = False
+                    if cutlass.const_expr(self.rope_head_dim > 0):
+                        in_rope = (
+                            (first_n + nt * 16) & Int32(self.rope_head_dim - 1)
+                        ) >= Int32(self.nope_dim)
+                    for mt in cutlass.range_constexpr(self.max_m_tiles):
+                        slot_idx = nt * self.max_m_tiles + mt
+                        if warp == Int32(slot_idx % self.warps):
+                            s0 = Float32(0.0)
+                            s1 = Float32(0.0)
+                            s2 = Float32(0.0)
+                            s3 = Float32(0.0)
+                            dsm_off = partials_addr + Int32(
+                                (slot_idx * self.warps * _LANES + lane) * 16
+                            )
+                            for sp in cutlass.range_constexpr(self.split_k):
+                                v0, v1, v2, v3 = ld_dsm_v4_f32(dsm_off, Int32(sp))
+                                s0 = s0 + v0
+                                s1 = s1 + v1
+                                s2 = s2 + v2
+                                s3 = s3 + v3
+                            f_lo = first_n + nt * 16 + group
+                            f_hi = first_n + nt * 16 + group + 8
+                            r0 = Int32(mt * 8) + quad * 2
+                            r1 = r0 + 1
+                            b0 = self._maybe_rope(
+                                s0, f_lo, r0, rows, is_odd, in_rope, cos_sin
+                            )
+                            b1 = self._maybe_rope(
+                                s1, f_lo, r1, rows, is_odd, in_rope, cos_sin
+                            )
+                            b2 = self._maybe_rope(
+                                s2, f_hi, r0, rows, is_odd, in_rope, cos_sin
+                            )
+                            b3 = self._maybe_rope(
+                                s3, f_hi, r1, rows, is_odd, in_rope, cos_sin
+                            )
+                            if f_lo < self.n:
+                                if r0 < rows:
+                                    out[Int64(r0) * Int64(self.n) + Int64(f_lo)] = b0
+                                if r1 < rows:
+                                    out[Int64(r1) * Int64(self.n) + Int64(f_lo)] = b1
+                            if f_hi < self.n:
+                                if r0 < rows:
+                                    out[Int64(r0) * Int64(self.n) + Int64(f_hi)] = b2
+                                if r1 < rows:
+                                    out[Int64(r1) * Int64(self.n) + Int64(f_hi)] = b3
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
         else:
             tile_elems = self.n_tiles * self.max_m_tiles * 128
             scratch_base = Int64(scratch.toint())
@@ -877,12 +1006,14 @@ def _compile_mxfp8_tc_gemv_cached(
     warps: int,
     n_per_cta: int,
     use_pdl: bool,
+    use_dsmem: bool,
 ):
     max_m_tiles = (int(max_rows) + 7) // 8
     active_k = mxfp8_tc_gemv_active_k(in_features, padded_k)
     eff_warps = effective_mxfp8_tc_gemv_warps(active_k, split_k, warps)
     n_per_cta = int(n_per_cta)
     use_pdl = bool(use_pdl)
+    use_dsmem = bool(use_dsmem)
     kernel = MXFP8MultiRowTCGemvKernel(
         n,
         in_features,
@@ -892,6 +1023,7 @@ def _compile_mxfp8_tc_gemv_cached(
         warps=eff_warps,
         n_per_cta=n_per_cta,
         use_pdl=use_pdl,
+        use_dsmem=use_dsmem,
     )
     key = (
         int(n),
@@ -902,6 +1034,7 @@ def _compile_mxfp8_tc_gemv_cached(
         eff_warps,
         n_per_cta,
         use_pdl,
+        use_dsmem,
     )
     fake = (
         make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -919,7 +1052,7 @@ def _compile_mxfp8_tc_gemv_cached(
             Int64(in_features),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.blockscaled.mxfp8_tc_gemv", 7, key
+                "gemm.blockscaled.mxfp8_tc_gemv", 8, key
             ),
         )
 
@@ -975,6 +1108,24 @@ def _compile_mxfp8_tc_gemv_cached(
     return attach_programs(run, raw)
 
 
+def _mxfp8_tc_gemv_auto_dsmem(
+    ordinal: int,
+    n: int,
+    split_k: int,
+    n_per_cta: int,
+) -> bool:
+    if not sm120_dsmem_split_enabled(
+        ordinal, num_splits=split_k, env_var="B12X_TC_GEMV_DSMEM_SPLIT"
+    ):
+        return False
+    if int(split_k) >= 4:
+        n_blocks = (int(n) + int(n_per_cta) - 1) // int(n_per_cta)
+        sm_count = int(torch.cuda.get_device_properties(ordinal).multi_processor_count)
+        if n_blocks * int(split_k) > 2 * sm_count:
+            return False
+    return True
+
+
 def compile_mxfp8_tc_gemv(
     ordinal: int,
     n: int,
@@ -986,11 +1137,17 @@ def compile_mxfp8_tc_gemv(
     n_per_cta: int = 16,
     *,
     use_pdl: bool | None = None,
+    use_dsmem: bool | None = None,
 ):
     resolved_pdl = (
         sm120_consumer_pdl_enabled(ordinal, env_var="B12X_MXFP8_TC_GEMV_PDL")
         if use_pdl is None
         else bool(use_pdl)
+    )
+    resolved_dsmem = (
+        _mxfp8_tc_gemv_auto_dsmem(ordinal, n, split_k, n_per_cta)
+        if use_dsmem is None
+        else bool(use_dsmem)
     )
     return _compile_mxfp8_tc_gemv_cached(
         ordinal,
@@ -1002,6 +1159,7 @@ def compile_mxfp8_tc_gemv(
         warps,
         n_per_cta,
         resolved_pdl,
+        resolved_dsmem,
     )
 
 
@@ -1022,6 +1180,7 @@ def _compile_mxfp8_tc_gemv_rope_cached(
     head_dim: int,
     rope_dim: int,
     use_pdl: bool,
+    use_dsmem: bool,
 ):
     max_m_tiles = (int(max_rows) + 7) // 8
     active_k = mxfp8_tc_gemv_active_k(in_features, padded_k)
@@ -1030,6 +1189,7 @@ def _compile_mxfp8_tc_gemv_rope_cached(
     head_dim = int(head_dim)
     rope_dim = int(rope_dim)
     use_pdl = bool(use_pdl)
+    use_dsmem = bool(use_dsmem)
     kernel = MXFP8MultiRowTCGemvKernel(
         n,
         in_features,
@@ -1041,6 +1201,7 @@ def _compile_mxfp8_tc_gemv_rope_cached(
         rope_head_dim=head_dim,
         rope_dim=rope_dim,
         use_pdl=use_pdl,
+        use_dsmem=use_dsmem,
     )
     key = (
         int(n),
@@ -1053,6 +1214,7 @@ def _compile_mxfp8_tc_gemv_rope_cached(
         head_dim,
         rope_dim,
         use_pdl,
+        use_dsmem,
     )
     fake = (
         make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -1071,12 +1233,12 @@ def _compile_mxfp8_tc_gemv_rope_cached(
             Int64(in_features),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.blockscaled.mxfp8_tc_gemv_rope", 3, key
+                "gemm.blockscaled.mxfp8_tc_gemv_rope", 4, key
             ),
         )
 
     def run(source, values, scale_bytes, output, cos_sin, scratch, flags, stream):
-        if split_k > 1 and (scratch is None or flags is None):
+        if split_k > 1 and not use_dsmem and (scratch is None or flags is None):
             raise ValueError("split_k > 1 requires scratch and flags buffers")
         sc_ptr = (
             make_ptr(
@@ -1148,11 +1310,17 @@ def compile_mxfp8_tc_gemv_rope(
     rope_dim: int = 64,
     *,
     use_pdl: bool | None = None,
+    use_dsmem: bool | None = None,
 ):
     resolved_pdl = (
         sm120_consumer_pdl_enabled(ordinal, env_var="B12X_MXFP8_TC_GEMV_PDL")
         if use_pdl is None
         else bool(use_pdl)
+    )
+    resolved_dsmem = (
+        _mxfp8_tc_gemv_auto_dsmem(ordinal, n, split_k, n_per_cta)
+        if use_dsmem is None
+        else bool(use_dsmem)
     )
     return _compile_mxfp8_tc_gemv_rope_cached(
         ordinal,
@@ -1166,6 +1334,7 @@ def compile_mxfp8_tc_gemv_rope(
         head_dim,
         rope_dim,
         resolved_pdl,
+        resolved_dsmem,
     )
 
 
