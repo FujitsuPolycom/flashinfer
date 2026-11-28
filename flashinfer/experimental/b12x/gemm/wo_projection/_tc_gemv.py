@@ -24,6 +24,7 @@ from b12x._lib.intrinsics.memory import get_ptr_as_int64, ld_global_nc_v4_u32
 from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32
 from b12x._lib.program_cache import program_cache
 from b12x._lib.utils.device import cuda_stream_from_int_or_current, current_cuda_stream
+from b12x._lib.utils.pdl import sm120_consumer_pdl_enabled
 from b12x._lib.utils.pointers import make_ptr
 from b12x.gemm.blockscaled._mxfp8_tc_gemv import (
     _atomic_add_gpu_u32,
@@ -177,6 +178,7 @@ class GroupedWoaTCGemvKernel:
         nope_dim: int = 448,
         rope_dim: int = 64,
         positions_dtype: str = "int64",
+        use_pdl: bool = False,
     ):
         self.groups = int(groups)
         self.rank = int(rank)
@@ -184,6 +186,7 @@ class GroupedWoaTCGemvKernel:
         self.max_m_tiles = int(max_m_tiles)
         self.split_k = int(split_k)
         self.fuse_inv_rope = bool(fuse_inv_rope)
+        self.use_pdl = bool(use_pdl)
         self.head_dim = int(head_dim)
         self.nope_dim = int(nope_dim)
         self.rope_dim = int(rope_dim)
@@ -244,6 +247,7 @@ class GroupedWoaTCGemvKernel:
             grid=(self.total_n_blocks, self.split_k, 1),
             block=(self.warps * _LANES, 1, 1),
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -318,6 +322,8 @@ class GroupedWoaTCGemvKernel:
                 wb2, wb3 = _e4m3x4_scaled_to_bf16x2x2_sm120(
                     pb1 if cutlass.const_expr(half == 0) else pb3, sb
                 )
+                if cutlass.const_expr(self.use_pdl and step == 0 and half == 0):
+                    cute.arch.griddepcontrol_wait()
                 h_off = x_off + Int64(half * 16)
                 head_d = (k_col + Int32(half * 8)) % Int32(self.head_dim)
                 for mt in cutlass.range_constexpr(self.max_m_tiles):
@@ -366,6 +372,8 @@ class GroupedWoaTCGemvKernel:
                     acc[mt, 0], acc[mt, 1], acc[mt, 2], acc[mt, 3] = a0, a1, a2, a3
 
         storage = cutlass.utils.SmemAllocator().allocate(self._shared_storage_cls())
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
         partials = storage.partials.get_tensor(
             cute.make_layout((self.warps * _LANES * 4 * self.max_m_tiles,))
         )
@@ -498,7 +506,7 @@ class GroupedWoaTCGemvKernel:
 
 
 @program_cache
-def compile_grouped_woa_tc_gemv(
+def _compile_grouped_woa_tc_gemv_cached(
     ordinal: int,
     groups: int,
     rank: int,
@@ -506,15 +514,17 @@ def compile_grouped_woa_tc_gemv(
     max_rows: int,
     split_k: int,
     warps: int,
-    fuse_inv_rope: bool = False,
-    head_dim: int = 512,
-    nope_dim: int = 448,
-    rope_dim: int = 64,
-    positions_dtype: str = "int64",
+    fuse_inv_rope: bool,
+    head_dim: int,
+    nope_dim: int,
+    rope_dim: int,
+    positions_dtype: str,
+    use_pdl: bool,
 ):
     max_m_tiles = (int(max_rows) + 7) // 8
     eff_warps = effective_mxfp8_tc_gemv_warps(group_width, split_k, warps)
     fuse_inv_rope = bool(fuse_inv_rope)
+    use_pdl = bool(use_pdl)
     pos_ct = Int64 if positions_dtype == "int64" else Int32
     kernel = GroupedWoaTCGemvKernel(
         groups=groups,
@@ -528,6 +538,7 @@ def compile_grouped_woa_tc_gemv(
         nope_dim=nope_dim,
         rope_dim=rope_dim,
         positions_dtype=positions_dtype,
+        use_pdl=use_pdl,
     )
     key = (
         int(groups),
@@ -541,6 +552,7 @@ def compile_grouped_woa_tc_gemv(
         int(nope_dim) if fuse_inv_rope else 0,
         int(rope_dim) if fuse_inv_rope else 0,
         positions_dtype if fuse_inv_rope else "",
+        use_pdl,
     )
     fake = (
         make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -565,7 +577,7 @@ def compile_grouped_woa_tc_gemv(
             Int64(rope_dim),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.wo_projection.grouped_woa_tc_gemv", 1, key
+                "gemm.wo_projection.grouped_woa_tc_gemv", 2, key
             ),
         )
 
@@ -653,3 +665,47 @@ def compile_grouped_woa_tc_gemv(
         )
 
     return attach_programs(run, raw)
+
+
+def compile_grouped_woa_tc_gemv(
+    ordinal: int,
+    groups: int,
+    rank: int,
+    group_width: int,
+    max_rows: int,
+    split_k: int,
+    warps: int,
+    fuse_inv_rope: bool = False,
+    head_dim: int = 512,
+    nope_dim: int = 448,
+    rope_dim: int = 64,
+    positions_dtype: str = "int64",
+    *,
+    use_pdl: bool | None = None,
+):
+    resolved_pdl = (
+        sm120_consumer_pdl_enabled(ordinal, env_var="B12X_WO_TC_GEMV_PDL")
+        if use_pdl is None
+        else bool(use_pdl)
+    )
+    return _compile_grouped_woa_tc_gemv_cached(
+        ordinal,
+        groups,
+        rank,
+        group_width,
+        max_rows,
+        split_k,
+        warps,
+        fuse_inv_rope,
+        head_dim,
+        nope_dim,
+        rope_dim,
+        positions_dtype,
+        resolved_pdl,
+    )
+
+
+compile_grouped_woa_tc_gemv.cache_clear = (
+    _compile_grouped_woa_tc_gemv_cached.cache_clear
+)
+compile_grouped_woa_tc_gemv.cache_info = _compile_grouped_woa_tc_gemv_cached.cache_info

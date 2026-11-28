@@ -1016,7 +1016,7 @@ class W4A8CompactCoalesceRoutesKernel:
       - [1 + 2 * max_pairs .. 1 + 10 * max_pairs - 1]: group_pairs[g * 8 + c]
     """
 
-    def __init__(self, max_pairs: int, num_experts: int):
+    def __init__(self, max_pairs: int, num_experts: int, *, use_pdl: bool = False):
         if max_pairs <= 0 or max_pairs > 512:
             raise ValueError(
                 f"coalesced compact routing requires 1 <= max_pairs <= 512, got {max_pairs}"
@@ -1025,6 +1025,7 @@ class W4A8CompactCoalesceRoutesKernel:
             raise ValueError("num_experts must be positive")
         self.max_pairs = int(max_pairs)
         self.num_experts = int(num_experts)
+        self.use_pdl = bool(use_pdl)
         n_sort = 1 << (max(self.max_pairs, 32) - 1).bit_length()
         self.n_sort = int(n_sort)
         self.log_n_sort = int(n_sort.bit_length() - 1)
@@ -1046,6 +1047,7 @@ class W4A8CompactCoalesceRoutesKernel:
             grid=(1, 1, 1),
             block=[self.threads, 1, 1],
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -1071,6 +1073,9 @@ class W4A8CompactCoalesceRoutesKernel:
         base = shared_ptr_to_u32(storage.words.data_ptr())
         keys_base = base + Int32(self.keys_offset)
         warp_sums_base = base + Int32(self.warp_sums_offset)
+
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
 
         key = Uint32(0xFFFFFFFF)
         if tid < num_pairs:
@@ -1225,6 +1230,8 @@ class W4A8CompactCoalesceRoutesKernel:
                 ] = p_out
             coalesce_meta[Int64(1) + Int64(group_id)] = exp
             coalesce_meta[Int64(1 + self.max_pairs) + Int64(group_id)] = cnt
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
 
 
 class W4A8CompactCoalescedFC1Kernel:
@@ -1249,6 +1256,7 @@ class W4A8CompactCoalescedFC1Kernel:
         max_copy_groups: int = 2,
         fuse_input_quantization: bool = False,
         pipeline_stages: int = 2,
+        use_pdl: bool = False,
     ):
         if k <= 0 or n < 64 or k % 128 or n % 64:
             raise ValueError(
@@ -1278,6 +1286,7 @@ class W4A8CompactCoalescedFC1Kernel:
         self.max_copy_groups = max_copy_groups
         self.stages = pipeline_stages
         self.fuse_input_quantization = bool(fuse_input_quantization)
+        self.use_pdl = bool(use_pdl)
         self.n64_tail = self.n % 128 == 64
         self.n_tiles = (self.n + self.tile_n - 1) // self.tile_n
         self.n_padded = ((self.n + 127) // 128) * 128
@@ -1341,6 +1350,7 @@ class W4A8CompactCoalescedFC1Kernel:
             block=[self.threads_per_cta, 1, 1],
             min_blocks_per_mp=self.min_blocks_per_mp,
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.jit
@@ -1666,10 +1676,6 @@ class W4A8CompactCoalescedFC1Kernel:
         q = lane >> Int32(2)
         c = lane & Int32(3)
 
-        num_groups = coalesce_meta[Int64(0)]
-        total_tasks = num_groups * Int32(self.n_tiles)
-        task = Int32(bidx)
-
         smem = cutlass.utils.SmemAllocator()
 
         @cute.struct
@@ -1703,6 +1709,13 @@ class W4A8CompactCoalescedFC1Kernel:
         act_gate = cute.make_rmem_tensor((4,), cutlass.Float32)
         act_up = cute.make_rmem_tensor((4,), cutlass.Float32)
         k128_tiles = Int32(self.k // 128)
+
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+
+        num_groups = coalesce_meta[Int64(0)]
+        total_tasks = num_groups * Int32(self.n_tiles)
+        task = Int32(bidx)
 
         while task < total_tasks:
             group_idx = task // Int32(self.n_tiles)
@@ -1738,6 +1751,8 @@ class W4A8CompactCoalescedFC1Kernel:
                 k128_tiles,
             )
             task += Int32(gdimx)
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
     def _run_task(
@@ -2165,6 +2180,7 @@ class W4A8CompactCoalescedFC2Kernel:
         max_pairs: int,
         *,
         csf_inline: bool = False,
+        use_pdl: bool = False,
     ):
         if k <= 0 or n < 64 or k % 256 or n % 64:
             raise ValueError(
@@ -2176,6 +2192,7 @@ class W4A8CompactCoalescedFC2Kernel:
         self.n = int(n)
         self.max_pairs = int(max_pairs)
         self.csf_inline = bool(csf_inline)
+        self.use_pdl = bool(use_pdl)
         self.n64_tail = self.n % 128 == 64
         self.intermediate_tiles = (self.n + 127) // 128
         self.output_tiles = self.k // 128
@@ -2227,6 +2244,7 @@ class W4A8CompactCoalescedFC2Kernel:
             block=[self.threads_per_cta, 1, 1],
             min_blocks_per_mp=4,
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.jit
@@ -2475,10 +2493,6 @@ class W4A8CompactCoalescedFC2Kernel:
         q = lane >> Int32(2)
         c = lane & Int32(3)
 
-        num_groups = coalesce_meta[Int64(0)]
-        total_tasks = num_groups * Int32(self.output_tiles)
-        task = Int32(bidx)
-
         smem = cutlass.utils.SmemAllocator()
 
         @cute.struct
@@ -2494,6 +2508,13 @@ class W4A8CompactCoalescedFC2Kernel:
         words = cute.make_rmem_tensor((4,), Uint32)
         dn_b0 = cute.make_rmem_tensor((4,), Uint32)
         dn_b1 = cute.make_rmem_tensor((4,), Uint32)
+
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+
+        num_groups = coalesce_meta[Int64(0)]
+        total_tasks = num_groups * Int32(self.output_tiles)
+        task = Int32(bidx)
 
         while task < total_tasks:
             group_idx = task // Int32(self.output_tiles)
@@ -2522,6 +2543,8 @@ class W4A8CompactCoalescedFC2Kernel:
                 output_tile,
             )
             task += Int32(gdimx)
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
     def _run_task(
@@ -2737,7 +2760,14 @@ class W4A8CompactTopkSumKernel:
 
     threads_per_cta = 128
 
-    def __init__(self, k: int, num_topk: int, num_experts: int):
+    def __init__(
+        self,
+        k: int,
+        num_topk: int,
+        num_experts: int,
+        *,
+        use_pdl: bool = False,
+    ):
         if k <= 0 or k % 256:
             raise ValueError("compact topk sum requires K divisible by 256")
         if num_topk <= 0 or num_experts <= 0:
@@ -2745,6 +2775,7 @@ class W4A8CompactTopkSumKernel:
         self.k = int(k)
         self.num_topk = int(num_topk)
         self.num_experts = int(num_experts)
+        self.use_pdl = bool(use_pdl)
         self.tiles_per_token = self.k // 256
 
     @cute.jit
@@ -2762,6 +2793,7 @@ class W4A8CompactTopkSumKernel:
             grid=(live_tokens * Int32(self.tiles_per_token), 1, 1),
             block=[self.threads_per_cta, 1, 1],
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -2777,14 +2809,16 @@ class W4A8CompactTopkSumKernel:
         tid = Int32(tidx)
         bid = Int32(bidx)
         token = bid // Int32(self.tiles_per_token)
+        tile = bid % Int32(self.tiles_per_token)
+        col = tile * Int32(256) + tid * Int32(2)
+        col_u32 = col >> Int32(1)
+        row_u32_stride = Int64(self.k // 2)
+        base_pair = token * Int32(self.num_topk)
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
         if token < live_tokens:
-            tile = bid % Int32(self.tiles_per_token)
-            col = tile * Int32(256) + tid * Int32(2)
-            col_u32 = col >> Int32(1)
-            row_u32_stride = Int64(self.k // 2)
             acc0 = cutlass.Float32(0.0)
             acc1 = cutlass.Float32(0.0)
-            base_pair = token * Int32(self.num_topk)
             for slot in cutlass.range_constexpr(self.num_topk):
                 pair = base_pair + Int32(slot)
                 expert = local_expert_id(topk_ids[Int64(pair)], Int32(self.num_experts))

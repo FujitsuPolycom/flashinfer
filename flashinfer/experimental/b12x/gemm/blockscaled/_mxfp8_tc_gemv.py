@@ -28,6 +28,7 @@ from b12x._lib.intrinsics.memory import get_ptr_as_int64, ld_global_nc_v4_u32
 from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32
 from b12x._lib.program_cache import program_cache
 from b12x._lib.utils.device import cuda_stream_from_int_or_current, current_cuda_stream
+from b12x._lib.utils.pdl import sm120_consumer_pdl_enabled
 from b12x._lib.utils.pointers import make_ptr
 
 MXFP8_TC_GEMV_MAX_ROWS = 32
@@ -285,6 +286,7 @@ class MXFP8MultiRowTCGemvKernel:
         n_per_cta: int = 16,
         rope_head_dim: int = 0,
         rope_dim: int = 64,
+        use_pdl: bool = False,
     ):
         self.n = int(n)
         self.in_features = int(in_features)
@@ -292,6 +294,7 @@ class MXFP8MultiRowTCGemvKernel:
         self.max_m_tiles = int(max_m_tiles)
         self.split_k = int(split_k)
         self.n_per_cta = int(n_per_cta)
+        self.use_pdl = bool(use_pdl)
         if self.n_per_cta not in (16, 32):
             raise ValueError(
                 f"MXFP8 TC-GEMV requires n_per_cta in (16, 32), got {self.n_per_cta}"
@@ -370,6 +373,7 @@ class MXFP8MultiRowTCGemvKernel:
             grid=((self.n + self.n_per_cta - 1) // self.n_per_cta, self.split_k, 1),
             block=(self.warps * _LANES, 1, 1),
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.jit
@@ -400,6 +404,7 @@ class MXFP8MultiRowTCGemvKernel:
             grid=((self.n + self.n_per_cta - 1) // self.n_per_cta, self.split_k, 1),
             block=(self.warps * _LANES, 1, 1),
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.jit
@@ -503,6 +508,8 @@ class MXFP8MultiRowTCGemvKernel:
                     wb2, wb3 = _e4m3x4_scaled_to_bf16x2x2_sm120(
                         pb1 if cutlass.const_expr(half == 0) else pb3, sb
                     )
+                    if cutlass.const_expr(self.use_pdl and step == 0 and half == 0):
+                        cute.arch.griddepcontrol_wait()
                     h_off = x_off + Int64(half * 16)
                     for mt in cutlass.range_constexpr(self.max_m_tiles):
                         token = cutlass.min(Int32(mt * 8) + group, rows - 1)
@@ -590,6 +597,8 @@ class MXFP8MultiRowTCGemvKernel:
                     )
                 )
                 for half in cutlass.range_constexpr(2):
+                    if cutlass.const_expr(self.use_pdl and step == 0 and half == 0):
+                        cute.arch.griddepcontrol_wait()
                     h_off = x_off + Int64(half * 16)
                     for mt in cutlass.range_constexpr(self.max_m_tiles):
                         token = cutlass.min(Int32(mt * 8) + group, rows - 1)
@@ -858,7 +867,7 @@ class MXFP8MultiRowTCGemvKernel:
 
 
 @program_cache
-def compile_mxfp8_tc_gemv(
+def _compile_mxfp8_tc_gemv_cached(
     ordinal: int,
     n: int,
     in_features: int,
@@ -866,12 +875,14 @@ def compile_mxfp8_tc_gemv(
     max_rows: int,
     split_k: int,
     warps: int,
-    n_per_cta: int = 16,
+    n_per_cta: int,
+    use_pdl: bool,
 ):
     max_m_tiles = (int(max_rows) + 7) // 8
     active_k = mxfp8_tc_gemv_active_k(in_features, padded_k)
     eff_warps = effective_mxfp8_tc_gemv_warps(active_k, split_k, warps)
     n_per_cta = int(n_per_cta)
+    use_pdl = bool(use_pdl)
     kernel = MXFP8MultiRowTCGemvKernel(
         n,
         in_features,
@@ -880,6 +891,7 @@ def compile_mxfp8_tc_gemv(
         split_k=split_k,
         warps=eff_warps,
         n_per_cta=n_per_cta,
+        use_pdl=use_pdl,
     )
     key = (
         int(n),
@@ -889,6 +901,7 @@ def compile_mxfp8_tc_gemv(
         int(split_k),
         eff_warps,
         n_per_cta,
+        use_pdl,
     )
     fake = (
         make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -906,7 +919,7 @@ def compile_mxfp8_tc_gemv(
             Int64(in_features),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.blockscaled.mxfp8_tc_gemv", 6, key
+                "gemm.blockscaled.mxfp8_tc_gemv", 7, key
             ),
         )
 
@@ -962,8 +975,7 @@ def compile_mxfp8_tc_gemv(
     return attach_programs(run, raw)
 
 
-@program_cache
-def compile_mxfp8_tc_gemv_rope(
+def compile_mxfp8_tc_gemv(
     ordinal: int,
     n: int,
     in_features: int,
@@ -972,8 +984,44 @@ def compile_mxfp8_tc_gemv_rope(
     split_k: int,
     warps: int,
     n_per_cta: int = 16,
-    head_dim: int = 512,
-    rope_dim: int = 64,
+    *,
+    use_pdl: bool | None = None,
+):
+    resolved_pdl = (
+        sm120_consumer_pdl_enabled(ordinal, env_var="B12X_MXFP8_TC_GEMV_PDL")
+        if use_pdl is None
+        else bool(use_pdl)
+    )
+    return _compile_mxfp8_tc_gemv_cached(
+        ordinal,
+        n,
+        in_features,
+        padded_k,
+        max_rows,
+        split_k,
+        warps,
+        n_per_cta,
+        resolved_pdl,
+    )
+
+
+compile_mxfp8_tc_gemv.cache_clear = _compile_mxfp8_tc_gemv_cached.cache_clear
+compile_mxfp8_tc_gemv.cache_info = _compile_mxfp8_tc_gemv_cached.cache_info
+
+
+@program_cache
+def _compile_mxfp8_tc_gemv_rope_cached(
+    ordinal: int,
+    n: int,
+    in_features: int,
+    padded_k: int,
+    max_rows: int,
+    split_k: int,
+    warps: int,
+    n_per_cta: int,
+    head_dim: int,
+    rope_dim: int,
+    use_pdl: bool,
 ):
     max_m_tiles = (int(max_rows) + 7) // 8
     active_k = mxfp8_tc_gemv_active_k(in_features, padded_k)
@@ -981,6 +1029,7 @@ def compile_mxfp8_tc_gemv_rope(
     n_per_cta = int(n_per_cta)
     head_dim = int(head_dim)
     rope_dim = int(rope_dim)
+    use_pdl = bool(use_pdl)
     kernel = MXFP8MultiRowTCGemvKernel(
         n,
         in_features,
@@ -991,6 +1040,7 @@ def compile_mxfp8_tc_gemv_rope(
         n_per_cta=n_per_cta,
         rope_head_dim=head_dim,
         rope_dim=rope_dim,
+        use_pdl=use_pdl,
     )
     key = (
         int(n),
@@ -1002,6 +1052,7 @@ def compile_mxfp8_tc_gemv_rope(
         n_per_cta,
         head_dim,
         rope_dim,
+        use_pdl,
     )
     fake = (
         make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -1020,7 +1071,7 @@ def compile_mxfp8_tc_gemv_rope(
             Int64(in_features),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.blockscaled.mxfp8_tc_gemv_rope", 2, key
+                "gemm.blockscaled.mxfp8_tc_gemv_rope", 3, key
             ),
         )
 
@@ -1082,3 +1133,41 @@ def compile_mxfp8_tc_gemv_rope(
         )
 
     return attach_programs(run, raw)
+
+
+def compile_mxfp8_tc_gemv_rope(
+    ordinal: int,
+    n: int,
+    in_features: int,
+    padded_k: int,
+    max_rows: int,
+    split_k: int,
+    warps: int,
+    n_per_cta: int = 16,
+    head_dim: int = 512,
+    rope_dim: int = 64,
+    *,
+    use_pdl: bool | None = None,
+):
+    resolved_pdl = (
+        sm120_consumer_pdl_enabled(ordinal, env_var="B12X_MXFP8_TC_GEMV_PDL")
+        if use_pdl is None
+        else bool(use_pdl)
+    )
+    return _compile_mxfp8_tc_gemv_rope_cached(
+        ordinal,
+        n,
+        in_features,
+        padded_k,
+        max_rows,
+        split_k,
+        warps,
+        n_per_cta,
+        head_dim,
+        rope_dim,
+        resolved_pdl,
+    )
+
+
+compile_mxfp8_tc_gemv_rope.cache_clear = _compile_mxfp8_tc_gemv_rope_cached.cache_clear
+compile_mxfp8_tc_gemv_rope.cache_info = _compile_mxfp8_tc_gemv_rope_cached.cache_info

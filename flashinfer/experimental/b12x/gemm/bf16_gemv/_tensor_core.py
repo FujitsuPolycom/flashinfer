@@ -27,6 +27,7 @@ from b12x._lib.intrinsics.memory import get_ptr_as_int64, ld_global_nc_v4_u32
 from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32
 from b12x._lib.program_cache import program_cache
 from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pdl import sm120_consumer_pdl_enabled
 from b12x._lib.utils.pointers import make_ptr
 
 TC_MAX_ROWS = 32
@@ -166,7 +167,14 @@ def _flat(pointer: cute.Pointer):
 class TensorCoreGemvKernel:
     """``out[m, n] = sum_k x[m, k] * w[n, k]`` for up to 32 live rows."""
 
-    def __init__(self, n: int, k: int, max_rows: int = 8, split_k: int = 1):
+    def __init__(
+        self,
+        n: int,
+        k: int,
+        max_rows: int = 8,
+        split_k: int = 1,
+        use_pdl: bool = False,
+    ):
         if k <= 0 or k % TC_K_MULTIPLE:
             raise ValueError(
                 f"tensor-core GEMV requires K to be a positive multiple of {TC_K_MULTIPLE}"
@@ -180,6 +188,7 @@ class TensorCoreGemvKernel:
         self.n, self.k = int(n), int(k)
         self.max_m_tiles = (int(max_rows) + 7) // 8
         self.split_k = int(split_k)
+        self.use_pdl = bool(use_pdl)
         self.chunks_per_split = chunks // self.split_k
         self.warps = min(TC_MAX_WARPS, self.chunks_per_split)
         while self.chunks_per_split % self.warps:
@@ -229,6 +238,7 @@ class TensorCoreGemvKernel:
             grid=((self.n + 15) // 16, self.split_k, 1),
             block=(self.warps * _LANES, 1, 1),
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -275,6 +285,8 @@ class TensorCoreGemvKernel:
                 wb4, wb5, wb6, wb7 = ld_global_nc_v4_u32(pb + Int64(16))
                 wa = (wa0, wa1, wa2, wa3, wa4, wa5, wa6, wa7)
                 wb = (wb0, wb1, wb2, wb3, wb4, wb5, wb6, wb7)
+                if cutlass.const_expr(self.use_pdl and step == 0):
+                    cute.arch.griddepcontrol_wait()
                 for mt in cutlass.range_constexpr(self.max_m_tiles):
                     token = cutlass.min(Int32(mt * 8) + group, rows - 1)
                     px = x_base + Int64(token) * x_stride * 2 + offset
@@ -304,6 +316,8 @@ class TensorCoreGemvKernel:
                 wb0, wb1, wb2, wb3 = ld_global_nc_v4_u32(pb)
                 wa = (wa0, wa1, wa2, wa3)
                 wb = (wb0, wb1, wb2, wb3)
+                if cutlass.const_expr(self.use_pdl and step == 0):
+                    cute.arch.griddepcontrol_wait()
                 for mt in cutlass.range_constexpr(self.max_m_tiles):
                     token = cutlass.min(Int32(mt * 8) + group, rows - 1)
                     px = x_base + Int64(token) * x_stride * 2 + offset
@@ -426,20 +440,24 @@ class TensorCoreGemvKernel:
 
 
 @program_cache
-def compile_tc_projection(
+def _compile_tc_projection_cached(
     ordinal: int,
     max_rows: int,
     split_k: int,
     n: int,
     k: int,
     output_dtype: str,
+    use_pdl: bool,
 ):
     """Compile one TensorCoreGemvKernel for up to 32 rows and optional split-K."""
     y_type = getattr(torch, output_dtype)
     ct_y = Float32 if y_type == torch.float32 else BFloat16
     max_m_tiles = (int(max_rows) + 7) // 8
-    kernel = TensorCoreGemvKernel(n, k, max_rows=max_m_tiles * 8, split_k=split_k)
-    key = (max_m_tiles, int(split_k), int(n), int(k), output_dtype)
+    use_pdl = bool(use_pdl)
+    kernel = TensorCoreGemvKernel(
+        n, k, max_rows=max_m_tiles * 8, split_k=split_k, use_pdl=use_pdl
+    )
+    key = (max_m_tiles, int(split_k), int(n), int(k), output_dtype, use_pdl)
     fake_x = make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16)
     fake_w = make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16)
     fake_y = make_ptr(ct_y, 16, cute.AddressSpace.gmem, assumed_align=y_type.itemsize)
@@ -459,7 +477,7 @@ def compile_tc_projection(
             Int64(n),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.bf16_projection.tc_multirow", 2, key
+                "gemm.bf16_projection.tc_multirow", 3, key
             ),
         )
 
@@ -493,3 +511,27 @@ def compile_tc_projection(
             )
 
     return attach_programs(run, raw)
+
+
+def compile_tc_projection(
+    ordinal: int,
+    max_rows: int,
+    split_k: int,
+    n: int,
+    k: int,
+    output_dtype: str,
+    *,
+    use_pdl: bool | None = None,
+):
+    resolved_pdl = (
+        sm120_consumer_pdl_enabled(ordinal, env_var="B12X_BF16_GEMV_PDL")
+        if use_pdl is None
+        else bool(use_pdl)
+    )
+    return _compile_tc_projection_cached(
+        ordinal, max_rows, split_k, n, k, output_dtype, resolved_pdl
+    )
+
+
+compile_tc_projection.cache_clear = _compile_tc_projection_cached.cache_clear
+compile_tc_projection.cache_info = _compile_tc_projection_cached.cache_info

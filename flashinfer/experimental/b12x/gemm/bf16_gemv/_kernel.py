@@ -28,6 +28,7 @@ from b12x._lib.intrinsics.reduction import warp_reduce
 from b12x._lib.program_cache import program_cache
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pdl import sm120_consumer_pdl_enabled
 from b12x._lib.utils.pointers import make_ptr
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 from cutlass.cute.nvgpu import warp, warpgroup
@@ -79,10 +80,12 @@ class SmallNGemvKernel:
         has_bias: bool,
         rows_per_tile: int = SMALL_M_MAX,
         block_threads: int = _THREADS,
+        use_pdl: bool = False,
     ):
         self.n, self.k = int(n), int(k)
         self.bf16_operands = bool(bf16_operands)
         self.has_bias = bool(has_bias)
+        self.use_pdl = bool(use_pdl)
         if rows_per_tile not in (1, 2, 4, 8):
             raise ValueError("SIMT projection supports 1, 2, 4, or 8 rows per tile")
         self.rows_per_tile = int(rows_per_tile)
@@ -131,6 +134,7 @@ class SmallNGemvKernel:
             ),
             block=(self.block_threads, 1, 1),
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -159,6 +163,8 @@ class SmallNGemvKernel:
         acc = cute.make_rmem_tensor((self.rows_per_tile,), Float32)
         for r in cutlass.range_constexpr(self.rows_per_tile):
             acc[r] = Float32(0.0)
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
         if cutlass.const_expr(self.bf16_operands and self.k % 8 == 0):
             if vector_loads != Int32(0):
                 index = tid
@@ -335,9 +341,10 @@ class MixedVectorGemvKernel(SmallNGemvKernel):
 class Bf16GemmKernel:
     """Cooperatively staged BF16 warp-MMA, with runtime strides and M tails."""
 
-    def __init__(self, n: int, k: int, has_bias: bool):
+    def __init__(self, n: int, k: int, has_bias: bool, use_pdl: bool = False):
         self.n, self.k = int(n), int(k)
         self.has_bias = bool(has_bias)
+        self.use_pdl = bool(use_pdl)
         self.tile_m, self.tile_n, self.tile_k = 32, 64, 64
 
     @cute.jit
@@ -398,6 +405,7 @@ class Bf16GemmKernel:
             ),
             block=(_THREADS, 1, 1),
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.jit
@@ -491,18 +499,6 @@ class Bf16GemmKernel:
         for k_tile in cutlass.range((self.k + self.tile_k - 1) // self.tile_k):
             k_base = Int32(k_tile * self.tile_k)
             self.load_tile(
-                source,
-                shared_a,
-                Int32(m_tile * self.tile_m),
-                rows,
-                k_base,
-                x_stride,
-                x_column_stride,
-                Int32(thread),
-                vector_loads,
-                self.tile_m,
-            )
-            self.load_tile(
                 weight,
                 shared_b,
                 Int32(n_tile * self.tile_n),
@@ -513,6 +509,21 @@ class Bf16GemmKernel:
                 Int32(thread),
                 vector_loads,
                 self.tile_n,
+            )
+            if cutlass.const_expr(self.use_pdl):
+                if k_tile == Int32(0):
+                    cute.arch.griddepcontrol_wait()
+            self.load_tile(
+                source,
+                shared_a,
+                Int32(m_tile * self.tile_m),
+                rows,
+                k_base,
+                x_stride,
+                x_column_stride,
+                Int32(thread),
+                vector_loads,
+                self.tile_m,
             )
             cute.arch.barrier()
             cute.copy(copy_a, source_a[None, None, 0], target_a[None, None, 0])
@@ -618,7 +629,7 @@ def _validate(x, weight, out, bias):
 
 
 @program_cache
-def compile_projection(
+def _compile_projection_cached(
     ordinal: int,
     backend: str,
     rows_per_tile: int,
@@ -629,6 +640,7 @@ def compile_projection(
     output_dtype: str,
     bias_dtype: str | None,
     block_threads: int,
+    use_pdl: bool,
 ):
     """Compile one selected concrete kernel from immutable operand metadata."""
     x_type, w_type, y_type = (
@@ -639,6 +651,7 @@ def compile_projection(
             output_dtype,
         )
     )
+    use_pdl = bool(use_pdl)
     if backend not in ("simt", "mixed_vector", "mma", "tc"):
         raise ValueError(f"unsupported native projection algorithm {backend!r}")
     if backend in ("simt", "mixed_vector"):
@@ -652,13 +665,14 @@ def compile_projection(
             bias_dtype is not None,
             rows_per_tile,
             block_threads,
+            use_pdl=use_pdl,
         )
     elif backend == "tc":
         from ._tensor_core import compile_tc_projection
 
-        return compile_tc_projection(ordinal, 8, 1, n, k, output_dtype)
+        return compile_tc_projection(ordinal, 8, 1, n, k, output_dtype, use_pdl=use_pdl)
     else:
-        kernel = Bf16GemmKernel(n, k, bias_dtype is not None)
+        kernel = Bf16GemmKernel(n, k, bias_dtype is not None, use_pdl=use_pdl)
     types = (
         x_type,
         w_type,
@@ -675,6 +689,7 @@ def compile_projection(
         weight_dtype,
         output_dtype,
         bias_dtype,
+        use_pdl,
     )
     fake = tuple(
         make_ptr(
@@ -695,7 +710,7 @@ def compile_projection(
             Int32(0),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.bf16_projection.selected", 3, key
+                "gemm.bf16_projection.selected", 4, key
             ),
         )
 
@@ -729,3 +744,41 @@ def compile_projection(
             )
 
     return attach_programs(run, raw)
+
+
+def compile_projection(
+    ordinal: int,
+    backend: str,
+    rows_per_tile: int,
+    n: int,
+    k: int,
+    source_dtype: str,
+    weight_dtype: str,
+    output_dtype: str,
+    bias_dtype: str | None,
+    block_threads: int,
+    *,
+    use_pdl: bool | None = None,
+):
+    resolved_pdl = (
+        sm120_consumer_pdl_enabled(ordinal, env_var="B12X_BF16_GEMV_PDL")
+        if use_pdl is None
+        else bool(use_pdl)
+    )
+    return _compile_projection_cached(
+        ordinal,
+        backend,
+        rows_per_tile,
+        n,
+        k,
+        source_dtype,
+        weight_dtype,
+        output_dtype,
+        bias_dtype,
+        block_threads,
+        resolved_pdl,
+    )
+
+
+compile_projection.cache_clear = _compile_projection_cached.cache_clear
+compile_projection.cache_info = _compile_projection_cached.cache_info
