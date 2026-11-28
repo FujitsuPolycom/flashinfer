@@ -280,7 +280,7 @@ def test_compact_w4a8_defaults_enable_inline_csf_and_bound_micro_tokens():
     from b12x.moe.fused_moe._tuning import TUNING as MOE_TUNING
     from tests.experimental.b12x.moe.test_compact_w4a8_backend_race import _query
 
-    assert 8 <= _COMPACT_W4A8_MAX_TOKENS <= 16
+    assert 8 <= _COMPACT_W4A8_MAX_TOKENS <= 64
     assert _COMPACT_W4A8_MAX_TOKENS_SM121 == 4
 
     # SM120: micro through _COMPACT_W4A8_MAX_TOKENS, dynamic M16 above the

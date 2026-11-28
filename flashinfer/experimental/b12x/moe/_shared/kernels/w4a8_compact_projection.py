@@ -1017,9 +1017,9 @@ class W4A8CompactCoalesceRoutesKernel:
     """
 
     def __init__(self, max_pairs: int, num_experts: int):
-        if max_pairs <= 0 or max_pairs > 256:
+        if max_pairs <= 0 or max_pairs > 512:
             raise ValueError(
-                f"coalesced compact routing requires 1 <= max_pairs <= 256, got {max_pairs}"
+                f"coalesced compact routing requires 1 <= max_pairs <= 512, got {max_pairs}"
             )
         if num_experts <= 0:
             raise ValueError("num_experts must be positive")

@@ -30,8 +30,8 @@ from b12x.moe._shared.kernels.w4a8_phase2 import W4A8MaterializedPhase2Kernel
 
 
 _ALIGN = 256
-_COALESCED_MAX_TOKENS = 16
-_COALESCED_MAX_PAIRS = 256
+_COALESCED_MAX_TOKENS = 85
+_COALESCED_MAX_PAIRS = 512
 
 
 def _ceil_div(x: int, y: int) -> int:
