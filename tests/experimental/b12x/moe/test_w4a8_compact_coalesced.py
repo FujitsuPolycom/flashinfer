@@ -259,7 +259,9 @@ def deepseek_experts_by_csf():
     torch.cuda.empty_cache()
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 7, 8, 12, 14, 16])
+@pytest.mark.parametrize(
+    "num_tokens", [1, 2, 4, 7, 8, 12, 14, 16, 19, 24, 32, 42, 47, 64]
+)
 @pytest.mark.parametrize("csf_inline", [False, True])
 @pytest.mark.parametrize("prequant", [False, True])
 def test_w4a8_compact_coalesced_0ulp_parity_deepseek_shape(
@@ -530,7 +532,7 @@ def test_w4a8_compact_coalesced_cuda_graph_live_route_mutation(fuse_input_quant:
 
 
 def test_coupled_prequant_m_le_128_tuning_policy():
-    """Heuristic and validator select coalesced micro for M<=16 and Dynamic M16 for 17<=M<=128."""
+    """Heuristic and validator select coalesced micro for M<=64 and Dynamic M16 for 65<=M<=128."""
     base = dict(
         quant_mode="w4a8_mx",
         quant_modes=("w4a8_mx",),
@@ -559,7 +561,7 @@ def test_coupled_prequant_m_le_128_tuning_policy():
         controls=FrozenMapping({}),
         prequantized_input=True,
     )
-    for t in (1, 8, 12, 16):
+    for t in (1, 8, 12, 16, 19, 24, 32, 42, 47, 64):
         q = MoeDecodeQuery(**base, num_tokens=t, routed_rows=t * 6)
         cfg = _heuristic_moe_decode_config(q, None)
         assert cfg.backend == "micro"
@@ -578,7 +580,7 @@ def test_coupled_prequant_m_le_128_tuning_policy():
                 None,
             )
 
-    for t in (17, 32, 64, 128):
+    for t in (65, 96, 128):
         q = MoeDecodeQuery(**base, num_tokens=t, routed_rows=t * 6)
         cfg = _heuristic_moe_decode_config(q, None)
         assert cfg.backend == "dynamic"
@@ -676,8 +678,13 @@ def test_coupled_prequant_m_le_128_gpu_parity(num_tokens: int):
         )
     )
 
+    compact_max = (
+        _COMPACT_W4A8_MAX_TOKENS_SM121
+        if torch.cuda.get_device_capability(device) == (12, 1)
+        else _COMPACT_W4A8_MAX_TOKENS
+    )
     assert supports_prequant_mxfp8(plan_mx, num_tokens)
-    if num_tokens <= 16:
+    if num_tokens <= compact_max:
         assert supports_prequant_mxfp8(plan_bf16, num_tokens)
         assert plan_mx._prepared.state.config.backend == "micro"
     else:
@@ -767,7 +774,7 @@ def test_coupled_prequant_m_le_128_gpu_parity(num_tokens: int):
 
     assert torch.all(out_mx[live:] == 0)
     assert torch.all(out_pq[live:] == 0)
-    if num_tokens <= 16:
+    if num_tokens <= compact_max:
         # Compact micro is deterministic -> strict 0-ULP bit-exact!
         assert torch.equal(out_mx.view(torch.uint16), bf16_runs[0].view(torch.uint16))
         assert torch.equal(out_pq.view(torch.uint16), bf16_runs[0].view(torch.uint16))
@@ -801,8 +808,8 @@ def test_coupled_prequant_m_le_128_gpu_parity(num_tokens: int):
 
 
 def test_compact_w4a8_max_tokens_sm121_vs_sm120():
-    """Verify compact W4A8 micro stays capped at 4 tokens on SM121 vs 16 on SM120."""
-    assert _COMPACT_W4A8_MAX_TOKENS == 16
+    """Verify compact W4A8 micro stays capped at 4 tokens on SM121 vs 64 on SM120."""
+    assert _COMPACT_W4A8_MAX_TOKENS == 64
     assert _COMPACT_W4A8_MAX_TOKENS_SM121 == 4
     sm120 = DeviceIdentity("nvidia", (12, 0), 188, "RTX PRO 6000 Blackwell")
     sm121 = DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10")
@@ -834,19 +841,19 @@ def test_compact_w4a8_max_tokens_sm121_vs_sm120():
         controls=FrozenMapping({}),
         prequantized_input=False,
     )
-    for t in (1, 4, 8, 12, 16):
+    for t in (1, 4, 8, 12, 16, 19, 24, 32, 47, 64):
         q = MoeDecodeQuery(**base, num_tokens=t, routed_rows=t * 6)
         assert _w4a8_mx_micro_preferred(q, sm120) is True
         assert _heuristic_moe_decode_config(q, sm120).backend == "micro"
-    q17 = MoeDecodeQuery(**base, num_tokens=17, routed_rows=17 * 6)
-    assert _w4a8_mx_micro_preferred(q17, sm120) is False
-    assert _heuristic_moe_decode_config(q17, sm120).backend == "dynamic"
+    q65 = MoeDecodeQuery(**base, num_tokens=65, routed_rows=65 * 6)
+    assert _w4a8_mx_micro_preferred(q65, sm120) is False
+    assert _heuristic_moe_decode_config(q65, sm120).backend == "dynamic"
 
     for t in (1, 4):
         q = MoeDecodeQuery(**base, num_tokens=t, routed_rows=t * 6)
         assert _w4a8_mx_micro_preferred(q, sm121) is True
         assert _heuristic_moe_decode_config(q, sm121).backend == "micro"
-    for t in (5, 8, 12, 16):
+    for t in (5, 8, 12, 16, 64):
         q = MoeDecodeQuery(**base, num_tokens=t, routed_rows=t * 6)
         assert _w4a8_mx_micro_preferred(q, sm121) is False
         assert _heuristic_moe_decode_config(q, sm121).backend == "dynamic"

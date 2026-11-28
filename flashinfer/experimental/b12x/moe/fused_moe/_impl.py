@@ -2477,7 +2477,7 @@ _MICRO_DYNAMIC_CUTOVER_PAIRS_DEFAULT = 64
 # Micro keeps the m tokens' activations resident in registers; 8 is the budget
 # ceiling. Micro is correct for any 1<=m<=8 (not just powers of two).
 _MICRO_MAX_TOKENS = 8
-_COMPACT_W4A8_MAX_TOKENS = 16
+_COMPACT_W4A8_MAX_TOKENS = 64
 _COMPACT_W4A8_MAX_TOKENS_SM121 = 4
 # Prepared MXFP4 decode keeps the shared-input producer through M=8, while
 # pair-direct routing wins through M=4 for the common top-k=8 regime.
@@ -2893,7 +2893,7 @@ def _w4a8_mx_micro_preferred(
         and query.num_tokens > compact_max_tokens
     ):
         # No-tune heuristic: compact decode stays on the micro kernel through
-        # 16 tokens on SM120 (coalesced) and 4 tokens on SM121.
+        # 64 tokens on SM120 (coalesced) and 4 tokens on SM121.
         return False
     return not (
         capability == (12, 1)

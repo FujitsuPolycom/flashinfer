@@ -30,6 +30,7 @@ from b12x._lib.compiler import (
     tensor_compile_fact,
 )
 from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pdl import sm120_consumer_pdl_enabled
 
 from .decode_math import _exp2_approx_ftz_f32, _u32_to_f32
 from .reference import _MLA_GROUP_SIZE, _MLA_NOPE_DIM
@@ -500,10 +501,12 @@ class SparseMLASplitDecodeMergeKernel:
         static_num_chunks: int | None = None,
         vector_output: bool = True,
         vector_partials: bool = True,
+        use_pdl: bool = False,
     ):
         self.static_num_chunks = static_num_chunks
         self.vector_output = bool(vector_output)
         self.vector_partials = bool(vector_partials)
+        self.use_pdl = bool(use_pdl)
 
     @cute.jit
     def __call__(
@@ -523,6 +526,7 @@ class SparseMLASplitDecodeMergeKernel:
             grid=(output.shape[0], output.shape[1], _MLA_SCALE_GROUPS),
             block=[_MERGE_THREADS, 1, 1],
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -537,6 +541,8 @@ class SparseMLASplitDecodeMergeKernel:
         scratch = smem.allocate_tensor(
             Float32, cute.make_layout(_MERGE_SMEM_FLOATS), 16
         )
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
         if cutlass.const_expr(self.static_num_chunks is None):
             num_chunks = Int32(num_chunks_ptr[Int32(0)])
         else:
@@ -563,10 +569,12 @@ class SparseMLASplitDecodeSinkMergeKernel:
         static_num_chunks: int | None = None,
         vector_output: bool = True,
         vector_partials: bool = True,
+        use_pdl: bool = False,
     ):
         self.static_num_chunks = static_num_chunks
         self.vector_output = bool(vector_output)
         self.vector_partials = bool(vector_partials)
+        self.use_pdl = bool(use_pdl)
 
     @cute.jit
     def __call__(
@@ -588,6 +596,7 @@ class SparseMLASplitDecodeSinkMergeKernel:
             grid=(output.shape[0], output.shape[1], _MLA_SCALE_GROUPS),
             block=[_MERGE_THREADS, 1, 1],
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -603,6 +612,8 @@ class SparseMLASplitDecodeSinkMergeKernel:
         scratch = smem.allocate_tensor(
             Float32, cute.make_layout(_MERGE_SMEM_FLOATS), 16
         )
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
         if cutlass.const_expr(self.static_num_chunks is None):
             num_chunks = Int32(num_chunks_ptr[Int32(0)])
         else:
@@ -626,9 +637,10 @@ def _build_sparse_mla_split_merge_kernel(
     static_num_chunks: int | None = None,
     vector_output: bool = True,
     vector_partials: bool = True,
+    use_pdl: bool = False,
 ) -> SparseMLASplitDecodeMergeKernel:
     return SparseMLASplitDecodeMergeKernel(
-        static_num_chunks, vector_output, vector_partials
+        static_num_chunks, vector_output, vector_partials, use_pdl=use_pdl
     )
 
 
@@ -637,9 +649,10 @@ def _build_sparse_mla_split_sink_merge_kernel(
     static_num_chunks: int | None = None,
     vector_output: bool = True,
     vector_partials: bool = True,
+    use_pdl: bool = False,
 ) -> SparseMLASplitDecodeSinkMergeKernel:
     return SparseMLASplitDecodeSinkMergeKernel(
-        static_num_chunks, vector_output, vector_partials
+        static_num_chunks, vector_output, vector_partials, use_pdl=use_pdl
     )
 
 
@@ -676,6 +689,7 @@ def _sparse_mla_split_decode_merge_flat_launch(
     )
     vector_output = _merge_vector_tensor(output)
     vector_partials = _merge_vector_tensor(tmp_output)
+    use_pdl = sm120_consumer_pdl_enabled(output.device, env_var="B12X_MLA_MERGE_PDL")
     if not has_attn_sink:
         merge_args = (
             _to_kernel_tensor(tmp_output, _torch_to_cutlass_dtype(tmp_output.dtype)),
@@ -687,7 +701,7 @@ def _sparse_mla_split_decode_merge_flat_launch(
         if _prepared is not None:
             return run_compiled(_prepared, merge_args)
         merge_kernel = _build_sparse_mla_split_merge_kernel(
-            static_num_chunks_or_none, vector_output, vector_partials
+            static_num_chunks_or_none, vector_output, vector_partials, use_pdl=use_pdl
         )
         merge_cache_key = (
             _tensor_compile_key(
@@ -713,10 +727,11 @@ def _sparse_mla_split_decode_merge_flat_launch(
             static_num_chunks_or_none,
             int(vector_output),
             int(vector_partials),
+            int(use_pdl),
         )
         merge_spec = KernelCompileSpec.from_key(
             "attention.mla.merge",
-            7,
+            8,
             merge_cache_key,
             labels=(
                 "tmp_output",
@@ -728,6 +743,7 @@ def _sparse_mla_split_decode_merge_flat_launch(
                 "static_num_chunks",
                 "vector_output",
                 "vector_partials",
+                "use_pdl",
             ),
         )
         return b12x_launch(
@@ -748,7 +764,7 @@ def _sparse_mla_split_decode_merge_flat_launch(
     if _prepared is not None:
         return run_compiled(_prepared, merge_args)
     merge_kernel = _build_sparse_mla_split_sink_merge_kernel(
-        static_num_chunks_or_none, vector_output, vector_partials
+        static_num_chunks_or_none, vector_output, vector_partials, use_pdl=use_pdl
     )
     merge_cache_key = (
         _tensor_compile_key(
@@ -776,10 +792,11 @@ def _sparse_mla_split_decode_merge_flat_launch(
         static_num_chunks_or_none,
         int(vector_output),
         int(vector_partials),
+        int(use_pdl),
     )
     merge_spec = KernelCompileSpec.from_key(
         "attention.mla.sink_merge",
-        7,
+        8,
         merge_cache_key,
         labels=(
             "tmp_output",
@@ -793,6 +810,7 @@ def _sparse_mla_split_decode_merge_flat_launch(
             "static_num_chunks",
             "vector_output",
             "vector_partials",
+            "use_pdl",
         ),
     )
     return b12x_launch(

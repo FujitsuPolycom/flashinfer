@@ -52,6 +52,7 @@ from b12x.norm.mhc._split_lagged import (
     CLUSTER_AR_MHC_MAX_TOKENS,
     CLUSTER_AR_MHC_ONESHOT_MAX_TOKENS,
     _encode_bf16_sentinel_word,
+    cluster_allreduce_cluster_size,
     cluster_allreduce_transport,
     compile_cluster_allreduce_post_y_norm,
     compile_cluster_post_y_norm,
@@ -282,7 +283,7 @@ class _SimulatedLamportRing:
         tokens, hidden = peer_xs[0].shape
         packs = hidden // 8
         cs = (
-            split_lagged_cluster_size(tokens)
+            cluster_allreduce_cluster_size(tokens)
             if cluster_size is None
             else int(cluster_size)
         )
@@ -420,7 +421,7 @@ def test_cluster_allreduce_post_y_norm_bit_exact_simulation(
     device = torch.device("cuda", torch.cuda.current_device())
     ordinal = int(device.index or 0)
     assert CLUSTER_AR_MHC_MAX_TOKENS == 128
-    assert CLUSTER_AR_MHC_ONESHOT_MAX_TOKENS == 4
+    assert CLUSTER_AR_MHC_ONESHOT_MAX_TOKENS == 1
     assert supports_cluster_allreduce_post_y_norm(
         device, tokens, hidden, torch.bfloat16, world_size
     )
@@ -479,7 +480,7 @@ def test_cluster_allreduce_post_y_norm_bit_exact_simulation(
         False,
         1e-20,
         norm_dtype,
-        cluster_size=split_lagged_cluster_size(tokens),
+        cluster_size=cluster_allreduce_cluster_size(tokens),
         emit_mxfp8=emit_mxfp8,
     )
     load_programs(fused_runner)
@@ -661,17 +662,48 @@ def test_cluster_allreduce_post_y_norm_bit_exact_simulation(
         assert ring_r.epoch_and_arrived(r_test) == (1, 0)
 
 
-@pytest.mark.parametrize("tokens", [4, 8])
+def test_cluster_allreduce_sizing_and_transport_policy():
+    """Verify AllReduce cluster sizing (4/1) and RSAG cutoff (M>=2) leave non-AR sizing at 8/4/1."""
+    assert CLUSTER_AR_MHC_ONESHOT_MAX_TOKENS == 1
+    for m in (1, 2, 3, 4):
+        assert cluster_allreduce_cluster_size(m) == 4
+        assert split_lagged_cluster_size(m) == 8
+    for m in (5, 8, 16):
+        assert cluster_allreduce_cluster_size(m) == 1
+        assert split_lagged_cluster_size(m) == 8
+    for m in (17, 32, 48):
+        assert cluster_allreduce_cluster_size(m) == 1
+        assert split_lagged_cluster_size(m) == 4
+    for m in (49, 64, 128):
+        assert cluster_allreduce_cluster_size(m) == 1
+        assert split_lagged_cluster_size(m) == 1
+
+    for ws in (2, 3, 4, 6, 8):
+        assert cluster_allreduce_transport(1, ws) == "oneshot"
+    for m in (2, 4, 8, 16, 32, 64, 128):
+        assert cluster_allreduce_transport(m, 2) == "oneshot"
+        for ws in (3, 4, 6, 8):
+            assert cluster_allreduce_transport(m, ws) == "rsag"
+
+
+@pytest.mark.parametrize(
+    ("tokens", "transport_mode"),
+    [(4, "oneshot"), (4, "auto"), (8, "auto")],
+)
 @pytest.mark.parametrize("has_addend", [False, True])
 def test_cluster_allreduce_post_y_norm_adversarial_zero_and_exponents(
-    tokens: int, has_addend: bool
+    tokens: int, transport_mode: str, has_addend: bool
 ):
     """Test +0.0, -0.0, subnormals, extreme finite exponents, and mixed cancellation across oneshot & rsag."""
     _sm120_required()
     device = torch.device("cuda", torch.cuda.current_device())
     ordinal = int(device.index or 0)
     hidden, world_size = 5120, 4
-    transport = cluster_allreduce_transport(tokens, world_size)
+    transport = (
+        cluster_allreduce_transport(tokens, world_size)
+        if transport_mode == "auto"
+        else transport_mode
+    )
 
     # Construct adversarial BF16 bit patterns covering +0.0 (0x0000), -0.0 (0x8000),
     # smallest subnormal (0x0001 / 0x8001), tiny normal (0x0080), cancellation pairs,
@@ -757,10 +789,16 @@ def test_cluster_allreduce_post_y_norm_adversarial_zero_and_exponents(
         has_addend=has_addend,
         device_slot_selection=True,
         slot_bias=0,
-        transport="auto",
+        transport=transport_mode,
     )
     post_y_runner = compile_cluster_post_y_norm(
-        ordinal, hidden, False, 1e-20, torch.bfloat16, cluster_size=8, emit_mxfp8=True
+        ordinal,
+        hidden,
+        False,
+        1e-20,
+        torch.bfloat16,
+        cluster_size=cluster_allreduce_cluster_size(tokens),
+        emit_mxfp8=True,
     )
     load_programs(fused_runner)
     load_programs(post_y_runner)
@@ -910,7 +948,7 @@ def test_cluster_allreduce_post_y_norm_50_iter_zero_alloc_cuda_graph(tokens: int
         False,
         1e-20,
         torch.bfloat16,
-        cluster_size=split_lagged_cluster_size(tokens),
+        cluster_size=cluster_allreduce_cluster_size(tokens),
         emit_mxfp8=True,
     )
     load_programs(fused_runner)
@@ -1098,6 +1136,7 @@ def test_cluster_allreduce_post_y_norm_zero_register_spills():
         for cs, transport in (
             (8, "oneshot"),
             (8, "rsag"),
+            (4, "oneshot"),
             (4, "rsag"),
             (1, "rsag"),
             (1, "oneshot"),
@@ -1248,7 +1287,7 @@ def _multi_gpu_worker(rank: int, world_size: int, port: int, hidden: int, tokens
             False,
             1e-20,
             torch.bfloat16,
-            cluster_size=split_lagged_cluster_size(tokens),
+            cluster_size=cluster_allreduce_cluster_size(tokens),
             emit_mxfp8=True,
         )
         load_programs(fused_runner)

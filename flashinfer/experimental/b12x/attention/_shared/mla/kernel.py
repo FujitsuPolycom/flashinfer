@@ -40,6 +40,7 @@ from b12x._lib.intrinsics.memory import (
     st_global_v4_u32,
 )
 from b12x._lib.intrinsics.atomics import st_shared_u32
+from b12x._lib.utils.pdl import sm120_consumer_pdl_enabled
 
 from .decode_math import (
     EPILOGUE_FINAL_BF16,
@@ -417,6 +418,7 @@ class UnifiedDecodeKernel:
         vector_q=False,
         direct_output=False,
         has_attn_sink=False,
+        use_pdl=False,
     ):
         self.traits = traits
         self.layout = layout
@@ -518,6 +520,7 @@ class UnifiedDecodeKernel:
         )
         self.direct_output = bool(direct_output)
         self.has_attn_sink = bool(direct_output and has_attn_sink)
+        self.use_pdl = bool(use_pdl)
         self.vector_q_hpb = 8 if self.native_h8 else int(traits.hpb)
         if self.native_dsv4_h8 or self.native_dsv4_h16:
             packed_span = int(layout.kv_bufs) * int(
@@ -587,6 +590,7 @@ class UnifiedDecodeKernel:
             # target artificial multi-CTA register occupancy.
             min_blocks_per_mp=1,
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.jit
@@ -636,6 +640,7 @@ class UnifiedDecodeKernel:
             block=[self.block_threads, 1, 1],
             min_blocks_per_mp=1,
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.jit
@@ -677,6 +682,7 @@ class UnifiedDecodeKernel:
             block=[self.block_threads, 1, 1],
             min_blocks_per_mp=1,
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.jit
@@ -725,6 +731,7 @@ class UnifiedDecodeKernel:
             block=[self.block_threads, 1, 1],
             min_blocks_per_mp=1,
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.jit
@@ -777,6 +784,7 @@ class UnifiedDecodeKernel:
             block=[self.block_threads, 1, 1],
             min_blocks_per_mp=1,
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -1041,24 +1049,6 @@ class UnifiedDecodeKernel:
             head_block = head_block + Int32(self.head_block_offset)
         head_base = head_block * Int32(8 if self.native_h8 else t.hpb)
 
-        # Load and clamp replay-time lengths before touching the shared KV
-        # pipeline. Capacity planning, launch geometry, and workspace addresses
-        # remain fixed across CUDA-graph capture and replay.
-        if cutlass.const_expr(per_token_len):
-            topk_total = Int32(self.topk)
-            section_len = Int32(topk_length[token_idx])
-            if section_len < Int32(0):
-                section_len = Int32(0)
-            if section_len > topk_total:
-                section_len = topk_total
-            if cutlass.const_expr(has_extra):
-                extra_total = Int32(self.extra_topk)
-                extra_section_len = Int32(extra_topk_length[token_idx])
-                if extra_section_len < Int32(0):
-                    extra_section_len = Int32(0)
-                if extra_section_len > extra_total:
-                    extra_section_len = extra_total
-
         smem = cutlass_utils.SmemAllocator()
         SharedStorage = get_unified_shared_storage_cls(t)
         st = smem.allocate(SharedStorage)
@@ -1176,6 +1166,30 @@ class UnifiedDecodeKernel:
                 cute.arch.mbarrier_init(mbar_base + s, Int32(full_arrivals))
                 cute.arch.mbarrier_init(mbar_base + n_buf + s, Int32(1))  # empty[s]
         cute.arch.barrier()  # Full-CTA structural fence.
+
+        # Consumer-side SM120 PDL wait: SMEM allocation, pointer setup, and
+        # mbarrier initialization above overlap with the prior grid; synchronize
+        # before reading any dependent global tensors (lengths, Q, indices).
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+
+        # Load and clamp replay-time lengths before touching the shared KV
+        # pipeline. Capacity planning, launch geometry, and workspace addresses
+        # remain fixed across CUDA-graph capture and replay.
+        if cutlass.const_expr(per_token_len):
+            topk_total = Int32(self.topk)
+            section_len = Int32(topk_length[token_idx])
+            if section_len < Int32(0):
+                section_len = Int32(0)
+            if section_len > topk_total:
+                section_len = topk_total
+            if cutlass.const_expr(has_extra):
+                extra_total = Int32(self.extra_topk)
+                extra_section_len = Int32(extra_topk_length[token_idx])
+                if extra_section_len < Int32(0):
+                    extra_section_len = Int32(0)
+                if extra_section_len > extra_total:
+                    extra_section_len = extra_total
 
         # ── Length-independent prologue work. The Q staging and the first
         #    chunk's index loads do not depend on the per-token lengths loaded
@@ -1384,6 +1398,8 @@ class UnifiedDecodeKernel:
                     if tid == Int32(self.math_threads):
                         cute.arch.mbarrier_arrive(mbar_base)
                     cute.arch.mbarrier_wait(mbar_base, phase=0)
+            if cutlass.const_expr(self.use_pdl and not self.direct_output):
+                cute.arch.griddepcontrol_launch_dependents()
             _exit_thread()
 
         # ════════════════════════════════════════════════════════════════════
@@ -2452,6 +2468,8 @@ class UnifiedDecodeKernel:
                 attn_sink=attn_sink,
                 head_base=head_base_stage,
             )
+            if cutlass.const_expr(self.use_pdl and not self.direct_output):
+                cute.arch.griddepcontrol_launch_dependents()
 
 
 def _to_cute(x, dtype, align=16, dynamic_layout=False):
@@ -2581,6 +2599,7 @@ def _sparse_mla_decode_grid_flat_launch(
     indexed_num_pages: int = 0,
     attn_sink: torch.Tensor | None = None,
     direct_output: bool = False,
+    use_pdl_override: bool | None = None,
     _prepared=None,
 ) -> None:
     q_head_dim = int(q_all.shape[-1])
@@ -2770,6 +2789,11 @@ def _sparse_mla_decode_grid_flat_launch(
     hpb = int(traits.hpb)
     d_v = int(traits.d_v)
 
+    use_pdl = (
+        bool(use_pdl_override)
+        if use_pdl_override is not None
+        else sm120_consumer_pdl_enabled(q_all.device, env_var="B12X_MLA_DECODE_PDL")
+    )
     kernel = UnifiedDecodeKernel(
         traits,
         layout,
@@ -2798,6 +2822,7 @@ def _sparse_mla_decode_grid_flat_launch(
         vector_q=vector_q,
         direct_output=direct_output,
         has_attn_sink=has_attn_sink,
+        use_pdl=use_pdl,
     )
     spec_fields = [
         key_field("model_type", traits.model_type),
@@ -2828,6 +2853,7 @@ def _sparse_mla_decode_grid_flat_launch(
         key_field("v41_heads_per_block", int(v41_heads_per_block)),
         key_field("direct_output", int(direct_output)),
         key_field("has_attn_sink", int(has_attn_sink)),
+        key_field("use_pdl", int(use_pdl)),
         tensor_key(
             "q_all",
             q_all,
@@ -2913,7 +2939,8 @@ def _sparse_mla_decode_grid_flat_launch(
         # EPILOGUE_FINAL_BF16 direct output with attn_sink fold (merge bypass).
         # v55: unified DSV4.1 BF16 consumer loop and single-path predicated S1/S6
         # dequant (halves SASS .text and eliminates cold I-cache P=8 regression).
-        55,
+        # v56: consumer-side SM120 PDL (use_pdl + griddepcontrol_wait/launch_dependents).
+        56,
         key_field(
             "latent_scale_identity",
             int(float(latent_scale) == 1.0 or bool(latent_scale_per_token)),

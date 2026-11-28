@@ -14,6 +14,7 @@ from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pdl import sm120_consumer_pdl_enabled
 from b12x._lib.utils.pointers import make_ptr
 from b12x.moe._shared.kernels.w4a8_compact_projection import (
     W4A8CompactCoalesceRoutesKernel,
@@ -30,8 +31,8 @@ from b12x.moe._shared.kernels.w4a8_phase2 import W4A8MaterializedPhase2Kernel
 
 
 _ALIGN = 256
-_COALESCED_MAX_TOKENS = 16
-_COALESCED_MAX_PAIRS = 256
+_COALESCED_MAX_TOKENS = 85
+_COALESCED_MAX_PAIRS = 512
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -125,6 +126,7 @@ class _DirectW4A8CompactLaunch:
         fuse_input_quantization: bool = False,
         fc1_pipeline_stages: int = 2,
         coalesced: bool | None = None,
+        use_pdl: bool = False,
     ):
         self.capacity = max_tokens
         self.topk = num_topk
@@ -161,9 +163,12 @@ class _DirectW4A8CompactLaunch:
                 "fused input quantization requires paired compact projections"
             )
         self.fuse_input_quantization = bool(fuse_input_quantization)
+        self.use_pdl = bool(use_pdl)
         if self.coalesced:
             max_pairs = self.capacity * self.topk
-            self.coalesce = W4A8CompactCoalesceRoutesKernel(max_pairs, experts)
+            self.coalesce = W4A8CompactCoalesceRoutesKernel(
+                max_pairs, experts, use_pdl=self.use_pdl
+            )
             self.projection = W4A8CompactCoalescedFC1Kernel(
                 k,
                 n,
@@ -175,14 +180,18 @@ class _DirectW4A8CompactLaunch:
                 max_copy_groups=fc1_max_copy_groups,
                 fuse_input_quantization=self.fuse_input_quantization,
                 pipeline_stages=fc1_pipeline_stages,
+                use_pdl=self.use_pdl,
             )
             self.phase2 = W4A8CompactCoalescedFC2Kernel(
                 k,
                 n,
                 max_pairs,
                 csf_inline=csf_inline_scales,
+                use_pdl=self.use_pdl,
             )
-            self.topk_sum = W4A8CompactTopkSumKernel(k, num_topk, experts)
+            self.topk_sum = W4A8CompactTopkSumKernel(
+                k, num_topk, experts, use_pdl=self.use_pdl
+            )
         elif self.fuse_activation:
             self.projection = W4A8CompactMicroProjectionActivationKernel(
                 k,
@@ -421,7 +430,7 @@ class _DirectW4A8CompactLaunch:
 
 
 @program_cache
-def _compiled_direct_w4a8_compact(
+def _compiled_direct_w4a8_compact_cached(
     device_index: int,
     max_tokens: int,
     num_topk: int,
@@ -433,13 +442,15 @@ def _compiled_direct_w4a8_compact(
     down_scale_count: int,
     swiglu_limit: float | None,
     fast_math: bool,
-    fc1_tile_n: int = 128,
-    csf_inline_scales: bool = False,
-    fc1_max_copy_groups: int = 2,
-    fuse_input_quantization: bool = False,
-    fc1_pipeline_stages: int = 2,
-    coalesced: bool | None = None,
+    fc1_tile_n: int,
+    csf_inline_scales: bool,
+    fc1_max_copy_groups: int,
+    fuse_input_quantization: bool,
+    fc1_pipeline_stages: int,
+    coalesced: bool | None,
+    use_pdl: bool,
 ):
+    use_pdl = bool(use_pdl)
     launch = _DirectW4A8CompactLaunch(
         max_tokens=max_tokens,
         num_topk=num_topk,
@@ -456,6 +467,7 @@ def _compiled_direct_w4a8_compact(
         fuse_input_quantization=fuse_input_quantization,
         fc1_pipeline_stages=fc1_pipeline_stages,
         coalesced=coalesced,
+        use_pdl=use_pdl,
     )
     ids_type = cutlass.Int32 if ids_dtype == torch.int32 else cutlass.Int64
 
@@ -483,6 +495,7 @@ def _compiled_direct_w4a8_compact(
             bool(fuse_input_quantization),
             fc1_pipeline_stages,
             bool(launch.coalesced),
+            use_pdl,
         ),
     )
     return b12x_compile(
@@ -510,7 +523,7 @@ def _compiled_direct_w4a8_compact(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a8.compact_micro",
-            37,
+            38,
             (
                 max_tokens,
                 num_topk,
@@ -528,9 +541,65 @@ def _compiled_direct_w4a8_compact(
                 bool(fuse_input_quantization),
                 fc1_pipeline_stages,
                 bool(launch.coalesced),
+                use_pdl,
             ),
         ),
     )
+
+
+def _compiled_direct_w4a8_compact(
+    device_index: int,
+    max_tokens: int,
+    num_topk: int,
+    k: int,
+    n: int,
+    experts: int,
+    ids_dtype: torch.dtype,
+    input_scale_count: int,
+    down_scale_count: int,
+    swiglu_limit: float | None,
+    fast_math: bool,
+    fc1_tile_n: int = 128,
+    csf_inline_scales: bool = False,
+    fc1_max_copy_groups: int = 2,
+    fuse_input_quantization: bool = False,
+    fc1_pipeline_stages: int = 2,
+    coalesced: bool | None = None,
+    use_pdl: bool | None = None,
+):
+    resolved_pdl = (
+        sm120_consumer_pdl_enabled(device_index, env_var="B12X_W4A8_COMPACT_PDL")
+        if use_pdl is None
+        else bool(use_pdl)
+    )
+    return _compiled_direct_w4a8_compact_cached(
+        device_index,
+        max_tokens,
+        num_topk,
+        k,
+        n,
+        experts,
+        ids_dtype,
+        input_scale_count,
+        down_scale_count,
+        swiglu_limit,
+        fast_math,
+        fc1_tile_n,
+        csf_inline_scales,
+        fc1_max_copy_groups,
+        fuse_input_quantization,
+        fc1_pipeline_stages,
+        coalesced,
+        resolved_pdl,
+    )
+
+
+_compiled_direct_w4a8_compact.cache_clear = (
+    _compiled_direct_w4a8_compact_cached.cache_clear
+)
+_compiled_direct_w4a8_compact.cache_info = (
+    _compiled_direct_w4a8_compact_cached.cache_info
+)
 
 
 def _as_bytes(scratch: torch.Tensor) -> torch.Tensor:
@@ -571,6 +640,7 @@ def launch_w4a8_compact_micro(
     prequant_a_values: torch.Tensor | None = None,
     prequant_a_scales: torch.Tensor | None = None,
     coalesced: bool | None = None,
+    use_pdl: bool | None = None,
 ) -> torch.Tensor:
     """Run compact W4A8 projections and ordered route reduction into output."""
     if max_active_clusters is not None and max_active_clusters <= 0:
@@ -668,6 +738,7 @@ def launch_w4a8_compact_micro(
         fuse_input_quantization,
         fc1_pipeline_stages,
         coalesced,
+        use_pdl,
     )
     ids = topk_ids.reshape(-1)
     weights = topk_weights.reshape(-1)

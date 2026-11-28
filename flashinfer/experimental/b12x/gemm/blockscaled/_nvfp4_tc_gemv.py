@@ -39,6 +39,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile, run_compiled
+from b12x._lib.utils.pdl import sm120_consumer_pdl_enabled
 from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     ld_global_nc_v4_u32,
@@ -584,6 +585,7 @@ class NVFP4MultiRowTCGemvKernel:
         warps: int = 4,
         n_per_cta: int = 16,
         alpha_reciprocal: bool = False,
+        use_pdl: bool = False,
     ):
         self.n = int(n)
         self.in_features = int(in_features)
@@ -594,6 +596,7 @@ class NVFP4MultiRowTCGemvKernel:
         self.split_k = int(split_k)
         self.n_per_cta = int(n_per_cta)
         self.alpha_reciprocal = bool(alpha_reciprocal)
+        self.use_pdl = bool(use_pdl)
         if self.n_per_cta not in (16, 32, 64):
             raise ValueError(
                 f"NVFP4 TC-GEMV requires n_per_cta in (16, 32, 64), got {self.n_per_cta}"
@@ -674,6 +677,7 @@ class NVFP4MultiRowTCGemvKernel:
             grid=((self.n + self.n_per_cta - 1) // self.n_per_cta, self.split_k, 1),
             block=(self.warps * _LANES, 1, 1),
             stream=stream,
+            use_pdl=self.use_pdl,
         )
         if cutlass.const_expr(self.n_warp_mode):
             self.kernel_nwarp(
@@ -750,6 +754,9 @@ class NVFP4MultiRowTCGemvKernel:
         iters_x = (total_vecs + n_threads - 1) // n_threads
         q_mask = self.quarters - 1
         q_shift = 3 if self.quarters == 8 else 2 if self.quarters == 4 else 1
+
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
 
         for step in cutlass.range(self.chunks_per_warp, unroll=1):
             stage = Uint32(step & Int32(1))
@@ -980,6 +987,9 @@ class NVFP4MultiRowTCGemvKernel:
                 )
                 sa = _load_scale_chunk(s_base, row_a, g0, self.k_blocks4, self.chunk_k)
                 sb = _load_scale_chunk(s_base, row_b, g0, self.k_blocks4, self.chunk_k)
+                if cutlass.const_expr(self.use_pdl):
+                    if step == Int32(0):
+                        cute.arch.griddepcontrol_wait()
                 x_off = Int64(k_col) * Int64(2)
                 for q in cutlass.range_constexpr(self.quarters):
                     wa0, wa1, wa2, wa3 = _e2m1x8_scaled_to_bf16x2x4_sm120(
@@ -1086,6 +1096,9 @@ class NVFP4MultiRowTCGemvKernel:
                 sb1 = _load_scale_chunk(
                     s_base, row_b1, g0, self.k_blocks4, self.chunk_k
                 )
+                if cutlass.const_expr(self.use_pdl):
+                    if step == Int32(0):
+                        cute.arch.griddepcontrol_wait()
                 x_off = Int64(k_col) * Int64(2)
                 for q in cutlass.range_constexpr(self.quarters):
                     k_q = k_col + Int32(q * 8)
@@ -1354,7 +1367,7 @@ class NVFP4MultiRowTCGemvKernel:
 
 
 @program_cache
-def compile_nvfp4_tc_gemv(
+def _compile_nvfp4_tc_gemv_cached(
     ordinal: int,
     n: int,
     in_features: int,
@@ -1362,15 +1375,16 @@ def compile_nvfp4_tc_gemv(
     max_rows: int,
     split_k: int,
     warps: int,
-    n_per_cta: int = 16,
-    *,
-    alpha_reciprocal: bool = False,
+    n_per_cta: int,
+    alpha_reciprocal: bool,
+    use_pdl: bool,
 ):
     max_m_tiles = (int(max_rows) + 7) // 8
     n_per_cta = int(n_per_cta)
     chunk_k = effective_nvfp4_tc_gemv_chunk_k(padded_k, split_k, warps, n_per_cta)
     eff_warps = effective_nvfp4_tc_gemv_warps(padded_k, split_k, warps, n_per_cta)
     alpha_reciprocal = bool(alpha_reciprocal)
+    use_pdl = bool(use_pdl)
     kernel = NVFP4MultiRowTCGemvKernel(
         n,
         in_features,
@@ -1380,6 +1394,7 @@ def compile_nvfp4_tc_gemv(
         warps=eff_warps,
         n_per_cta=n_per_cta,
         alpha_reciprocal=alpha_reciprocal,
+        use_pdl=use_pdl,
     )
     key = (
         int(n),
@@ -1391,6 +1406,7 @@ def compile_nvfp4_tc_gemv(
         eff_warps,
         n_per_cta,
         alpha_reciprocal,
+        use_pdl,
     )
     fake = (
         make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -1409,7 +1425,7 @@ def compile_nvfp4_tc_gemv(
             Int64(in_features),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.blockscaled.nvfp4_tc_gemv", 3, key
+                "gemm.blockscaled.nvfp4_tc_gemv", 4, key
             ),
         )
 
@@ -1471,3 +1487,39 @@ def compile_nvfp4_tc_gemv(
         )
 
     return attach_programs(run, raw)
+
+
+def compile_nvfp4_tc_gemv(
+    ordinal: int,
+    n: int,
+    in_features: int,
+    padded_k: int,
+    max_rows: int,
+    split_k: int,
+    warps: int,
+    n_per_cta: int = 16,
+    *,
+    alpha_reciprocal: bool = False,
+    use_pdl: bool | None = None,
+):
+    resolved_pdl = (
+        sm120_consumer_pdl_enabled(ordinal, env_var="B12X_NVFP4_TC_GEMV_PDL")
+        if use_pdl is None
+        else bool(use_pdl)
+    )
+    return _compile_nvfp4_tc_gemv_cached(
+        ordinal,
+        n,
+        in_features,
+        padded_k,
+        max_rows,
+        split_k,
+        warps,
+        n_per_cta,
+        alpha_reciprocal,
+        resolved_pdl,
+    )
+
+
+compile_nvfp4_tc_gemv.cache_clear = _compile_nvfp4_tc_gemv_cached.cache_clear
+compile_nvfp4_tc_gemv.cache_info = _compile_nvfp4_tc_gemv_cached.cache_info

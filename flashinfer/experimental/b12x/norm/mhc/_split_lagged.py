@@ -79,20 +79,31 @@ from ._kernels import (
 SPLIT_LAGGED_MAX_TOKENS = 128
 SPLIT_LAGGED_HIDDEN_SIZES = (4096, 5120, 7168)
 CLUSTER_AR_MHC_MAX_TOKENS = 128
-CLUSTER_AR_MHC_ONESHOT_MAX_TOKENS = 4
+CLUSTER_AR_MHC_ONESHOT_MAX_TOKENS = 1
 CLUSTER_AR_MHC_WORLD_SIZES = (2, 3, 4, 6, 8)
 _CLUSTER_AR_MHC_TRANSPORTS = ("oneshot", "rsag")
 _PARTIAL_STRIDE = 32
 
 
+def cluster_allreduce_cluster_size(tokens: int) -> int:
+    """Return the SM120 CTA-per-row cluster size for ``ClusterMhcAllReducePostYNorm``.
+
+    On SM120 PCIe links, a 4-CTA cluster minimizes tiny-batch latency (``M <= 4``),
+    while single-CTA-per-row (``cluster_size=1``) eliminates hardware DSM cluster
+    barriers and keeps every warp full-width (32 lanes = 512B coalesced PCIe TLP
+    bursts) for ``M >= 5``.
+    """
+    return 4 if int(tokens) <= 4 else 1
+
+
 def cluster_allreduce_transport(tokens: int, world_size: int) -> str:
     """Return the Lamport PCIe transport for ``ClusterMhcAllReducePostYNorm``.
 
-    For TP2 (where 1-hop and 2-hop move identical byte volume) or tiny batches
-    (``tokens <= 4``), 1-hop ``"oneshot"`` minimizes round-trip latency. For
-    wider batches (``5 <= tokens <= 128``) with ``world_size >= 3``, 2-hop
-    Lamport reduce-scatter + all-gather (``"rsag"``) halves per-rank PCIe TX
-    traffic on TP4 (1.5x vs 3.0x payload) while keeping the entire AllReduce +
+    For TP2 (where 1-hop and 2-hop move identical byte volume) or single-token
+    batches (``tokens <= 1``), 1-hop ``"oneshot"`` minimizes round-trip latency.
+    For multi-token batches (``2 <= tokens <= 128``) with ``world_size >= 3``,
+    2-hop Lamport reduce-scatter + all-gather (``"rsag"``) halves per-rank PCIe
+    TX traffic on TP4 (1.5x vs 3.0x payload) while keeping the entire AllReduce +
     mHC + RMSNorm + MXFP8 sequence fused in a single kernel launch.
     """
     if int(world_size) <= 2 or int(tokens) <= CLUSTER_AR_MHC_ONESHOT_MAX_TOKENS:
@@ -2032,16 +2043,16 @@ def compile_cluster_allreduce_post_y_norm(
             f"transport must be 'auto' or in {_CLUSTER_AR_MHC_TRANSPORTS}, got {transport!r}"
         )
     norm_cute_dt = BFloat16 if norm_is_bf16 else Float32
-    cluster_sizes = (8, 4, 1) if cluster_size is None else (int(cluster_size),)
+    cluster_sizes = (4, 1) if cluster_size is None else (int(cluster_size),)
     specs: list[tuple[int, str]] = []
     for cs in cluster_sizes:
         if transport != "auto":
             specs.append((cs, transport))
         elif world_size <= 2:
             specs.append((cs, "oneshot"))
-        elif cs == 8:
-            specs.append((8, "oneshot"))
-            specs.append((8, "rsag"))
+        elif cs == 4:
+            specs.append((4, "oneshot"))
+            specs.append((4, "rsag"))
         else:
             specs.append((cs, "rsag"))
 
@@ -2150,7 +2161,7 @@ def compile_cluster_allreduce_post_y_norm(
             cs = (
                 int(cluster_size)
                 if cluster_size is not None
-                else split_lagged_cluster_size(tokens)
+                else cluster_allreduce_cluster_size(tokens)
             )
             resolved_t = (
                 cluster_allreduce_transport(tokens, world_size)
@@ -2247,6 +2258,7 @@ __all__ = [
     "ClusterMhcAllReducePostYNorm",
     "SPLIT_LAGGED_HIDDEN_SIZES",
     "SPLIT_LAGGED_MAX_TOKENS",
+    "cluster_allreduce_cluster_size",
     "cluster_allreduce_transport",
     "compile_cluster_allreduce_post_y_norm",
     "compile_cluster_post_y_norm",
